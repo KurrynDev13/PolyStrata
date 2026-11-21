@@ -29,7 +29,7 @@ PolyStrata は、ふつうはサーバーが必要な大きな AI モデルを�
 GLM 5.3 Flash と DeepSeek V4 Flash 以外は Windows でも動きます。まだ実験的で、32 GB のカードを載せた PC と、
 小さいモデルについては 8 GB や 12 GB のカードを載せた PC でも動いています。
 
-- **[Inkling 2 Mini](Inkling%202%20Mini%20Benchmark.md)**：Thinking Machines Lab の 48 仮想層ループ型 MoE モデル（`inkling2_loop` / `inkling2`）で、ファイルは 12〜18 GB（Unsloth の `UD-Q4_K_XL` は 0〜19 層をネイティブ NVFP4 のまま保持）。48 仮想層のうち 40 層は直前の 1,024 トークンだけを見て、8 層だけが全文脈を見るため、128K コンテキストでもグローバル KV キャッシュは FP16 でわずか 256 MiB（Q8_0 では 136 MiB）しか使いません。CPU ビジョンエンコーダーで画像も読めます。
+- **[Inkling 2 Mini](Inkling%202%20Mini%20Benchmark.md)**：Thinking Machines Lab の 48 仮想層ループ型 MoE モデル（`inkling2_loop` / `inkling2`）で、ファイルは 12〜18 GB（[`unsloth/Inkling-2-Mini-GGUF`](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF)：`UD-Q3_K_XL` 14.4 GiB、または 0〜19 層をネイティブ NVFP4 で保持する `UD-Q4_K_XL` 16.4 GiB）。オプションのネイティブ **DSpark MTP** 8 トークン一括投機的デコード（`--draft-model inkling2-dspark.gguf`）にも、MTP なしのゼロ VRAM 内蔵 n-gram lookup にも対応しています。48 仮想層のうち 40 層は固定リングバッファで直前の 1,024 トークンだけを見て、8 層だけが全文脈を見るため、トークンあたり FP16 で `32 KiB`（128K で `4.0 GiB`）、`--kv q8_0` で `17 KiB`（`2.13 GiB`）、`--kv k8v4` で `13 KiB`（`1.63 GiB`、`Q8_0` キー + `Q4_0` バリュー）、`--kv q4_0` で `9 KiB`（`1.13 GiB`）しか使わず、`--kv-grow` により最大 1M `max_context` まで拡張できます。CPU ビジョンエンコーダー（`mmproj-F16.gguf`）で画像も読めます。
 - **[GLM 5.3 Flash](docs/models/glm.ja.md)**：いちばん大きいモデル。ファイルは 79〜114 GB で、その大部分は RAM に置かれます。
 - **[DeepSeek V4 Flash](docs/models/deepseek.ja.md)**：ファイルは 91 GB で、これも大部分は RAM に置かれます。会話を覚えておくための VRAM が少なく、128K のコンテキストでも 32K より 0.7 GB 多いだけです。
 - **[LFM2.5-24B-A2B](docs/models/lfm25.ja.md)**：Liquid AI のモデルで、ファイルは 11〜25 GB。ほとんどの層にアテンションがないので、
@@ -76,7 +76,7 @@ PolyStrata は Niko1221 の [Strata](https://github.com/Niko1221/Strata) をも�
 
 ノート PC：RTX 4070 Laptop（8 GB）、Core i7-14700HX、RAM 32 GB。ワークステーション：RTX 5090（32 GB）、Xeon Platinum 8470Q（25 vCPU）、RAM 90〜120 GB。Flint はノート PC では UD-Q3_K_XL（RAM 32 GB でインストーラーが選ぶサイズ）、ワークステーションでは UD-Q4_K_XL です。Kolibri 1 はワークステーションでは Q2_K です。そこでインストーラーが選ぶ Q4_K_M は測っていません。
 
-**Inkling 2 Mini（`UD-Q4_K_XL`、17.63 GB）** は RTX 4070 SUPER（12 GB VRAM）と 46.7 GiB DDR5 RAM のデスクトップで **128K `max_context`（`131072`）** で測定され、単発プロンプトで **45.0〜47.3 トークン/秒**（マルチターンのコード/ログでは lookup ドラフトにより最大 **108.2 トークン/秒**）で書き出し、5,461 トークンのプロンプトを **1,307 トークン/秒**で読み込みました（**llama.cpp PR `#32704` の 3.4〜3.7 倍の速さ**、詳細は [Inkling 2 Mini Benchmark.md](Inkling%202%20Mini%20Benchmark.md)）。
+**Inkling 2 Mini（`UD-Q3_K_XL` 14.4 GiB & `UD-Q4_K_XL` 16.4 GiB）** は RTX 4070 SUPER（12 GB VRAM）と 32 GB DDR5 RAM のデスクトップで **128K〜1M `max_context`** で測定されました。ネイティブ **DSpark MTP**（`--draft-model inkling2-dspark.gguf --kv k8v4 --cache-bias 0.2`）有効時、`UD-Q3_K_XL` は短いプロンプトで **64.4 トークン/秒**（コード生成で最大 **99.4 トークン/秒**）、32.7K コンテキストで **50.2 トークン/秒**（読み込み **821 トークン/秒**）、実際の **181.6K トークン**のコーディングセッション中でも **28.1〜30.0 トークン/秒**で書き出します（`UD-Q4_K_XL` + DSpark は短文 **60.2 トークン/秒** / 32.7K で **44.1 トークン/秒**）。**MTP なし**（`UD-Q4_K_XL`）でも単発プロンプトで **45.0〜47.3 トークン/秒**（マルチターンのコード/ログでは内蔵 lookup ドラフトにより最大 **108.2 トークン/秒**）で書き出し、5,461 トークンのプロンプトを **1,307 トークン/秒**で読み込みます（**llama.cpp PR `#32704` の 3.4〜3.7 倍の速さ**）。厳密な純粋デコード（`--window 1`、`1048576` `max_context`）でも FP16 で **~92K**、`--kv q8_0` で **~122K**、`--kv q4_0` で **~137K〜141K トークン**まで `>= 30 トークン/秒` を維持します（ダウンロード手順と MTP あり/なしの設定ガイドは [Inkling 2 Mini Benchmark.md](Inkling%202%20Mini%20Benchmark.md)）。
 
 Qwen3.8-Flash-Next は [Strata](https://github.com/Niko1221/Strata) プロジェクトのエンジンで動き、そのプロジェクトが RTX 5070（12 GB）、RAM 64 GB の PC で測りました：IQ2_XS で書き出し 79、32K プロンプトの読み込み 2,090（[全サイズ](docs/models/qwen38.ja.md)）。
 

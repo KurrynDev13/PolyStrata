@@ -1,4 +1,4 @@
-# Inkling 2 Mini (`UD-Q4_K_XL`) — PolyStrata Engine Benchmark & Optimization Report
+# Inkling 2 Mini (`UD-Q4_K_XL` & `UD-Q3_K_XL` + DSpark MTP) — PolyStrata Engine Benchmark & Optimization Report
 
 ## 1. Hardware, Model & Software Environment
 
@@ -8,12 +8,15 @@
   - **System RAM:** 32 GB DDR5 (`31.1 GiB` usable)
   - **OS & Toolchain:** Windows 11 x64, Visual Studio 2026 (MSVC 19.51), CUDA Toolkit 13.5 (`v13.5.37`)
 - **Model & Multimodal Files:**
-  - **Text Model:** `Inkling-2-Mini-UD-Q4_K_XL.gguf` (`16.41 GiB`, 744 tensors)
+  - **Text Models:**
+    - `Inkling-2-Mini-UD-Q4_K_XL.gguf` (`16.41 GiB`, 744 tensors; `1,520–1,613 / 3,072` routed experts in VRAM on 12 GB)
+    - `Inkling-2-Mini-UD-Q3_K_XL.gguf` (`14.37 GiB`, 604 tensors; `2,067 / 3,072` routed experts in VRAM on 12 GB — `67.3%` VRAM residency)
     - Architecture: `inkling2_loop` — 24 physical layers executed across **48 logical steps** (prelude layers `0..5`, looped core layers `6..17` $\times$ 3 passes with rank-64 cross-pass gated controllers, epilogue layers `18..23`).
     - Hidden dimension: `2304`; Attention: `24` query heads, `8` KV heads, `head_dim = 128`; **40 SWA logical slots** (`sliding_window = 1024`) + **8 global attention slots** (layers `5, 11, 17, 23` across passes) with logarithmic position scale $\tau(\text{pos}) = 1 + 0.1 \ln(\max(1, (\text{pos}+1)/8192))$, learned L2 clipping (`qk_clip = 22.63`, `rel_clip = 8.0`), 16-dim factorized relative position bias (`extent = 1024`), and virtual zero attention sink.
     - Residual & Convolutions: **6-stream Block Attention Residuals** (`block_size = 6`) + 4-tap causal short convolutions (`l_cache = 4`) on `K`, `V` (with input-dependent reversed-lag dynamic taps on global layers), `attn_out`, and `ffn_out`.
-    - Mixture-of-Experts: `128` routed experts (`n_ff_exp = 1152`), top-8 sigmoid routing with learned bias (`w_scale = 8.0`) and **SiTU** activation ($\beta = 4.0$, $\beta_{\text{linear}} = 25.0$). Layers `0..19` use `NVFP4` routed experts with shared `ffn_gate_up_exps.scale` (`F32[128]`) and `ffn_down_exps.scale` (`F32[128]`); layers `20..23` use `Q8_0` routed experts.
+    - Mixture-of-Experts: `128` routed experts (`n_ff_exp = 1152`), top-8 sigmoid routing with learned bias (`w_scale = 8.0`) and **SiTU** activation ($\beta = 4.0$, $\beta_{\text{linear}} = 25.0$). In `UD-Q4_K_XL`, layers `0..19` use `NVFP4` routed experts with shared `ffn_gate_up_exps.scale` (`F32[128]`) and `ffn_down_exps.scale` (`F32[128]`), and layers `20..23` use `Q8_0`. In `UD-Q3_K_XL`, routed experts use `Q2_K` / `Q3_K` / `Q4_K` / `Q5_0`.
     - Vocabulary: `200,058` unpadded tokens (`201,024` padded in `token_embd.weight` / `output.weight`), `GPT4O` pre-tokenizer (`tokenizer.ggml.pre = "inkling2"`), stop token `<|content_model_end_sampling|>` (`200006`).
+  - **DSpark MTP Speculative Drafter:** `inkling2-dspark.gguf` (`455.3 MiB`, 82 tensors, `inkling2_dspark` — 5-layer bidirectional block-8 transformer with 4 target tap extractors `[5, 23, 41, 48]`, 4 local SWA layers `win=1024`, 1 global attention layer, and a rank-256 7-step Markov RNN logit head).
   - **Vision Projector:** `mmproj-F16.gguf` (`639.3 MB`, `inkling2v`, 23 blocks, patch size `20`, `2x2` spatial merge, projection dim `2304`), offloaded to CPU via `strata-vision-inkling2.exe` (`CUDA_VISIBLE_DEVICES=-1`) so 100% of GPU VRAM remains dedicated to the language model.
 - **Binaries Under Test:**
   - **PolyStrata Engine:** `D:\PolyStrata\engine-poly-inkling2\strata-poly.exe` & `strata-vision-inkling2.exe` (branch `feat/inkling2-loop` synced onto `0.1.45-poly.10`).
@@ -23,9 +26,9 @@
 
 ## 2. Kernel Accuracy & Reference `llama.cpp` Parity
 
-### 2.1 CUDA Kernel & CPU SiTU Unit Test Suite (`poly_inkling2_test.exe`)
+### 2.1 CUDA Kernel, DSpark MTP & CPU SiTU Unit Test Suite (`poly_inkling2_test.exe`)
 
-All 27 checks in `poly_inkling2_test.exe` verify GPU kernels and CPU expert math against FP64 CPU reference implementations (including bounded split-K `>32K`, `GQA=3` & fallback kernels, and GPU `store_q4` / `store_q4_at`):
+All 44 checks in `poly_inkling2_test.exe` verify GPU kernels (target model + DSpark MTP drafter + `K8V4` mixed KV cache) and CPU expert math against FP64 CPU reference implementations:
 
 | Kernel / Subsystem Test | Elements Checked | Max Relative Error | Result |
 | :--- | :---: | :---: | :---: |
@@ -56,6 +59,21 @@ All 27 checks in `poly_inkling2_test.exe` verify GPU kernels and CPU expert math
 | Global (`>32K`) bounded-splits Q4_0 `inkling_attend_batch` vs `inkling_attend` | 6,144 | `3.06e-06` | **PASS** |
 | Global (`>1024`) generic fallback (`GQA=2`) `inkling_attend` vs FP64 ref | 16,384 | `1.78e-08` | **PASS** |
 | Global (`>1024`) generic fallback (`GQA=2`) `inkling_attend_batch` vs `inkling_attend` | 16,384 | `2.29e-05` | **PASS** |
+| DSpark `extract_taps` (`[5, 23, 41, 48]`) | 6,048 | `0` | **PASS** |
+| DSpark `mix_norm` vs FP64 | 2,016 | `1.62e-07` | **PASS** |
+| DSpark `rnn_gate` state vs FP64 | 256 | `1.05e-07` | **PASS** |
+| DSpark `rnn_gate` latent vs FP64 | 256 | `6.27e-08` | **PASS** |
+| DSpark `prep_rnn_step(step=0, slot)` | 512 | `1.05e-07` | **PASS** |
+| DSpark `prep_rnn_step(step=1)` | 512 | `1.05e-07` | **PASS** |
+| DSpark `add_softcap` vs FP64 | 4,099 | `2.77e-07` | **PASS** |
+| DSpark `pack_q8_0_block` vs `ggml_to_float` | 8,768 | `0.031` | **PASS** |
+| DSpark `pack_q4_0_block` vs `ggml_quantize` | 8,768 | `0` | **PASS** |
+| DSpark `split_qkv` (Q / K / V) | 1,024 | `0` | **PASS** |
+| DSpark `attend` local SWA ring FP16 | 24,576 | `6.34e-08` | **PASS** |
+| DSpark `attend` global split-K FP16 | 24,576 | `2.02e-08` | **PASS** |
+| DSpark `attend` global split-K Q8_0 | 24,576 | `2.17e-08` | **PASS** |
+| DSpark `attend` global split-K Q4_0 | 24,576 | `2.13e-08` | **PASS** |
+| DSpark `attend` global split-K K8V4 (`Q8_0` K + `Q4_0` V) | 24,576 | `2.12e-08` | **PASS** |
 
 ### 2.2 Greedy Parity & Throughput vs Reference `llama-completion.exe`
 
@@ -182,29 +200,104 @@ Verified against live HTTP endpoints (`/v1/chat/completions`, `/v1/messages`, `/
 
 ---
 
-## 7. Optimization Reference & Production Configuration
+## 7. Native DSpark MTP Speculative Drafter (`inkling2-dspark.gguf`), Kernel Optimizations & `UD-Q3_K_XL` Benchmarks
 
-### Summary of Engine Flags for Inkling 2 Mini on 12 GB VRAM
+### 7.1 DSpark MTP Architecture & CUDA Kernel Optimizations in `strata-poly`
 
-1. **`--kv-grow` (Default ON):** Uses CUDA VMM (`kv_alloc` + `cover`) on the 8 global attention slots paired with bounded split-K (`MAX_SPLITS = 64`), so configuring `--max-context 262144` or up to `1048576` (1M) costs only `~32 MiB` upfront global KV VRAM at startup. The 40 SWA slots use fixed `1024 + prompt_batch` ring buffers.
-2. **`--vram-reserve-mib 1280`:** Prevents Windows WDDM shared-memory spill (which otherwise causes `~968 ms/tok` PCIe stalls when VRAM oversubscribes 12 GB) while fitting `1,561–1,613 / 3,072` routed experts in physical VRAM. *(Do not enable `--vram-pool` on Windows WDDM, as Windows includes shared system memory in the process DXGI budget.)*
+PolyStrata implements native support for Inkling 2's **DSpark Multi-Token Prediction (MTP)** drafter (`--draft-model inkling2-dspark.gguf`, `inkling2_dspark`, 5 layers, `block_size = 8`, `markov_rank = 256`):
+
+1. **Zero-Sync GPU Markov Recurrence + Captured CUDA Graph (`dspark_markov_graph_`):**
+   - Extracts hidden states from the 4 target logical tap points (`[5, 23, 41, 48]`), projects them through `dspark_mix_norm`, and runs the 5 bidirectional block-8 transformer layers (`4` local SWA ring layers `win = 1024` + `1` global split-K attention layer).
+   - Executes all 7 autoregressive Markov RNN draft steps (`inkling_dspark_prep_rnn_step` $\rightarrow$ `native_gemv_q8_0_rows` $\rightarrow$ `inkling_dspark_rnn_gate` $\rightarrow$ `dspark_fold_w_` `[256, 201024]` $\rightarrow$ `inkling_dspark_add_softcap` $\rightarrow$ `argmax_f32`) **entirely on the GPU inside a single captured CUDA Graph** with zero mid-loop host-device synchronization (`d_block_picks_` stays on device and is copied back once in a single 28-byte `DtoH` transfer after graph replay).
+2. **Fused Projections & Shared `Q8_1` Activation Quantization:**
+   - Fuses target loop controllers (`B.ctrl_gf`), same-type attention projections (`wq_fused`, `wkv_fused`), and DSpark block projections (`qkv_proj` + `inkling_dspark_split_qkv`, `kv_proj_ctx`, `gate_up_proj`), quantizing each normalized activation to `Q8_1` once (`native_add_rms_norm_q8_1`, `native_swiglu_quantize_q8_1`).
+3. **Mixed-Precision `--kv k8v4` (`Q8_0` Keys + `Q4_0` Values) & Quantized DSpark Global KV:**
+   - Supports `--kv fp16` (`32 KiB/tok`), `--kv q8_0` (`17 KiB/tok`), **`--kv k8v4` (`13 KiB/tok`: `1,088 B/row` `Q8_0` Keys + `576 B/row` `Q4_0` Values = `1,664 B/row`)**, and `--kv q4_0` (`9 KiB/tok`) across all 48 target attention slots and DSpark global layer 1.
+   - At `181K` context, `--kv k8v4` saves an additional **`~800 MiB` of VRAM** over `--kv q8_0` while keeping full 8-bit key precision for long-range attention dot products.
+4. **Router Cache Bias (`--cache-bias 0.2`) with True Unbiased Sigmoid Weighting:**
+   - Adds a configurable bias (`0.2`) to the router scores of VRAM-resident experts during decode/verify windows while recomputing the selected top-8 experts' mixing weights from their **unbiased** router scores (`sigmoid(logit) / sum * 8.0` via `Inkling2::route_weights`), increasing VRAM expert hit rate to `94–96%` without distorting expert scale.
+
+### 7.2 `UD-Q4_K_XL` vs `UD-Q3_K_XL` with & without DSpark MTP (RTX 4070 SUPER 12 GB)
+
+| Model & Configuration | Routed Experts in VRAM | Short Context Decode (`128`–`256` tok) | `32.7K` Context Prefill / Decode | Live `181.6K` OpenCode Session Decode | DSpark Draft Acceptance |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **`UD-Q4_K_XL` (No MTP, `--window 1`)** | `1,561 / 3,072` (`7.5 GiB`) | 45.0–47.3 tok/s | 1,116 tok/s / 38.5 tok/s | — | *(no drafter)* |
+| **`UD-Q4_K_XL` + DSpark MTP (`--kv q8_0`)** | `1,520 / 3,072` (`7.3 GiB`) | **60.2 tok/s** | 773 tok/s / **44.1 tok/s** | — | `60.5%` (`138 / 228`) |
+| **`UD-Q3_K_XL` (No MTP, `--window 1`)** | `2,140 / 3,072` (`7.9 GiB`) | 29.8 tok/s *(pure 1-tok/step)* | 820 tok/s / 24.6 tok/s | — | *(no drafter)* |
+| **`UD-Q3_K_XL` + DSpark MTP (`--kv q8_0`)** | `2,067 / 3,072` (`7.6 GiB`) | **60.8 tok/s** | 817 tok/s / **46.4 tok/s** | 20.0 tok/s *(before opt)* | `61.4%` (`140 / 228`) |
+| **`UD-Q3_K_XL` + DSpark MTP (`--kv k8v4 --cache-bias 0.2`)** | **`2,067 / 3,072` (`7.6 GiB`)** | **64.4 tok/s** *(up to 99.4 tok/s on code)* | **821 tok/s / 50.2 tok/s** | **28.1–30.0 tok/s** *(at `181,571` tok)* | **`61–100%`** (`94.7%` VRAM hit) |
+
+---
+
+## 8. Quick Start: Where to Download Files & How to Run (With or Without MTP)
+
+### 8.1 Where to Download the Model Files
+
+All official GGUF files are hosted on Hugging Face in [**`unsloth/Inkling-2-Mini-GGUF`**](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF):
+
+1. **Main Language Model (pick ONE based on your VRAM + RAM):**
+   - **`Inkling-2-Mini-UD-Q3_K_XL.gguf` (`14.4 GiB`) — Recommended for 12 GB VRAM + 32 GB RAM:** Fits `2,067 / 3,072` (`67.3%`) of routed experts directly in 12 GB VRAM and holds all remaining experts in 32 GB RAM without paging.
+   - **`Inkling-2-Mini-UD-Q4_K_XL.gguf` (`16.4 GiB`) — Recommended for 16 GB+ VRAM (or 12 GB VRAM + 48–64 GB RAM):** Keeps layers `0..19` in native `NVFP4` (`1,520–1,613 / 3,072` experts in 12 GB VRAM).
+2. **Optional — DSpark MTP Speculative Drafter (`~2.1x` faster decode, uses `~400 MiB` VRAM):**
+   - **`inkling2-dspark.gguf` (`455 MiB`):** Found in the `Mainline_Support/` folder (or root) of `unsloth/Inkling-2-Mini-GGUF`.
+3. **Optional — Vision Encoder (for image understanding, runs on CPU with `0 MiB` GPU VRAM):**
+   - **`mmproj-F16.gguf` (`639 MB`):** Found in `unsloth/Inkling-2-Mini-GGUF`.
+
+#### Download via `huggingface-cli`:
+```bash
+# 1. Download main model (choose UD-Q3_K_XL or UD-Q4_K_XL)
+huggingface-cli download unsloth/Inkling-2-Mini-GGUF Inkling-2-Mini-UD-Q3_K_XL.gguf --local-dir ./models/inkling2
+
+# 2. (Optional) Download DSpark MTP drafter & Vision projector
+huggingface-cli download unsloth/Inkling-2-Mini-GGUF Mainline_Support/inkling2-dspark.gguf mmproj-F16.gguf --local-dir ./models/inkling2
+```
+
+---
+
+### 8.2 Should You Run With or Without DSpark MTP (`--draft-model`)?
+
+You can run `strata-poly` in **three modes** depending on your hardware and use case:
+
+| Mode | CLI Flag | Extra VRAM Used | Best For |
+| :--- | :--- | :---: | :--- |
+| **1. With DSpark MTP (Recommended)** | `--draft-model inkling2-dspark.gguf` | `~400 MiB` | **Fastest overall generation (`60–64 tok/s` short, `50 tok/s` @ 32K).** Drafts up to 7 tokens ahead per step using the neural DSpark block-8 drafter + n-gram lookup. |
+| **2. Without MTP (Built-in Lookup Only)** | *(omit `--draft-model`)* | **`0 MiB`** | **Low-VRAM cards (8 GB–10 GB) or maximum expert residency.** Saves `~400 MiB` of VRAM (fitting `~80–100` extra routed experts on GPU) while still getting free n-gram speculative speedups (`--lookup 3 --window 8`, up to `108 tok/s` on repetitive code/logs) with zero extra model weights. |
+| **3. Pure 1-Token-Per-Step Decode** | *(omit `--draft-model`)* + `--window 1` | **`0 MiB`** | **Deterministic single-token benchmarking or strict per-step latency profiling.** Disables all speculative guessing so every forward pass processes a single token (`width = 1`, `45–47 tok/s` on `UD-Q4_K_XL`). |
+
+---
+
+### 8.3 Summary of Engine Flags for Inkling 2 Mini on 12 GB VRAM
+
+1. **`--kv-grow` (Default ON):** Uses CUDA VMM (`kv_alloc` + `cover`) on the 8 global attention slots paired with bounded split-K (`MAX_SPLITS = 64`), so configuring `--max-context 262144` or up to `1048576` (1M) costs only `~32 MiB` upfront global KV VRAM at startup. The 40 SWA slots use fixed `1024 + prompt_batch` ring buffers (`160 MiB` total regardless of context length).
+2. **`--vram-reserve-mib 1280`:** Prevents Windows WDDM shared-memory spill while fitting `1,520–2,067 / 3,072` routed experts in physical VRAM. *(Do not enable `--vram-pool` on Windows WDDM.)*
 3. **`--prompt-batch 512`:** Frees `~600 MiB` of scratch + SWA ring VRAM for `+124` additional GPU-cached experts and increases 5.4k prefill throughput by `+23.3%` (`1,307.3 tok/s`).
-4. **`--kv fp16` (Default) vs `--kv q8_0` vs `--kv q4_0`:**
-   - **FP16 KV (default, `32 KiB/token`):** Exact reference weights with peak single-shot prefill (`1,307 tok/s`), multi-turn decode up to `108 tok/s` with lookup drafts, and `>= 30 tok/s` pure unassisted decode through ~92K filled tokens (configured with `--max-context 262144` headroom).
-   - **`--kv q8_0` (`17 KiB/token`):** Halves global KV VRAM (`2.13 GiB` at 128K), extending pure `>= 30 tok/s` decode to ~122K tokens.
+4. **`--kv fp16` vs `--kv q8_0` vs `--kv k8v4` vs `--kv q4_0`:**
+   - **`--kv k8v4` (`13 KiB/token`, Recommended for 128K–262K coding sessions):** Mixed 8-bit `Q8_0` Keys (`1,088 B/row`) + 4-bit `Q4_0` Values (`576 B/row`). Preserves 8-bit key precision while saving `~800 MiB` of VRAM over `q8_0` at 180K context.
+   - **`--kv q8_0` (`17 KiB/token`):** Symmetric 8-bit Keys and Values (`2.13 GiB` at 128K), extending pure `>= 30 tok/s` decode to ~122K tokens.
    - **`--kv q4_0` (`9 KiB/token`):** Quarters global KV VRAM (`1.13 GiB` at 128K), keeping pure unassisted decode above **30 tok/s across the full 128K window** (~137K–141K limit) with verified recall past 224K tokens.
-   - *Note:* `--kv k8v4` is specific to the Qwen 3.8 engine (`strata.exe`) and is not used in `strata-poly.exe`.
+   - **`--kv fp16` (default, `32 KiB/token`):** Unquantized FP16 KV cache (`>= 30 tok/s` pure decode through ~92K tokens).
+5. **`--cache-bias 0.2` (Optional):** Gently biases top-8 expert selection toward experts already cached in VRAM while keeping unbiased sigmoid mixing weights, raising VRAM expert hit rates to `94–96%` on 12 GB cards.
 
-### Production Run Config ([strata-inkling2-ud-q4_k_xl.json](file:///d:/PolyStrata/strata-inkling2-ud-q4_k_xl.json))
+---
+
+### 8.4 Production Server Configurations (`serve/server.py`)
+
+#### A. Recommended 12 GB VRAM + 32 GB RAM Config with DSpark MTP & `--kv k8v4` (`strata-inkling2-ud-q3_k_xl.json`)
 
 ```json
 {
   "exe": "D:\\PolyStrata\\engine-poly-inkling2\\strata-poly.exe",
   "args": [
     "--model",
-    "D:\\Users\\Kurryn_PC\\Documents\\Strata\\Models\\models\\inkling2-UD-Q4_K_XL\\Inkling-2-Mini-UD-Q4_K_XL.gguf",
+    "D:\\Users\\Kurryn_PC\\Documents\\Strata\\Models\\models\\inkling2-UD-Q3_K_XL\\Inkling-2-Mini-UD-Q3_K_XL.gguf",
+    "--draft-model",
+    "D:\\Users\\Kurryn_PC\\Documents\\Strata\\Models\\models\\inkling2-UD-Q4_K_XL\\inkling2-dspark.gguf",
     "--max-context",
     "262144",
+    "--kv",
+    "k8v4",
+    "--cache-bias",
+    "0.2",
     "--vram-reserve-mib",
     "1280",
     "--prompt-batch",
@@ -212,30 +305,24 @@ Verified against live HTTP endpoints (`/v1/chat/completions`, `/v1/messages`, `/
     "--ram-experts-mib",
     "-1",
     "--expert-profile",
-    "D:\\Users\\Kurryn_PC\\Documents\\Strata\\Models\\packs\\inkling2-ud-q4_k_xl\\expert-profile.txt",
+    "D:\\Users\\Kurryn_PC\\Documents\\Strata\\Models\\packs\\inkling2-ud-q3_k_xl\\expert-profile.txt",
     "--conversation-cache-mib",
     "auto"
   ],
   "cwd": "D:\\PolyStrata",
   "tokenizer": "D:\\Users\\Kurryn_PC\\Documents\\Strata\\Models\\packs\\inkling2-ud-q4_k_xl\\tokenizer",
-  "model_name": "inkling-2-mini-ud-q4_k_xl",
-  "display_name": "Inkling 2 Mini UD-Q4_K_XL",
-  "log": "D:\\PolyStrata\\strata-inkling2-ud-q4_k_xl.log",
-  "lib_dirs": [
-    "D:\\PolyStrata\\.venv\\Lib\\site-packages\\nvidia\\cu13\\bin\\x86_64"
-  ],
+  "model_name": "inkling-2-mini-ud-q3_k_xl",
+  "display_name": "Inkling 2 Mini UD-Q3_K_XL",
+  "log": "D:\\PolyStrata\\strata-inkling2-ud-q3_k_xl.log",
   "port": 8080,
   "gpu": 0,
-  "gpus_asked": true,
-  "cors_origins": [
-    "*"
-  ],
+  "cors_origins": ["*"],
   "reasoning_close_retry": true,
   "repeat_stop_tokens": 64,
   "vision": {
     "exe": "D:\\PolyStrata\\engine-poly-inkling2\\strata-vision-inkling2.exe",
     "mmproj": "D:\\Users\\Kurryn_PC\\Documents\\Strata\\Models\\models\\inkling2-UD-Q4_K_XL\\mmproj-F16.gguf",
-    "model": "D:\\Users\\Kurryn_PC\\Documents\\Strata\\Models\\models\\inkling2-UD-Q4_K_XL\\Inkling-2-Mini-UD-Q4_K_XL.gguf",
+    "model": "D:\\Users\\Kurryn_PC\\Documents\\Strata\\Models\\models\\inkling2-UD-Q3_K_XL\\Inkling-2-Mini-UD-Q3_K_XL.gguf",
     "gpu": false,
     "threads": 12
   },
@@ -244,4 +331,27 @@ Verified against live HTTP endpoints (`/v1/chat/completions`, `/v1/messages`, `/
     "top_p": 1.0
   }
 }
+```
+
+#### B. Running Without DSpark MTP (No `inkling2-dspark.gguf` Needed)
+
+To run **without DSpark MTP**, simply remove `"--draft-model", ".../inkling2-dspark.gguf"` from `"args"` (and remove the `"vision"` block if you don't need image input):
+
+```json
+  "args": [
+    "--model",
+    "D:\\Users\\Kurryn_PC\\Documents\\Strata\\Models\\models\\inkling2-UD-Q4_K_XL\\Inkling-2-Mini-UD-Q4_K_XL.gguf",
+    "--max-context",
+    "262144",
+    "--kv",
+    "k8v4",
+    "--vram-reserve-mib",
+    "1280",
+    "--prompt-batch",
+    "512",
+    "--ram-experts-mib",
+    "-1",
+    "--conversation-cache-mib",
+    "auto"
+  ]
 ```

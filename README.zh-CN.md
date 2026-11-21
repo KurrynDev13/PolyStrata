@@ -27,7 +27,7 @@ PolyStrata 能在普通电脑上运行通常要用服务器才能跑的大型 AI
 另外十二个用的是为 PolyStrata 写的引擎，需要一张 NVIDIA 显卡，也可以用[两张](docs/MULTI_GPU.md#the-strata-poly-models)：十二个都能在 Linux 上跑，除了 GLM 5.3 Flash 和 DeepSeek V4 Flash，其余也都能在 Windows 上跑。
 目前是实验性的：在 32 GB 显卡的电脑上跑过，较小的模型也在 8 GB 或 12 GB 显卡上跑过。
 
-- **[Inkling 2 Mini](Inkling%202%20Mini%20Benchmark.md)**：Thinking Machines Lab 的 48 虚拟层循环 MoE 模型（`inkling2_loop` / `inkling2`），文件 12 到 18 GB（Unsloth 的 `UD-Q4_K_XL` 在第 0–19 层保留原生 NVFP4）。48 个虚拟层中有 40 层只往回看 1,024 个 token，只有 8 层使用全局注意力，因此 128K 上下文的全局 KV 缓存在 FP16 下仅占 256 MiB（Q8_0 下仅占 136 MiB）。它也能通过 CPU 视觉编码器看图片。
+- **[Inkling 2 Mini](Inkling%202%20Mini%20Benchmark.md)**：Thinking Machines Lab 的 48 虚拟层循环 MoE 模型（`inkling2_loop` / `inkling2`），文件 12 到 18 GB（[`unsloth/Inkling-2-Mini-GGUF`](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF)：`UD-Q3_K_XL` 为 14.4 GiB，`UD-Q4_K_XL` 为 16.4 GiB 且第 0–19 层保留原生 NVFP4）。支持可选的原生 **DSpark MTP** 8-token 块投机解码（`--draft-model inkling2-dspark.gguf`），也可不加载 MTP 仅使用零显存占用的内置 n-gram lookup。48 个虚拟层中有 40 层在固定环形缓冲区中只往回看 1,024 个 token，仅 8 层使用全局注意力，每 token 占 `32 KiB`（FP16，128K 下 `4.0 GiB`）、`17 KiB`（`--kv q8_0`，`2.13 GiB`）、`13 KiB`（`--kv k8v4`，`1.63 GiB`，`Q8_0` K + `Q4_0` V）或 `9 KiB`（`--kv q4_0`，`1.13 GiB`），配合 `--kv-grow` 可扩展至 1M `max_context`。它也能通过 CPU 视觉编码器（`mmproj-F16.gguf`）看图片。
 - **[GLM 5.3 Flash](docs/models/glm.zh-CN.md)**：最大的一个，文件 79 到 114 GB，大部分留在内存里。
 - **[DeepSeek V4 Flash](docs/models/deepseek.zh-CN.md)**：文件 91 GB，大部分也留在内存里。它记对话占的显存很少：128K 上下文只比 32K 多占 0.7 GB。
 - **[LFM2.5-24B-A2B](docs/models/lfm25.zh-CN.md)**：Liquid AI 的模型，文件 11 到 25 GB。它大部分层没有注意力，所以长对话占的显存很少：
@@ -73,7 +73,7 @@ PolyStrata 基于 Niko1221 的 [Strata](https://github.com/Niko1221/Strata)。
 
 笔记本：RTX 4070 Laptop（8 GB）、Core i7-14700HX、32 GB 内存。工作站：RTX 5090（32 GB）、Xeon Platinum 8470Q（25 vCPU）、90-120 GB 内存。Flint 在笔记本上是 UD-Q3_K_XL（32 GB 内存时安装程序选的规格），在工作站上是 UD-Q4_K_XL。Kolibri 1 在工作站上是 Q2_K；安装程序在工作站上会选 Q4_K_M，这个规格没测。
 
-**Inkling 2 Mini（`UD-Q4_K_XL`，17.63 GB）** 在 RTX 4070 SUPER（12 GB 显存）、46.7 GiB DDR5 内存的台式机上，以 **128K `max_context`（`131072`）** 测得：单轮写回答 **45.0–47.3 token/秒**（多轮代码/日志配合 lookup 草稿可达 **108.2 token/秒**），读 5,461 token 提示 **1,307 token/秒**——比 **llama.cpp（PR `#32704`）快 3.4 到 3.7 倍**（完整报告见 [Inkling 2 Mini Benchmark.md](Inkling%202%20Mini%20Benchmark.md)）。
+**Inkling 2 Mini（`UD-Q3_K_XL` 14.4 GiB 与 `UD-Q4_K_XL` 16.4 GiB）** 在 RTX 4070 SUPER（12 GB 显存）、32 GB DDR5 内存的台式机上，以 **128K–1M `max_context`** 测得：启用原生 **DSpark MTP**（`--draft-model inkling2-dspark.gguf --kv k8v4 --cache-bias 0.2`）时，`UD-Q3_K_XL` 短提示写回答 **64.4 token/秒**（代码生成最高 **99.4 token/秒**），32.7K 上下文下写 **50.2 token/秒**（读提示 **821 token/秒**），在 **181.6K token** 实时编程会话中仍保持 **28.1–30.0 token/秒**（`UD-Q4_K_XL` + DSpark 短提示 **60.2 token/秒** / 32.7K 下 **44.1 token/秒**）。**不启用 MTP** 时（`UD-Q4_K_XL`），单轮写回答 **45.0–47.3 token/秒**（多轮代码/日志配合内置 lookup 草稿可达 **108.2 token/秒**），读 5,461 token 提示 **1,307 token/秒**——比 **llama.cpp（PR `#32704`）快 3.4 到 3.7 倍**；在严格纯解码（`--window 1`、`1048576` `max_context`）下，FP16 可在 **~92K token** 内保持 `>= 30 token/秒`，`--kv q8_0` 可达 **~122K token**，`--kv q4_0` 可达 **~137K–141K token**（完整测速、模型下载与启用/不启用 MTP 的配置指南见 [Inkling 2 Mini Benchmark.md](Inkling%202%20Mini%20Benchmark.md)）。
 
 Qwen3.8-Flash-Next 用的是 [Strata](https://github.com/Niko1221/Strata) 的引擎，由 Strata 项目在 RTX 5070（12 GB）、64 GB 内存的电脑上测得：IQ2_XS 写 79、读 32K 提示 2,090（[全部规格](docs/models/qwen38.zh-CN.md)）。
 
