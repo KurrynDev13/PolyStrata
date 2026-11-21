@@ -3,7 +3,7 @@
 [English](README.md) · [简体中文](README.zh-CN.md) · **日本語** · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md) · [Türkçe](README.tr.md)
 
 <p align="center"><b>大きな AI モデルを、手元の PC で動かす</b><br>
-Qwen3.8-Flash-Next、GLM 5.3 Flash、DeepSeek V4 Flash、LFM2.5、Flint、Qwen3.6、Clover、Ornith 1.5、Gemma 4、Tiel Coder、MiniCPM-V、Kolibri 1 · 無料のオープンソース</p>
+Inkling 2 Mini、Qwen3.8-Flash-Next、GLM 5.3 Flash、DeepSeek V4 Flash、LFM2.5、Flint、Qwen3.6、Clover、Ornith 1.5、Gemma 4、Tiel Coder、MiniCPM-V、Kolibri 1 · 無料のオープンソース</p>
 
 <p align="center"><a href="https://github.com/simplexai-labs/linger"><img height="28" alt="Used by Linger" src="docs/media/used-by-linger.svg"></a></p>
 
@@ -19,16 +19,17 @@ Qwen3.8-Flash-Next、GLM 5.3 Flash、DeepSeek V4 Flash、LFM2.5、Flint、Qwen3.
 PolyStrata は、ふつうはサーバーが必要な大きな AI モデルを普通の PC で動かします。チャットをしたり、コードを書いたり、
 アプリやコーディングエージェントと連携したりできます。データが PC の外に出ることはありません。
 
-動かせるモデルは 12 個で、エンジンは 2 つです。
+動かせるモデルは 13 個で、エンジンは 2 つです。
 
 - **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)**：12 GB 以上の NVIDIA または AMD の
   グラフィックカード、Windows または Linux。画像も読めます。エンジンは
   [Strata](https://github.com/Niko1221/Strata) のものをそのまま使っています。
 
-残りの 11 個は PolyStrata のために書いたエンジンで動きます。NVIDIA カードが 1 枚必要です（[2 枚](docs/MULTI_GPU.md#the-strata-poly-models)でも動きます）。11 個とも Linux で動き、
-GLM 5.3 Flash と DeepSeek V4 Flash 以外は Windows でも動きます。まだ実験的で、動かしたのは 32 GB のカードを載せた 1 台の PC と、
-小さい 8 つについては 8 GB のカードを載せたノート PC 1 台だけです。
+残りの 12 個は PolyStrata のために書いたエンジンで動きます。NVIDIA カードが 1 枚必要です（[2 枚](docs/MULTI_GPU.md#the-strata-poly-models)でも動きます）。12 個とも Linux で動き、
+GLM 5.3 Flash と DeepSeek V4 Flash 以外は Windows でも動きます。まだ実験的で、32 GB のカードを載せた PC と、
+小さいモデルについては 8 GB や 12 GB のカードを載せた PC でも動いています。
 
+- **[Inkling 2 Mini](Inkling%202%20Mini%20Benchmark.md)**：Thinking Machines Lab の 48 仮想層ループ型 MoE モデル（`inkling2_loop` / `inkling2`）で、ファイルは 12〜18 GB（Unsloth の `UD-Q4_K_XL` は 0〜19 層をネイティブ NVFP4 のまま保持）。48 仮想層のうち 40 層は直前の 1,024 トークンだけを見て、8 層だけが全文脈を見るため、128K コンテキストでもグローバル KV キャッシュは FP16 でわずか 256 MiB（Q8_0 では 136 MiB）しか使いません。CPU ビジョンエンコーダーで画像も読めます。
 - **[GLM 5.3 Flash](docs/models/glm.ja.md)**：いちばん大きいモデル。ファイルは 79〜114 GB で、その大部分は RAM に置かれます。
 - **[DeepSeek V4 Flash](docs/models/deepseek.ja.md)**：ファイルは 91 GB で、これも大部分は RAM に置かれます。会話を覚えておくための VRAM が少なく、128K のコンテキストでも 32K より 0.7 GB 多いだけです。
 - **[LFM2.5-24B-A2B](docs/models/lfm25.ja.md)**：Liquid AI のモデルで、ファイルは 11〜25 GB。ほとんどの層にアテンションがないので、
@@ -74,6 +75,8 @@ PolyStrata は Niko1221 の [Strata](https://github.com/Niko1221/Strata) をも�
 | DeepSeek V4 Flash | 動きません（32 GB のカードが必要） | 56 / 1,040 | [DeepSeek](docs/models/deepseek.ja.md) |
 
 ノート PC：RTX 4070 Laptop（8 GB）、Core i7-14700HX、RAM 32 GB。ワークステーション：RTX 5090（32 GB）、Xeon Platinum 8470Q（25 vCPU）、RAM 90〜120 GB。Flint はノート PC では UD-Q3_K_XL（RAM 32 GB でインストーラーが選ぶサイズ）、ワークステーションでは UD-Q4_K_XL です。Kolibri 1 はワークステーションでは Q2_K です。そこでインストーラーが選ぶ Q4_K_M は測っていません。
+
+**Inkling 2 Mini（`UD-Q4_K_XL`、17.63 GB）** は RTX 4070 SUPER（12 GB VRAM）と 46.7 GiB DDR5 RAM のデスクトップで **128K `max_context`（`131072`）** で測定され、単発プロンプトで **45.0〜47.3 トークン/秒**（マルチターンのコード/ログでは lookup ドラフトにより最大 **108.2 トークン/秒**）で書き出し、5,461 トークンのプロンプトを **1,307 トークン/秒**で読み込みました（**llama.cpp PR `#32704` の 3.4〜3.7 倍の速さ**、詳細は [Inkling 2 Mini Benchmark.md](Inkling%202%20Mini%20Benchmark.md)）。
 
 Qwen3.8-Flash-Next は [Strata](https://github.com/Niko1221/Strata) プロジェクトのエンジンで動き、そのプロジェクトが RTX 5070（12 GB）、RAM 64 GB の PC で測りました：IQ2_XS で書き出し 79、32K プロンプトの読み込み 2,090（[全サイズ](docs/models/qwen38.ja.md)）。
 

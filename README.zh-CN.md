@@ -3,7 +3,7 @@
 [English](README.md) · **简体中文** · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md) · [Türkçe](README.tr.md)
 
 <p align="center"><b>在你自己的电脑上运行大型 AI 模型</b><br>
-Qwen3.8-Flash-Next、GLM 5.3 Flash、DeepSeek V4 Flash、LFM2.5、Flint、Qwen3.6、Clover、Ornith 1.5、Gemma 4、Tiel Coder、MiniCPM-V 和 Kolibri 1 · 免费开源</p>
+Inkling 2 Mini、Qwen3.8-Flash-Next、GLM 5.3 Flash、DeepSeek V4 Flash、LFM2.5、Flint、Qwen3.6、Clover、Ornith 1.5、Gemma 4、Tiel Coder、MiniCPM-V 和 Kolibri 1 · 免费开源</p>
 
 <p align="center"><a href="https://github.com/simplexai-labs/linger"><img height="28" alt="Used by Linger" src="docs/media/used-by-linger.svg"></a></p>
 
@@ -19,14 +19,15 @@ Qwen3.8-Flash-Next、GLM 5.3 Flash、DeepSeek V4 Flash、LFM2.5、Flint、Qwen3.
 PolyStrata 能在普通电脑上运行通常要用服务器才能跑的大型 AI 模型。它们能聊天、写代码，还能配合你的应用和编程智能体一起工作。
 所有数据都留在你的电脑上。
 
-它能跑十二个模型，用两个引擎：
+它能跑十三个模型，用两个引擎：
 
 - **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)**：12 GB 及以上的 NVIDIA 或 AMD 显卡，Windows 或
   Linux。它还能看图片。引擎是 Strata 项目的，没有改动。
 
-另外十一个用的是为 PolyStrata 写的引擎，需要一张 NVIDIA 显卡，也可以用[两张](docs/MULTI_GPU.md#the-strata-poly-models)：十一个都能在 Linux 上跑，除了 GLM 5.3 Flash 和 DeepSeek V4 Flash，其余也都能在 Windows 上跑。
-目前是实验性的：只在一台 32 GB 显卡的电脑上跑过，八个小的另外在一台 8 GB 显卡的笔记本上跑过。
+另外十二个用的是为 PolyStrata 写的引擎，需要一张 NVIDIA 显卡，也可以用[两张](docs/MULTI_GPU.md#the-strata-poly-models)：十二个都能在 Linux 上跑，除了 GLM 5.3 Flash 和 DeepSeek V4 Flash，其余也都能在 Windows 上跑。
+目前是实验性的：在 32 GB 显卡的电脑上跑过，较小的模型也在 8 GB 或 12 GB 显卡上跑过。
 
+- **[Inkling 2 Mini](Inkling%202%20Mini%20Benchmark.md)**：Thinking Machines Lab 的 48 虚拟层循环 MoE 模型（`inkling2_loop` / `inkling2`），文件 12 到 18 GB（Unsloth 的 `UD-Q4_K_XL` 在第 0–19 层保留原生 NVFP4）。48 个虚拟层中有 40 层只往回看 1,024 个 token，只有 8 层使用全局注意力，因此 128K 上下文的全局 KV 缓存在 FP16 下仅占 256 MiB（Q8_0 下仅占 136 MiB）。它也能通过 CPU 视觉编码器看图片。
 - **[GLM 5.3 Flash](docs/models/glm.zh-CN.md)**：最大的一个，文件 79 到 114 GB，大部分留在内存里。
 - **[DeepSeek V4 Flash](docs/models/deepseek.zh-CN.md)**：文件 91 GB，大部分也留在内存里。它记对话占的显存很少：128K 上下文只比 32K 多占 0.7 GB。
 - **[LFM2.5-24B-A2B](docs/models/lfm25.zh-CN.md)**：Liquid AI 的模型，文件 11 到 25 GB。它大部分层没有注意力，所以长对话占的显存很少：
@@ -71,6 +72,8 @@ PolyStrata 基于 Niko1221 的 [Strata](https://github.com/Niko1221/Strata)。
 | DeepSeek V4 Flash | 跑不了，要 32 GB 显卡 | 56 / 1,040 | [DeepSeek](docs/models/deepseek.zh-CN.md) |
 
 笔记本：RTX 4070 Laptop（8 GB）、Core i7-14700HX、32 GB 内存。工作站：RTX 5090（32 GB）、Xeon Platinum 8470Q（25 vCPU）、90-120 GB 内存。Flint 在笔记本上是 UD-Q3_K_XL（32 GB 内存时安装程序选的规格），在工作站上是 UD-Q4_K_XL。Kolibri 1 在工作站上是 Q2_K；安装程序在工作站上会选 Q4_K_M，这个规格没测。
+
+**Inkling 2 Mini（`UD-Q4_K_XL`，17.63 GB）** 在 RTX 4070 SUPER（12 GB 显存）、46.7 GiB DDR5 内存的台式机上，以 **128K `max_context`（`131072`）** 测得：单轮写回答 **45.0–47.3 token/秒**（多轮代码/日志配合 lookup 草稿可达 **108.2 token/秒**），读 5,461 token 提示 **1,307 token/秒**——比 **llama.cpp（PR `#32704`）快 3.4 到 3.7 倍**（完整报告见 [Inkling 2 Mini Benchmark.md](Inkling%202%20Mini%20Benchmark.md)）。
 
 Qwen3.8-Flash-Next 用的是 [Strata](https://github.com/Niko1221/Strata) 的引擎，由 Strata 项目在 RTX 5070（12 GB）、64 GB 内存的电脑上测得：IQ2_XS 写 79、读 32K 提示 2,090（[全部规格](docs/models/qwen38.zh-CN.md)）。
 

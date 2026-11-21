@@ -3,7 +3,7 @@
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · **Français** · [Español](README.es.md) · [Português](README.pt-BR.md) · [Türkçe](README.tr.md)
 
 <p align="center"><b>Faites tourner de grands modèles d'IA sur votre propre PC</b><br>
-Qwen3.8-Flash-Next, GLM 5.3 Flash, DeepSeek V4 Flash, LFM2.5, Flint, Qwen3.6, Clover, Ornith 1.5, Gemma 4, Tiel Coder, MiniCPM-V et Kolibri 1 · gratuit et open source</p>
+Inkling 2 Mini, Qwen3.8-Flash-Next, GLM 5.3 Flash, DeepSeek V4 Flash, LFM2.5, Flint, Qwen3.6, Clover, Ornith 1.5, Gemma 4, Tiel Coder, MiniCPM-V et Kolibri 1 · gratuit et open source</p>
 
 <p align="center"><a href="https://github.com/simplexai-labs/linger"><img height="28" alt="Used by Linger" src="docs/media/used-by-linger.svg"></a></p>
 
@@ -19,16 +19,17 @@ Qwen3.8-Flash-Next, GLM 5.3 Flash, DeepSeek V4 Flash, LFM2.5, Flint, Qwen3.6, Cl
 PolyStrata fait tourner de grands modèles d'IA sur un PC normal, des modèles qui demandent d'habitude un serveur.
 Ils discutent, écrivent du code et fonctionnent avec vos applications et vos agents de code. Rien ne quitte votre PC.
 
-Il fait tourner douze modèles, avec deux moteurs :
+Il fait tourner treize modèles, avec deux moteurs :
 
 - **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)** sur une carte graphique NVIDIA ou AMD
   de 12 Go ou plus, sous Windows ou Linux. Il lit aussi les images. Son moteur est celui de
   [Strata](https://github.com/Niko1221/Strata), inchangé.
 
-Les onze autres tournent sur un moteur écrit pour PolyStrata, avec une carte NVIDIA ou [deux](docs/MULTI_GPU.md#the-strata-poly-models) : tous les onze sous Linux, et
-tous sauf GLM 5.3 Flash et DeepSeek V4 Flash aussi sous Windows. Ils sont expérimentaux : ils n'ont tourné que sur un seul PC avec une carte
-de 32 Go, et les huit plus petits en plus sur un portable avec une carte de 8 Go.
+Les douze autres tournent sur un moteur écrit pour PolyStrata, avec une carte NVIDIA ou [deux](docs/MULTI_GPU.md#the-strata-poly-models) : tous les douze sous Linux, et
+tous sauf GLM 5.3 Flash et DeepSeek V4 Flash aussi sous Windows. Ils sont expérimentaux : ils ont tourné sur un PC avec une carte
+de 32 Go, et les plus petits aussi sur une carte de 8 Go ou 12 Go.
 
+- **[Inkling 2 Mini](Inkling%202%20Mini%20Benchmark.md)** de Thinking Machines Lab, un modèle MoE bouclé à 48 couches virtuelles (`inkling2_loop` / `inkling2`) dans un fichier de 12 à 18 Go (`UD-Q4_K_XL` d'Unsloth conserve les couches 0 à 19 en NVFP4 natif). 40 de ses 48 couches virtuelles ne regardent que 1 024 tokens en arrière et seules 8 couvrent tout le contexte, si bien qu'un contexte de 128K ne prend que 256 Mio de cache KV global en FP16 (136 Mio en Q8_0). Il lit aussi les images via un encodeur de vision sur CPU.
 - **[GLM 5.3 Flash](docs/models/glm.fr.md)**, le plus grand : un fichier de 79 à 114 Go, dont la plus grande part reste en RAM.
 - **[DeepSeek V4 Flash](docs/models/deepseek.fr.md)**, un fichier de 91 Go, dont la plus grande part reste aussi en RAM. Sa
   mémoire d'une discussion est petite : un contexte de 128K ne prend que 0,7 Go de VRAM de plus que 32K.
@@ -83,6 +84,8 @@ Le tableau donne la taille que l'installeur prend pour chaque modèle, en tokens
 | DeepSeek V4 Flash | ne tourne pas : il faut une carte de 32 Go | 56 / 1,040 | [DeepSeek](docs/models/deepseek.fr.md) |
 
 Portable : RTX 4070 Laptop (8 Go), Core i7-14700HX, 32 Go de RAM. Station de travail : RTX 5090 (32 Go), Xeon Platinum 8470Q (25 vCPU), 90 à 120 Go de RAM. Flint est en UD-Q3_K_XL sur le portable, la taille que l'installeur prend avec 32 Go de RAM, et en UD-Q4_K_XL sur la station de travail. Kolibri 1 est en Q2_K sur la station de travail ; l'installeur y prend Q4_K_M, qui n'a pas été mesuré.
+
+**Inkling 2 Mini (`UD-Q4_K_XL`, 17,63 Go)** a été mesuré sur un PC de bureau équipé d'une RTX 4070 SUPER (12 Go de VRAM) et de 46,7 Gio de RAM DDR5 avec un **`max_context` de 128K (`131072`)** : il écrit des réponses à **45,0–47,3 tokens/s** (jusqu'à **108,2 tokens/s** avec les brouillons par lookup en session multi-tours) et lit un prompt de 5 461 tokens à **1 307 tokens/s** — **3,4 à 3,7 fois plus vite que llama.cpp** (PR `#32704`, [benchmark complet](Inkling%202%20Mini%20Benchmark.md)).
 
 Qwen3.8-Flash-Next tourne sur le moteur du projet [Strata](https://github.com/Niko1221/Strata), qui l'a mesuré sur un PC avec une RTX 5070 (12 Go) et 64 Go de RAM : IQ2_XS écrit à 79 et lit un prompt de 32K à 2,090 ([toutes les tailles](docs/models/qwen38.fr.md)).
 

@@ -3,7 +3,7 @@
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md) · **Türkçe**
 
 <p align="center"><b>Büyük yapay zekâ modellerini kendi bilgisayarında çalıştır</b><br>
-Qwen3.8-Flash-Next, GLM 5.3 Flash, DeepSeek V4 Flash, LFM2.5, Flint, Qwen3.6, Clover, Ornith 1.5, Gemma 4, Tiel Coder, MiniCPM-V ve Kolibri 1 · ücretsiz ve açık kaynak</p>
+Inkling 2 Mini, Qwen3.8-Flash-Next, GLM 5.3 Flash, DeepSeek V4 Flash, LFM2.5, Flint, Qwen3.6, Clover, Ornith 1.5, Gemma 4, Tiel Coder, MiniCPM-V ve Kolibri 1 · ücretsiz ve açık kaynak</p>
 
 <p align="center"><a href="https://github.com/simplexai-labs/linger"><img height="28" alt="Used by Linger" src="docs/media/used-by-linger.svg"></a></p>
 
@@ -20,16 +20,17 @@ PolyStrata, normalde bir sunucu gerektiren büyük yapay zekâ modellerini sıra
 modeller sohbet eder, kod yazar, uygulamaların ve kodlama ajanlarınla birlikte çalışır. Hiçbir veri bilgisayarından
 dışarı çıkmaz.
 
-İki motor üzerinde on iki model çalıştırır:
+İki motor üzerinde on üç model çalıştırır:
 
 - **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)**: Windows veya Linux'ta, 12 GB ya da
   daha fazla belleği olan bir NVIDIA veya AMD ekran kartında. Resimleri de okur. Motoru
   [Strata](https://github.com/Niko1221/Strata) projesinin motorudur, değiştirilmeden kullanılır.
 
-Diğer on biri, PolyStrata için yazılmış bir motorda, bir NVIDIA kartıyla ya da [iki](docs/MULTI_GPU.md#the-strata-poly-models) kartla çalışır: hepsi
-Linux'ta, GLM 5.3 Flash ve DeepSeek V4 Flash dışındakiler Windows'ta da. Deneyseldirler: 32 GB kartlı tek bir
-bilgisayarda, sekiz küçük olanı ayrıca 8 GB kartlı bir dizüstünde de çalıştırıldı.
+Diğer on ikisi, PolyStrata için yazılmış bir motorda, bir NVIDIA kartıyla ya da [iki](docs/MULTI_GPU.md#the-strata-poly-models) kartla çalışır: hepsi
+Linux'ta, GLM 5.3 Flash ve DeepSeek V4 Flash dışındakiler Windows'ta da. Deneyseldirler: 32 GB kartlı bir
+bilgisayarda, küçük olanları ayrıca 8 GB veya 12 GB kartlı bilgisayarlarda da çalıştırıldı.
 
+- **[Inkling 2 Mini](Inkling%202%20Mini%20Benchmark.md)**, Thinking Machines Lab tarafından geliştirilen 48 sanal katmanlı döngüsel MoE modeli (`inkling2_loop` / `inkling2`): 12 ila 18 GB'lık bir dosya (Unsloth'un `UD-Q4_K_XL` boyutu 0–19. katmanları yerel NVFP4 olarak korur). 48 sanal katmanının 40'ı yalnızca 1.024 token geriye bakar ve yalnızca 8'i tüm bağlama dikkat eder; bu sayede 128K bağlam FP16'da yalnızca 256 MiB genel KV önbelleği alır (Q8_0'da 136 MiB). Ayrıca CPU görüntü kodlayıcısı aracılığıyla resimleri de okur.
 - **[GLM 5.3 Flash](docs/models/glm.md)**, en büyükleri: 79 ila 114 GB'lık bir dosya, çoğu RAM'de kalır.
 - **[DeepSeek V4 Flash](docs/models/deepseek.md)**, 91 GB'lık bir dosya; bunun da çoğu RAM'de kalır. Bir sohbeti
   hafızasında tutmak için az yer kaplar: 128K bağlam, 32K'ya göre yalnızca 0,7 GB daha fazla VRAM alır.
@@ -86,6 +87,8 @@ Tablo, her model için yükleyicinin seçtiği boyutu, saniyede token olarak ver
 | DeepSeek V4 Flash | çalışmaz: 32 GB kart gerekir | 56 / 1.040 | [DeepSeek](docs/models/deepseek.md) |
 
 Dizüstü: RTX 4070 Laptop (8 GB), Core i7-14700HX, 32 GB RAM. İş istasyonu: RTX 5090 (32 GB), Xeon Platinum 8470Q (25 vCPU), 90 ila 120 GB RAM. Flint, dizüstünde UD-Q3_K_XL boyutuyla (yükleyicinin 32 GB RAM ile seçtiği boyut), iş istasyonunda UD-Q4_K_XL boyutuyla ölçüldü. Kolibri 1, iş istasyonunda Q2_K boyutuyla ölçüldü; yükleyici orada Q4_K_M boyutunu seçer, bu boyut ölçülmedi.
+
+**Inkling 2 Mini (`UD-Q4_K_XL`, 17,63 GB)**, RTX 4070 SUPER (12 GB VRAM) ve 46,7 GiB DDR5 RAM'li bir masaüstünde **128K `max_context` (`131072`)** ile ölçüldü: yanıtları saniyede **45,0–47,3 token** hızla yazar (çok turlu kod/günlük oturumlarında lookup taslaklarıyla saniyede **108,2 token**'a kadar) ve 5.461 token'lık bir prompt'u saniyede **1.307 token** hızla okur — **llama.cpp'den (PR `#32704`) 3,4 ila 3,7 kat daha hızlı** ([tam benchmark](Inkling%202%20Mini%20Benchmark.md)).
 
 Qwen3.8-Flash-Next, [Strata](https://github.com/Niko1221/Strata) projesinin motorunda çalışır ve o proje tarafından RTX 5070 (12 GB) ve 64 GB RAM'li bir bilgisayarda ölçüldü: IQ2_XS boyutu saniyede 79 token yazar ve 32K'lık bir prompt'u saniyede 2.090 token hızla okur ([tüm boyutlar](docs/models/qwen38.md)).
 
