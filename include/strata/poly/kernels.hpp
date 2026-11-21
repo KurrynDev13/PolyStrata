@@ -460,19 +460,34 @@ void inkling_l2_clip(const float* x, const float* scale, float* out, int dim, in
 void inkling_rel_table(const float* r_cur, const float* rel_bias, const float* sinks, float* table, int n_rel,
                        int n_extent, int n_head, int rows, void* stream);
 
+/// Block-32 symmetric 4-bit KV cache (`--kv q4_0` for inkling2): `n` values pack into `n / 2` bytes (`elem[b*32+i]`
+/// in the low nibble, `elem[b*32+i+16]` in the high nibble, stored as `clamp(round(x / scale), -8, 7) + 8`), with one
+/// fp16 scale (`max_abs / 7.0f`) per 32-value block (`n / 32` halves per row). `n` must be a multiple of 32.
+struct Kvq4 {
+    const uint8_t* codes = nullptr;
+    const uint16_t* scales = nullptr;
+};
+
+void store_q4(const float* x, uint8_t* codes, uint16_t* scales, int n, int64_t pos, int rows, void* stream);
+void store_q4_at(const float* x, uint8_t* codes, uint16_t* scales, int n, const long long* at, int rows, int ring,
+                 void* stream);
+
 /// Inkling 2 decode/window attention with per-query distance bias table (`table`), beyond-extent fallback (`-sinks`),
-/// and virtual zero-value sink (m = 0, l = 1). Supports FP16 and --kv q8_0 caches, SWA rings, and CUDA graph `at`.
+/// and virtual zero-value sink (m = 0, l = 1). Supports FP16, --kv q8_0, and --kv q4_0 caches, SWA rings, and CUDA
+/// graph `at`.
 void inkling_attend(const float* q, const uint16_t* kcache, const uint16_t* vcache, const float* table,
                     const float* sinks, int n_extent, int64_t pos, int rows, float* score, int chunk, float* out,
                     int dim, int n_head, int kv_heads, float scale, void* stream, int window = 0, int ring = 0,
-                    const long long* at = nullptr, int room = 0, Kvq8 kq8 = {}, Kvq8 vq8 = {});
+                    const long long* at = nullptr, int room = 0, Kvq8 kq8 = {}, Kvq8 vq8 = {}, Kvq4 kq4 = {},
+                    Kvq4 vq4 = {});
 
 /// Inkling 2 prompt-batch attention using cuBLAS GEMM tiles + online block softmax with distance bias + zero sink.
 void inkling_attend_batch(void* blas, const float* q, const uint16_t* kcache, const uint16_t* vcache,
                           const float* table, const float* sinks, int n_extent, int64_t pos, int rows, float* score,
                           size_t score_floats, float* work, float* out, int dim, int n_head, int kv_heads,
                           float scale, void* stream, int window = 0, int ring = 0, Kvq8 kq8 = {}, Kvq8 vq8 = {},
-                          uint16_t* kwork = nullptr, uint16_t* vwork = nullptr, size_t work_halves = 0);
+                          uint16_t* kwork = nullptr, uint16_t* vwork = nullptr, size_t work_halves = 0,
+                          Kvq4 kq4 = {}, Kvq4 vq4 = {});
 
 /// Copy stream `src_stream` into stream `dst_stream` inside `r` ([rows, streams, n_embd]), or from flat `x`.
 void inkling_copy_stream(float* r, int streams, int dst_stream, int src_stream, int n_embd, int rows, void* stream);

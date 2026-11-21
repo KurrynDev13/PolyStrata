@@ -291,23 +291,51 @@ size_t Inkling2::recurrent_floats() const {
     return schedule_.size() * slot_conv_floats_;
 }
 
+size_t Inkling2::kv_code_row_bytes() const {
+    const size_t row = (size_t) n_kv_ * head_dim_;
+    if (opt_.kv_format == KvFmt::kQ4_0) return row / 2;
+    if (opt_.kv_format == KvFmt::kQ8_0) return row;
+    return row * sizeof(uint16_t);
+}
+
+size_t Inkling2::kv_scale_row_bytes() const {
+    const bool quant = opt_.kv_format == KvFmt::kQ8_0 || opt_.kv_format == KvFmt::kQ4_0;
+    return quant ? (size_t) n_kv_ * (head_dim_ / 32) * sizeof(uint16_t) : 0;
+}
+
+uint8_t* Inkling2::slot_k_codes(const SlotCache& sc) const {
+    if (opt_.kv_format == KvFmt::kQ4_0) return sc.k_q4;
+    if (opt_.kv_format == KvFmt::kQ8_0) return (uint8_t*) sc.k_codes;
+    return (uint8_t*) sc.keys;
+}
+
+uint8_t* Inkling2::slot_v_codes(const SlotCache& sc) const {
+    if (opt_.kv_format == KvFmt::kQ4_0) return sc.v_q4;
+    if (opt_.kv_format == KvFmt::kQ8_0) return (uint8_t*) sc.v_codes;
+    return (uint8_t*) sc.vals;
+}
+
 void Inkling2::alloc_caches() {
     ring_ = std::min(opt_.max_context, window_ + rows_);
     keep_ = std::min(window_, ring_);
     const bool q8 = opt_.kv_format == KvFmt::kQ8_0;
+    const bool q4 = opt_.kv_format == KvFmt::kQ4_0;
+    const bool quant = q8 || q4;
     const size_t row = (size_t) n_kv_ * head_dim_;
-    const size_t scale_row = (size_t) n_kv_ * (head_dim_ / 32) * sizeof(uint16_t);
-    if (q8 && again_ == SIZE_MAX)
-        std::fprintf(stderr, "strata-poly: inkling2 q8_0 KV cache: %zu bytes/row (%d global, %d SWA)\n",
-                     row + scale_row, n_global_slots_, n_swa_slots_);
+    const size_t code_row = kv_code_row_bytes();
+    const size_t scale_row = kv_scale_row_bytes();
+    if (quant && again_ == SIZE_MAX)
+        std::fprintf(stderr, "strata-poly: inkling2 %s KV cache: %zu bytes/row (%d global, %d SWA)\n",
+                     q4 ? "q4_0" : "q8_0", code_row + scale_row, n_global_slots_, n_swa_slots_);
 
-    const size_t rings = q8 ? 0 : 2 * (size_t) n_swa_slots_ * (size_t) ring_ * row;
-    const size_t codes = q8 ? 2 * (size_t) n_swa_slots_ * (size_t) ring_ * row : 0;
-    const size_t scales = q8 ? 2 * (size_t) n_swa_slots_ * (size_t) ring_ * scale_row : 0;
+    const size_t swa_codes = 2 * (size_t) n_swa_slots_ * (size_t) ring_ * code_row;
+    const size_t swa_scales = quant ? 2 * (size_t) n_swa_slots_ * (size_t) ring_ * scale_row : 0;
 
-    uint8_t* rc = codes ? (uint8_t*) seq_alloc(codes, "the attention cache") : nullptr;
-    uint8_t* rs = scales ? (uint8_t*) seq_alloc(scales, "the attention cache") : nullptr;
-    uint16_t* kv = rings ? (uint16_t*) seq_alloc(rings * sizeof(uint16_t), "the attention cache") : nullptr;
+    uint8_t* rc = quant ? (uint8_t*) seq_alloc(swa_codes, "the attention cache") : nullptr;
+    uint8_t* rs = quant ? (uint8_t*) seq_alloc(swa_scales, "the attention cache") : nullptr;
+    uint16_t* kv = !quant ? (uint16_t*) seq_alloc(2 * (size_t) n_swa_slots_ * (size_t) ring_ * row * sizeof(uint16_t),
+                                                   "the attention cache")
+                          : nullptr;
 
     slots_.assign(schedule_.size(), SlotCache{});
     int swa_idx = 0;
@@ -318,13 +346,22 @@ void Inkling2::alloc_caches() {
         sc.state_off = s * slot_conv_floats_;
         if (B.swa) {
             sc.swa_idx = swa_idx++;
-            if (q8) {
+            if (q4) {
+                sc.k_q4 = rc;
+                rc += (size_t) ring_ * code_row;
+                sc.k_scales = (uint16_t*) rs;
+                rs += (size_t) ring_ * scale_row;
+                sc.v_q4 = rc;
+                rc += (size_t) ring_ * code_row;
+                sc.v_scales = (uint16_t*) rs;
+                rs += (size_t) ring_ * scale_row;
+            } else if (q8) {
                 sc.k_codes = (int8_t*) rc;
-                rc += (size_t) ring_ * row;
+                rc += (size_t) ring_ * code_row;
                 sc.k_scales = (uint16_t*) rs;
                 rs += (size_t) ring_ * scale_row;
                 sc.v_codes = (int8_t*) rc;
-                rc += (size_t) ring_ * row;
+                rc += (size_t) ring_ * code_row;
                 sc.v_scales = (uint16_t*) rs;
                 rs += (size_t) ring_ * scale_row;
             } else {
@@ -333,10 +370,15 @@ void Inkling2::alloc_caches() {
                 sc.vals = kv;
                 kv += (size_t) ring_ * row;
             }
-        } else if (q8) {
-            sc.k_codes = (int8_t*) kv_alloc(row, 1);
+        } else if (q4) {
+            sc.k_q4 = (uint8_t*) kv_alloc(code_row, 1);
             sc.k_scales = (uint16_t*) kv_alloc(scale_row, 1);
-            sc.v_codes = (int8_t*) kv_alloc(row, 1);
+            sc.v_q4 = (uint8_t*) kv_alloc(code_row, 1);
+            sc.v_scales = (uint16_t*) kv_alloc(scale_row, 1);
+        } else if (q8) {
+            sc.k_codes = (int8_t*) kv_alloc(code_row, 1);
+            sc.k_scales = (uint16_t*) kv_alloc(scale_row, 1);
+            sc.v_codes = (int8_t*) kv_alloc(code_row, 1);
             sc.v_scales = (uint16_t*) kv_alloc(scale_row, 1);
         } else {
             sc.keys = (uint16_t*) kv_alloc(row * sizeof(uint16_t), 1);
@@ -344,7 +386,7 @@ void Inkling2::alloc_caches() {
         }
     }
 
-    const int n_splits_max = std::max(1, (opt_.max_context + 511) / 512);
+    const int n_splits_max = std::clamp((opt_.max_context + 511) / 512, 1, 64);
     chunk_batch_ = std::min(rows_, 64);
     chunk_dec_ = (int) std::clamp<size_t>(
         (size_t(8) << 20) / std::max<size_t>(1, (size_t) n_head_ * n_splits_max * (head_dim_ + 2)), 1,
@@ -382,7 +424,7 @@ void Inkling2::assign_scratch() {
     const size_t max_ext = (size_t) std::max(window_, n_rel_extent_);
     table_ = fbuf((size_t) chunk_batch_ * n_head_ * max_ext);
 
-    const size_t n_splits_max = (size_t) std::max(1, (opt_.max_context + 511) / 512);
+    const size_t n_splits_max = (size_t) std::clamp((opt_.max_context + 511) / 512, 1, 64);
     score_n_ = std::max((size_t) chunk_dec_ * n_head_ * n_splits_max * (head_dim_ + 2),
                         (size_t) chunk_batch_ * n_head_ * 1536);
     score_ = fbuf(score_n_);
@@ -391,19 +433,18 @@ void Inkling2::assign_scratch() {
         const size_t ch = (size_t) chunk_batch_ * n_head_;
         awork_ = fbuf(ch * (head_dim_ + head_dim_ / 2 + 3) + 1);
     }
-    if (rows_ >= kStageRows && opt_.kv_format == KvFmt::kQ8_0) {
+    if (rows_ >= kStageRows && (opt_.kv_format == KvFmt::kQ8_0 || opt_.kv_format == KvFmt::kQ4_0)) {
         work_halves_ = kQ8WorkRows * (size_t) n_kv_ * head_dim_;
         q8w_ = fbuf((2 * work_halves_ + 1) / 2);
     }
 }
 
 size_t Inkling2::card_row_bytes() const {
-    const bool q8 = opt_.kv_format == KvFmt::kQ8_0;
-    const size_t code_row = (size_t) n_kv_ * head_dim_ * (q8 ? 1 : sizeof(uint16_t));
-    const size_t scale_row = q8 ? (size_t) n_kv_ * (head_dim_ / 32) * sizeof(uint16_t) : 0;
+    const size_t code_row = kv_code_row_bytes();
+    const size_t scale_row = kv_scale_row_bytes();
     size_t layers = 0;
     for (const SlotCache& sc : slots_)
-        if (!sc.swa && (q8 ? sc.k_codes != nullptr : sc.keys != nullptr)) ++layers;
+        if (!sc.swa && slot_k_codes(sc) != nullptr) ++layers;
     return layers * 2 * (code_row + scale_row);
 }
 
@@ -411,26 +452,28 @@ void Inkling2::save_card_rows(int64_t first, int64_t n, uint8_t* dst) {
     if (first < 0 || n < 0 || first + n > opt_.max_context)
         throw std::logic_error("save_rows: the rows are outside the context");
     ck(cudaStreamSynchronize(cs(st_)), "save rows");
-    const bool q8 = opt_.kv_format == KvFmt::kQ8_0;
-    const size_t code_row = (size_t) n_kv_ * head_dim_ * (q8 ? 1 : sizeof(uint16_t));
-    const size_t scale_row = q8 ? (size_t) n_kv_ * (head_dim_ / 32) * sizeof(uint16_t) : 0;
+    const bool quant = opt_.kv_format == KvFmt::kQ8_0 || opt_.kv_format == KvFmt::kQ4_0;
+    const size_t code_row = kv_code_row_bytes();
+    const size_t scale_row = kv_scale_row_bytes();
     const size_t at_c = (size_t) first * code_row, at_s = (size_t) first * scale_row;
     const size_t n_c = (size_t) n * code_row, n_s = (size_t) n * scale_row;
     for (const SlotCache& sc : slots_) {
-        if (sc.swa || n == 0 || !(q8 ? sc.k_codes != nullptr : sc.keys != nullptr)) continue;
-        if (q8) {
-            ck(cudaMemcpy(dst, (const uint8_t*) sc.k_codes + at_c, n_c, cudaMemcpyDeviceToHost), "save rows");
+        const uint8_t* kptr = slot_k_codes(sc);
+        const uint8_t* vptr = slot_v_codes(sc);
+        if (sc.swa || n == 0 || kptr == nullptr) continue;
+        if (quant) {
+            ck(cudaMemcpy(dst, kptr + at_c, n_c, cudaMemcpyDeviceToHost), "save rows");
             dst += n_c;
             ck(cudaMemcpy(dst, (const uint8_t*) sc.k_scales + at_s, n_s, cudaMemcpyDeviceToHost), "save rows");
             dst += n_s;
-            ck(cudaMemcpy(dst, (const uint8_t*) sc.v_codes + at_c, n_c, cudaMemcpyDeviceToHost), "save rows");
+            ck(cudaMemcpy(dst, vptr + at_c, n_c, cudaMemcpyDeviceToHost), "save rows");
             dst += n_c;
             ck(cudaMemcpy(dst, (const uint8_t*) sc.v_scales + at_s, n_s, cudaMemcpyDeviceToHost), "save rows");
             dst += n_s;
             continue;
         }
-        for (const uint16_t* cache : {sc.keys, sc.vals}) {
-            ck(cudaMemcpy(dst, (const uint8_t*) cache + at_c, n_c, cudaMemcpyDeviceToHost), "save rows");
+        for (const uint8_t* cache : {kptr, vptr}) {
+            ck(cudaMemcpy(dst, cache + at_c, n_c, cudaMemcpyDeviceToHost), "save rows");
             dst += n_c;
         }
     }
@@ -441,28 +484,30 @@ void Inkling2::load_card_rows(const uint8_t* src, int64_t from, int64_t count, i
         throw std::logic_error("load_rows: the rows are outside what was saved");
     cover(first + n);
     ck(cudaStreamSynchronize(cs(st_)), "load rows");
-    const bool q8 = opt_.kv_format == KvFmt::kQ8_0;
-    const size_t code_row = (size_t) n_kv_ * head_dim_ * (q8 ? 1 : sizeof(uint16_t));
-    const size_t scale_row = q8 ? (size_t) n_kv_ * (head_dim_ / 32) * sizeof(uint16_t) : 0;
+    const bool quant = opt_.kv_format == KvFmt::kQ8_0 || opt_.kv_format == KvFmt::kQ4_0;
+    const size_t code_row = kv_code_row_bytes();
+    const size_t scale_row = kv_scale_row_bytes();
     const size_t at_c = (size_t) first * code_row, at_s = (size_t) first * scale_row;
     const size_t n_c = (size_t) n * code_row, n_s = (size_t) n * scale_row;
     const size_t sk_c = (size_t) (first - from) * code_row, sk_s = (size_t) (first - from) * scale_row;
     const size_t all_c = (size_t) count * code_row, all_s = (size_t) count * scale_row;
     for (const SlotCache& sc : slots_) {
-        if (sc.swa || n == 0 || !(q8 ? sc.k_codes != nullptr : sc.keys != nullptr)) continue;
-        if (q8) {
-            ck(cudaMemcpy((uint8_t*) sc.k_codes + at_c, src + sk_c, n_c, cudaMemcpyHostToDevice), "load rows");
+        uint8_t* kptr = slot_k_codes(sc);
+        uint8_t* vptr = slot_v_codes(sc);
+        if (sc.swa || n == 0 || kptr == nullptr) continue;
+        if (quant) {
+            ck(cudaMemcpy(kptr + at_c, src + sk_c, n_c, cudaMemcpyHostToDevice), "load rows");
             src += all_c;
             ck(cudaMemcpy((uint8_t*) sc.k_scales + at_s, src + sk_s, n_s, cudaMemcpyHostToDevice), "load rows");
             src += all_s;
-            ck(cudaMemcpy((uint8_t*) sc.v_codes + at_c, src + sk_c, n_c, cudaMemcpyHostToDevice), "load rows");
+            ck(cudaMemcpy(vptr + at_c, src + sk_c, n_c, cudaMemcpyHostToDevice), "load rows");
             src += all_c;
             ck(cudaMemcpy((uint8_t*) sc.v_scales + at_s, src + sk_s, n_s, cudaMemcpyHostToDevice), "load rows");
             src += all_s;
             continue;
         }
-        for (uint16_t* cache : {sc.keys, sc.vals}) {
-            ck(cudaMemcpy((uint8_t*) cache + at_c, src + sk_c, n_c, cudaMemcpyHostToDevice), "load rows");
+        for (uint8_t* cache : {kptr, vptr}) {
+            ck(cudaMemcpy(cache + at_c, src + sk_c, n_c, cudaMemcpyHostToDevice), "load rows");
             src += all_c;
         }
     }
@@ -478,10 +523,7 @@ void Inkling2::window_runs(int64_t pos, F&& f) const {
 }
 
 size_t Inkling2::extra_bytes() const {
-    const bool q8 = opt_.kv_format == KvFmt::kQ8_0;
-    const size_t code_row = (size_t) n_kv_ * head_dim_ * (q8 ? 1 : sizeof(uint16_t));
-    const size_t scale_row = q8 ? (size_t) n_kv_ * (head_dim_ / 32) * sizeof(uint16_t) : 0;
-    return (size_t) n_swa_slots_ * 2 * (size_t) keep_ * (code_row + scale_row);
+    return (size_t) n_swa_slots_ * 2 * (size_t) keep_ * (kv_code_row_bytes() + kv_scale_row_bytes());
 }
 
 void Inkling2::save_layer(int slot, int64_t pos, uint8_t* dst) {
@@ -490,9 +532,9 @@ void Inkling2::save_layer(int slot, int64_t pos, uint8_t* dst) {
                   slot_conv_floats_ * sizeof(float), cudaMemcpyDeviceToHost),
        "save state");
     if (!sc.swa) return;
-    const bool q8 = opt_.kv_format == KvFmt::kQ8_0;
-    const size_t code_row = (size_t) n_kv_ * head_dim_ * (q8 ? 1 : sizeof(uint16_t));
-    const size_t scale_row = q8 ? (size_t) n_kv_ * (head_dim_ / 32) * sizeof(uint16_t) : 0;
+    const bool quant = opt_.kv_format == KvFmt::kQ8_0 || opt_.kv_format == KvFmt::kQ4_0;
+    const size_t code_row = kv_code_row_bytes();
+    const size_t scale_row = kv_scale_row_bytes();
     const size_t whole = 2 * (size_t) keep_ * (code_row + scale_row);
     dst += state_n_ * sizeof(float) + (size_t) sc.swa_idx * whole;
     auto save_ring = [&](const uint8_t* cache, size_t one_row) {
@@ -503,21 +545,23 @@ void Inkling2::save_layer(int slot, int64_t pos, uint8_t* dst) {
         });
         dst += (size_t) keep_ * one_row;
     };
-    if (q8) {
-        save_ring((const uint8_t*) sc.k_codes, code_row);
+    const uint8_t* kptr = slot_k_codes(sc);
+    const uint8_t* vptr = slot_v_codes(sc);
+    if (quant) {
+        save_ring(kptr, code_row);
         save_ring((const uint8_t*) sc.k_scales, scale_row);
-        save_ring((const uint8_t*) sc.v_codes, code_row);
+        save_ring(vptr, code_row);
         save_ring((const uint8_t*) sc.v_scales, scale_row);
         return;
     }
-    save_ring((const uint8_t*) sc.keys, code_row);
-    save_ring((const uint8_t*) sc.vals, code_row);
+    save_ring(kptr, code_row);
+    save_ring(vptr, code_row);
 }
 
 void Inkling2::load_extra(const uint8_t* src, int64_t pos) {
-    const bool q8 = opt_.kv_format == KvFmt::kQ8_0;
-    const size_t code_row = (size_t) n_kv_ * head_dim_ * (q8 ? 1 : sizeof(uint16_t));
-    const size_t scale_row = q8 ? (size_t) n_kv_ * (head_dim_ / 32) * sizeof(uint16_t) : 0;
+    const bool quant = opt_.kv_format == KvFmt::kQ8_0 || opt_.kv_format == KvFmt::kQ4_0;
+    const size_t code_row = kv_code_row_bytes();
+    const size_t scale_row = kv_scale_row_bytes();
     for (const SlotCache& sc : slots_) {
         if (!sc.swa) continue;
         auto load_ring = [&](uint8_t* cache, size_t one_row) {
@@ -527,15 +571,17 @@ void Inkling2::load_extra(const uint8_t* src, int64_t pos) {
             });
             src += (size_t) keep_ * one_row;
         };
-        if (q8) {
-            load_ring((uint8_t*) sc.k_codes, code_row);
+        uint8_t* kptr = slot_k_codes(sc);
+        uint8_t* vptr = slot_v_codes(sc);
+        if (quant) {
+            load_ring(kptr, code_row);
             load_ring((uint8_t*) sc.k_scales, scale_row);
-            load_ring((uint8_t*) sc.v_codes, code_row);
+            load_ring(vptr, code_row);
             load_ring((uint8_t*) sc.v_scales, scale_row);
             continue;
         }
-        load_ring((uint8_t*) sc.keys, code_row);
-        load_ring((uint8_t*) sc.vals, code_row);
+        load_ring(kptr, code_row);
+        load_ring(vptr, code_row);
     }
 }
 
@@ -553,6 +599,16 @@ void Inkling2::apply_ctrl(const float* cur, const float* msg, const Block& B, in
 
 void Inkling2::store(const float* x, const SlotCache& sc, int64_t pos, int n, bool value) {
     const int width = n_kv_ * head_dim_;
+    if (opt_.kv_format == KvFmt::kQ4_0) {
+        uint8_t* codes = value ? sc.v_q4 : sc.k_q4;
+        uint16_t* scales = value ? sc.v_scales : sc.k_scales;
+        if (recording_) return store_q4_at(x, codes, scales, width, at_, n, sc.swa ? ring_ : 0, st_);
+        if (!sc.swa) return store_q4(x, codes, scales, width, pos, n, st_);
+        const int at = (int) (pos % ring_), head = std::min(n, ring_ - at);
+        store_q4(x, codes, scales, width, at, head, st_);
+        if (head < n) store_q4(x + (size_t) head * width, codes, scales, width, 0, n - head, st_);
+        return;
+    }
     if (opt_.kv_format == KvFmt::kQ8_0) {
         int8_t* codes = value ? sc.v_codes : sc.k_codes;
         uint16_t* scales = value ? sc.v_scales : sc.k_scales;
@@ -667,8 +723,12 @@ void Inkling2::attn(const Step& st, Block& B, SlotCache& sc, int64_t pos, int n)
     const int window = B.swa ? window_ : 0, ring = B.swa ? ring_ : 0;
     const int n_extent = B.swa ? window_ : n_rel_extent_;
     const bool q8 = opt_.kv_format == KvFmt::kQ8_0;
+    const bool q4 = opt_.kv_format == KvFmt::kQ4_0;
+    const bool quant = q8 || q4;
     const Kvq8 kq = q8 ? Kvq8{sc.k_codes, sc.k_scales} : Kvq8{};
     const Kvq8 vq = q8 ? Kvq8{sc.v_codes, sc.v_scales} : Kvq8{};
+    const Kvq4 kq4 = q4 ? Kvq4{sc.k_q4, sc.k_scales} : Kvq4{};
+    const Kvq4 vq4 = q4 ? Kvq4{sc.v_q4, sc.v_scales} : Kvq4{};
     const int c_step = n >= kStageRows ? chunk_batch_ : chunk_dec_;
     for (int first = 0; first < n; first += c_step) {
         const int c = std::min(c_step, n - first);
@@ -678,17 +738,18 @@ void Inkling2::attn(const Step& st, Block& B, SlotCache& sc, int64_t pos, int n)
         float* att_sub = att_ + (size_t) first * n_head_ * head_dim_;
         inkling_rel_table(r_sub, fp(B.attn_rel_bias), s_sub, table_, n_rel_, n_extent, n_head_, c, st_);
         if (n >= kStageRows) {
-            uint16_t* kw = q8 ? (uint16_t*) q8w_ : nullptr;
-            uint16_t* vw = q8 ? kw + work_halves_ : nullptr;
-            inkling_attend_batch(blas_, q_sub, q8 ? nullptr : sc.keys, q8 ? nullptr : sc.vals, table_, s_sub, n_extent,
-                                 pos + first, c, score_, score_n_, awork_, att_sub, head_dim_, n_head_, n_kv_, scale,
-                                 st_, window, ring, kq, vq, kw, vw, q8 ? work_halves_ : 0);
+            uint16_t* kw = quant ? (uint16_t*) q8w_ : nullptr;
+            uint16_t* vw = quant ? kw + work_halves_ : nullptr;
+            inkling_attend_batch(blas_, q_sub, quant ? nullptr : sc.keys, quant ? nullptr : sc.vals, table_, s_sub,
+                                 n_extent, pos + first, c, score_, score_n_, awork_, att_sub, head_dim_, n_head_,
+                                 n_kv_, scale, st_, window, ring, kq, vq, kw, vw, quant ? work_halves_ : 0, kq4,
+                                 vq4);
         } else {
             const long long* at_sub = at ? at + 2 * first : nullptr;
             const int rm = !at ? 0 : B.swa ? std::min(window_ + n - 1, opt_.max_context) : room(n);
-            inkling_attend(q_sub, q8 ? nullptr : sc.keys, q8 ? nullptr : sc.vals, table_, s_sub, n_extent, pos + first,
-                           c, score_, chunk_dec_, att_sub, head_dim_, n_head_, n_kv_, scale, st_, window, ring, at_sub,
-                           rm, kq, vq);
+            inkling_attend(q_sub, quant ? nullptr : sc.keys, quant ? nullptr : sc.vals, table_, s_sub, n_extent,
+                           pos + first, c, score_, chunk_dec_, att_sub, head_dim_, n_head_, n_kv_, scale, st_,
+                           window, ring, at_sub, rm, kq, vq, kq4, vq4);
         }
     }
 

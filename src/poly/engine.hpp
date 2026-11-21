@@ -42,12 +42,13 @@ class Shards;
 struct Likeliest;
 
 /// The attention caches' storing format, opt-in via --kv.  q8_0 is ggml's blocks (one fp16 scale a 32-value
-/// block of int8 codes) and reads them back element by element; int8 is the same rule with the codes and the
-/// deltas in two arrays, which a reader can take four codes to a load, and int8k keeps only the keys' side
-/// quantized.  q8_0 is qwen35moe's; int8 and int8k are Gemma 4's - the two readers are not the same arithmetic,
-/// so a model has one or the other rather than a choice between them.  Auto is resolved from model
-/// geometry before allocation on Metal; other backends default to fp16.
-enum class KvFmt { kAuto = -1, kFp16 = 0, kQ8_0 = 1, kInt8 = 2, kInt8K = 3 };
+/// block of int8 codes) and reads them back element by element; q4_0 packs block-32 symmetric 4-bit codes with an
+/// fp16 scale for inkling2 long-context caches; int8 is the same rule with the codes and the deltas in two arrays,
+/// which a reader can take four codes to a load, and int8k keeps only the keys' side quantized.  q8_0 is qwen35moe's;
+/// int8 and int8k are Gemma 4's - the two readers are not the same arithmetic, so a model has one or the other rather
+/// than a choice between them.  Auto is resolved from model geometry before allocation on Metal; other backends default
+/// to fp16.
+enum class KvFmt { kAuto = -1, kFp16 = 0, kQ8_0 = 1, kInt8 = 2, kInt8K = 3, kQ4_0 = 4 };
 
 struct Options {
 #if defined(STRATA_GPU_METAL)

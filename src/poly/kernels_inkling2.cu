@@ -21,6 +21,7 @@ namespace {
 constexpr int WARP = 32;
 constexpr int CONV_ROWS = 16;
 constexpr int SPLIT_KEYS = 512;
+constexpr int MAX_SPLITS = 64;
 constexpr size_t kAttendResults = size_t(8) << 20;
 
 cudaStream_t cs(void* s) { return (cudaStream_t) s; }
@@ -317,26 +318,62 @@ __device__ __forceinline__ int attn_rows_span(long long p, int window, long long
     return int(p - *lo) + 1;
 }
 
-__device__ __forceinline__ float read_kv_val(const uint16_t* cache, Kvq8 q8, size_t elem_idx, size_t scale_idx) {
-    if (!q8.codes) return __half2float(__ushort_as_half(cache[elem_idx]));
-    return float(q8.codes[elem_idx]) * __half2float(__ushort_as_half(q8.scales[scale_idx]));
+__device__ __forceinline__ float read_kv_val(const uint16_t* cache, Kvq8 q8, Kvq4 q4, size_t elem_idx,
+                                             size_t scale_idx) {
+    if (q8.codes) return float(q8.codes[elem_idx]) * __half2float(__ushort_as_half(q8.scales[scale_idx]));
+    if (q4.codes) {
+        const uint8_t packed = q4.codes[(scale_idx << 4) + (elem_idx & 15)];
+        const int q = (elem_idx & 16) ? (packed >> 4) : (packed & 0x0f);
+        return float(q - 8) * __half2float(__ushort_as_half(q4.scales[scale_idx]));
+    }
+    return __half2float(__ushort_as_half(cache[elem_idx]));
 }
 
-// Split-K decode/window kernel: each block handles up to SPLIT_KEYS keys of one (head h, token t).
-// A warp inside the block processes 4 keys? No: 128 threads = 4 warps; each thread holds 1 element of head_dim=128
-// for accumulation, and warps cooperate or 1 warp per sub-split. Even simpler and coalesced:
-// 1 block = 128 threads (dim=128 -> 1 thread per d), shared memory caches one key/value or loops over keys!
-// Better: 4 warps = 128 threads. Each thread holds `q_d = q[..., d]` and `acc_d = 0` in registers!
-//Wait: for Q.K^T we need sum over d=0..127 -> warp_sum? No, across 128 threads is 4 warps -> block_sum!
-// Let's compare: 1 warp (32 threads) holds 4 elements per thread (`d, d+32, d+64, d+96`), so Q.K^T uses ONLY `warp_sum`
-// with ZERO `__syncthreads()`! And 4 warps per block process 4 keys simultaneously, then merge across the 4 warps once at the end!
-// Let's use 4 warps per block (128 threads): warp w handles keys `k0 + w, k0 + w + 4, ...`!
+__device__ __forceinline__ void quant_q4_block(const float* xr, uint8_t* cr, uint16_t* sr) {
+    float amax = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 32; ++j) amax = fmaxf(amax, fabsf(xr[j]));
+    const half dh = __float2half(amax / 7.0f);
+    const float df = __half2float(dh);
+    const float id = df > 0.0f ? 1.0f / df : 0.0f;
+    *sr = __half_as_ushort(dh);
+#pragma unroll
+    for (int j = 0; j < 16; ++j) {
+        const float lo_f = fminf(fmaxf(rintf(xr[j] * id), -8.0f), 7.0f);
+        const float hi_f = fminf(fmaxf(rintf(xr[j + 16] * id), -8.0f), 7.0f);
+        const unsigned lo = unsigned(int(lo_f) + 8) & 0x0fu;
+        const unsigned hi = unsigned(int(hi_f) + 8) & 0x0fu;
+        cr[j] = uint8_t(lo | (hi << 4));
+    }
+}
+
+__global__ void store_q4_kernel(const float* __restrict__ x, uint8_t* __restrict__ codes,
+                                uint16_t* __restrict__ scales, int n, int rows, int nb) {
+    const int gb = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gb >= nb * rows) return;
+    const int row = gb / nb, blk = gb % nb;
+    quant_q4_block(x + (size_t) row * n + blk * 32, codes + (size_t) row * (n >> 1) + blk * 16,
+                   scales + (size_t) row * nb + blk);
+}
+
+__global__ void store_q4_at_kernel(const float* __restrict__ x, uint8_t* __restrict__ codes,
+                                   uint16_t* __restrict__ scales, int n, int rows, int nb,
+                                   const long long* __restrict__ at, int ring) {
+    const int gb = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gb >= nb * rows) return;
+    const int trow = gb / nb, blk = gb % nb;
+    const long long row = ring > 0 ? (*at + trow) % ring : *at + trow;
+    quant_q4_block(x + (size_t) trow * n + blk * 32, codes + (size_t) row * (n >> 1) + blk * 16,
+                   scales + (size_t) row * nb + blk);
+}
+
 __global__ void inkling_attend_split_kernel(const float* __restrict__ q, const uint16_t* __restrict__ kcache,
                                             const uint16_t* __restrict__ vcache, const float* __restrict__ table,
                                             const float* __restrict__ sinks, int n_extent, long long pos,
                                             float* __restrict__ partials, int n_splits, int dim, int n_head,
                                             int kv_heads, float scale, int window, int ring,
-                                            const long long* __restrict__ at, Kvq8 kq8, Kvq8 vq8) {
+                                            const long long* __restrict__ at, Kvq8 kq8, Kvq8 vq8,
+                                            Kvq4 kq4, Kvq4 vq4) {
     const int s = blockIdx.x;
     const int h = blockIdx.y;
     const int t = blockIdx.z;
@@ -344,7 +381,8 @@ __global__ void inkling_attend_split_kernel(const float* __restrict__ q, const u
 
     long long lo;
     const int total = attn_rows_span(q_pos, window, &lo);
-    const int k_begin = s * SPLIT_KEYS;
+    const int per_split = max(SPLIT_KEYS, (total + n_splits - 1) / n_splits);
+    const int k_begin = s * per_split;
     const int pstride = dim + 2;
     float* dst = partials + (((size_t(t) * n_head + h) * n_splits + s) * pstride);
 
@@ -355,7 +393,7 @@ __global__ void inkling_attend_split_kernel(const float* __restrict__ q, const u
         }
         return;
     }
-    const int k_end = min(total, k_begin + SPLIT_KEYS);
+    const int k_end = min(total, k_begin + per_split);
     const int per = n_head / kv_heads;
     const int kv_h = h / per;
     const int kv_width = kv_heads * dim;
@@ -387,7 +425,7 @@ __global__ void inkling_attend_split_kernel(const float* __restrict__ q, const u
         for (int u = 0; u < 4; ++u) {
             const int d = u * 32 + lane;
             if (d < dim) {
-                const float kv = read_kv_val(kcache, kq8, k_off + d, s_off + (d >> 5));
+                const float kv = read_kv_val(kcache, kq8, kq4, k_off + d, s_off + (d >> 5));
                 dot += q_reg[u] * kv;
             }
         }
@@ -403,7 +441,7 @@ __global__ void inkling_attend_split_kernel(const float* __restrict__ q, const u
         for (int u = 0; u < 4; ++u) {
             const int d = u * 32 + lane;
             if (d < dim) {
-                const float vv = read_kv_val(vcache, vq8, k_off + d, s_off + (d >> 5));
+                const float vv = read_kv_val(vcache, vq8, vq4, k_off + d, s_off + (d >> 5));
                 o_reg[u] = o_reg[u] * alpha + w_j * vv;
             }
         }
@@ -446,6 +484,145 @@ __global__ void inkling_attend_split_kernel(const float* __restrict__ q, const u
     }
 }
 
+template <int PER>
+__global__ void inkling_attend_split_gqa_kernel(const float* __restrict__ q, const uint16_t* __restrict__ kcache,
+                                                const uint16_t* __restrict__ vcache, const float* __restrict__ table,
+                                                const float* __restrict__ sinks, int n_extent, long long pos,
+                                                float* __restrict__ partials, int n_splits, int dim, int n_head,
+                                                int kv_heads, float scale, int window, int ring,
+                                                const long long* __restrict__ at, Kvq8 kq8, Kvq8 vq8,
+                                                Kvq4 kq4, Kvq4 vq4) {
+    const int s = blockIdx.x;
+    const int kv_h = blockIdx.y;
+    const int t = blockIdx.z;
+    const int h_base = kv_h * PER;
+    const long long q_pos = at ? at[2 * t] : pos + t;
+
+    long long lo;
+    const int total = attn_rows_span(q_pos, window, &lo);
+    const int per_split = max(SPLIT_KEYS, (total + n_splits - 1) / n_splits);
+    const int k_begin = s * per_split;
+    const int pstride = dim + 2;
+
+    if (k_begin >= total) {
+        if (threadIdx.x == 0) {
+            for (int p = 0; p < PER; ++p) {
+                float* dst = partials + (((size_t(t) * n_head + (h_base + p)) * n_splits + s) * pstride);
+                dst[dim] = 0.0f;
+                dst[dim + 1] = 0.0f;
+            }
+        }
+        return;
+    }
+
+    const int k_end = min(total, k_begin + per_split);
+    const int kv_width = kv_heads * dim;
+    const int kv_swidth = kv_heads * (dim >> 5);
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+
+    float q_reg[PER][4];
+    float o_reg[PER][4];
+    float m_w[PER];
+    float l_w[PER];
+#pragma unroll
+    for (int p = 0; p < PER; ++p) {
+        const float* q_ptr = q + (size_t(t) * n_head + (h_base + p)) * dim;
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            const int d = u * 32 + lane;
+            q_reg[p][u] = q_ptr[d] * scale;
+            o_reg[p][u] = 0.0f;
+        }
+        m_w[p] = -INFINITY;
+        l_w[p] = 0.0f;
+    }
+
+    for (int off = k_begin + warp; off < k_end; off += 4) {
+        const long long j = lo + off;
+        const size_t row = size_t(ring > 0 ? j % ring : j);
+        const size_t k_off = row * kv_width + size_t(kv_h) * dim;
+        const size_t s_off = row * kv_swidth + size_t(kv_h) * (dim >> 5);
+
+        float dot[PER];
+#pragma unroll
+        for (int p = 0; p < PER; ++p) dot[p] = 0.0f;
+
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            const int d = u * 32 + lane;
+            const float kv = read_kv_val(kcache, kq8, kq4, k_off + d, s_off + u);
+#pragma unroll
+            for (int p = 0; p < PER; ++p) dot[p] += q_reg[p][u] * kv;
+        }
+
+        const long long dist = q_pos - j;
+        float w_j[PER];
+#pragma unroll
+        for (int p = 0; p < PER; ++p) {
+            const int h = h_base + p;
+            const float dp = warp_sum(dot[p]);
+            const float bias = dist < n_extent
+                ? table[(size_t(t) * n_head + h) * n_extent + dist]
+                : -sinks[size_t(t) * n_head + h];
+            const float score = dp + bias;
+            const float m_new = fmaxf(m_w[p], score);
+            const float alpha = l_w[p] > 0.0f ? expf(m_w[p] - m_new) : 0.0f;
+            const float wv = expf(score - m_new);
+            w_j[p] = wv;
+#pragma unroll
+            for (int u = 0; u < 4; ++u) o_reg[p][u] *= alpha;
+            l_w[p] = l_w[p] * alpha + wv;
+            m_w[p] = m_new;
+        }
+
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            const int d = u * 32 + lane;
+            const float vv = read_kv_val(vcache, vq8, vq4, k_off + d, s_off + u);
+#pragma unroll
+            for (int p = 0; p < PER; ++p) o_reg[p][u] += w_j[p] * vv;
+        }
+    }
+
+    __shared__ float sm_m[4];
+    __shared__ float sm_l[4];
+    __shared__ float sm_o[4][128];
+    for (int p = 0; p < PER; ++p) {
+        if (lane == 0) {
+            sm_m[warp] = m_w[p];
+            sm_l[warp] = l_w[p];
+        }
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            sm_o[warp][u * 32 + lane] = o_reg[p][u];
+        }
+        __syncthreads();
+
+        if (threadIdx.x < dim) {
+            const int d = threadIdx.x;
+            float mb = -INFINITY, lb = 0.0f, ob = 0.0f;
+            for (int w = 0; w < 4; ++w) {
+                if (sm_l[w] > 0.0f) {
+                    const float mn = fmaxf(mb, sm_m[w]);
+                    const float a = lb > 0.0f ? expf(mb - mn) : 0.0f;
+                    const float b = expf(sm_m[w] - mn);
+                    lb = lb * a + sm_l[w] * b;
+                    ob = ob * a + sm_o[w][d] * b;
+                    mb = mn;
+                }
+            }
+            float* dst = partials + (((size_t(t) * n_head + (h_base + p)) * n_splits + s) * pstride);
+            dst[d] = ob;
+            if (d == 0) {
+                dst[dim] = mb;
+                dst[dim + 1] = lb;
+            }
+        }
+        if (p + 1 < PER) __syncthreads();
+    }
+}
+
 __global__ void inkling_attend_join_kernel(const float* __restrict__ partials, float* __restrict__ out, int n_splits,
                                            int dim, int n_head, long long pos, int window,
                                            const long long* __restrict__ at) {
@@ -457,7 +634,8 @@ __global__ void inkling_attend_join_kernel(const float* __restrict__ partials, f
     const long long q_pos = at ? at[2 * t] : pos + t;
     long long lo;
     const int total = attn_rows_span(q_pos, window, &lo);
-    const int active = min(n_splits, (total + SPLIT_KEYS - 1) / SPLIT_KEYS);
+    const int per_split = max(SPLIT_KEYS, (total + n_splits - 1) / n_splits);
+    const int active = min(n_splits, (total + per_split - 1) / per_split);
     const int pstride = dim + 2;
     const float* base = partials + (size_t(t) * n_head + h) * n_splits * pstride;
 
@@ -487,6 +665,21 @@ __global__ void dequant_q8_kernel(const int8_t* __restrict__ codes, const uint16
     const size_t r = size_t(row + blockIdx.y), at = r * width;
     const float d = __half2float(__ushort_as_half(scales[r * (width >> 5) + (i >> 5)]));
     out[size_t(blockIdx.y) * width + i] = __float2half(float(codes[at + i]) * d);
+}
+
+__global__ void dequant_q4_kernel(const uint8_t* __restrict__ codes, const uint16_t* __restrict__ scales,
+                                  half* __restrict__ out, int width, long long row) {
+    const int byte_i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int half_w = width >> 1;
+    if (byte_i >= half_w) return;
+    const size_t r = size_t(row + blockIdx.y);
+    const int blk = byte_i >> 4;
+    const int j = byte_i & 15;
+    const uint8_t packed = codes[r * half_w + byte_i];
+    const float d = __half2float(__ushort_as_half(scales[r * (width >> 5) + blk]));
+    const size_t base = size_t(blockIdx.y) * width + size_t(blk) * 32 + j;
+    out[base] = __float2half(float(int(packed & 0x0f) - 8) * d);
+    out[base + 16] = __float2half(float(int(packed >> 4) - 8) * d);
 }
 
 __global__ void attn_group_kernel(const float* __restrict__ src, half* __restrict__ dst, int dim, int n_head,
@@ -669,19 +862,43 @@ void inkling_rel_table(const float* r_cur, const float* rel_bias, const float* s
     ck("inkling_rel_table");
 }
 
+void store_q4(const float* x, uint8_t* codes, uint16_t* scales, int n, int64_t pos, int rows, void* stream) {
+    if (rows <= 0) return;
+    if (n <= 0 || n % 32 != 0) throw std::invalid_argument("store_q4: width must be a multiple of 32");
+    const int nb = n / 32;
+    store_q4_kernel<<<grid((size_t) nb * rows, 256), 256, 0, cs(stream)>>>(
+        x, codes + (size_t) pos * (n >> 1), scales + (size_t) pos * nb, n, rows, nb);
+    ck("store_q4");
+}
+
+void store_q4_at(const float* x, uint8_t* codes, uint16_t* scales, int n, const long long* at, int rows, int ring,
+                 void* stream) {
+    if (rows <= 0) return;
+    if (n <= 0 || n % 32 != 0) throw std::invalid_argument("store_q4_at: width must be a multiple of 32");
+    const int nb = n / 32;
+    store_q4_at_kernel<<<grid((size_t) nb * rows, 256), 256, 0, cs(stream)>>>(x, codes, scales, n, rows, nb, at, ring);
+    ck("store_q4_at");
+}
+
 void inkling_attend(const float* q, const uint16_t* kcache, const uint16_t* vcache, const float* table,
                     const float* sinks, int n_extent, int64_t pos, int rows, float* score, int chunk, float* out,
                     int dim, int n_head, int kv_heads, float scale, void* stream, int window, int ring,
-                    const long long* at, int room, Kvq8 kq8, Kvq8 vq8) {
+                    const long long* at, int room, Kvq8 kq8, Kvq8 vq8, Kvq4 kq4, Kvq4 vq4) {
     (void) chunk;
     if (rows <= 0) return;
     if (dim > 128) throw std::invalid_argument("inkling_attend: head dim must be <= 128");
     const long long max_pos = at ? (long long) room : (long long) pos + rows - 1;
     const int span = window > 0 ? std::min<int>((int) (max_pos + 1), window) : (int) (max_pos + 1);
-    const int n_splits = std::max(1, (span + SPLIT_KEYS - 1) / SPLIT_KEYS);
-    inkling_attend_split_kernel<<<dim3(n_splits, n_head, rows), 128, 0, cs(stream)>>>(
-        q, kcache, vcache, table, sinks, n_extent, (long long) pos, score, n_splits, dim, n_head, kv_heads, scale,
-        window, ring, at, kq8, vq8);
+    const int n_splits = std::clamp((span + SPLIT_KEYS - 1) / SPLIT_KEYS, 1, MAX_SPLITS);
+    if (dim == 128 && n_head == kv_heads * 3) {
+        inkling_attend_split_gqa_kernel<3><<<dim3(n_splits, kv_heads, rows), 128, 0, cs(stream)>>>(
+            q, kcache, vcache, table, sinks, n_extent, (long long) pos, score, n_splits, dim, n_head, kv_heads, scale,
+            window, ring, at, kq8, vq8, kq4, vq4);
+    } else {
+        inkling_attend_split_kernel<<<dim3(n_splits, n_head, rows), 128, 0, cs(stream)>>>(
+            q, kcache, vcache, table, sinks, n_extent, (long long) pos, score, n_splits, dim, n_head, kv_heads, scale,
+            window, ring, at, kq8, vq8, kq4, vq4);
+    }
     inkling_attend_join_kernel<<<dim3(n_head, rows), dim, 0, cs(stream)>>>(score, out, n_splits, dim, n_head,
                                                                             (long long) pos, window, at);
     ck("inkling_attend");
@@ -691,17 +908,18 @@ void inkling_attend_batch(void* blas, const float* q, const uint16_t* kcache, co
                           const float* table, const float* sinks, int n_extent, int64_t pos, int rows, float* score,
                           size_t score_floats, float* work, float* out, int dim, int n_head, int kv_heads,
                           float scale, void* stream, int window, int ring, Kvq8 kq8, Kvq8 vq8,
-                          uint16_t* kwork, uint16_t* vwork, size_t work_halves) {
+                          uint16_t* kwork, uint16_t* vwork, size_t work_halves, Kvq4 kq4, Kvq4 vq4) {
     if (rows <= 0) return;
     const cublasHandle_t h = (cublasHandle_t) blas;
     const float one = 1.0f, zero = 0.0f;
     const int per = n_head / kv_heads, width = kv_heads * dim;
     const bool kq = kq8.codes != nullptr, vq = vq8.codes != nullptr;
+    const bool k4 = kq4.codes != nullptr, v4 = vq4.codes != nullptr;
     const int work_rows = width > 0 ? (int) std::min<size_t>(work_halves / (size_t) width, (size_t) INT_MAX) : 0;
-    if (kq && (kwork == nullptr || work_rows < 1))
-        throw std::invalid_argument("inkling_attend_batch: q8 key cache needs workspace");
-    if (vq && (vwork == nullptr || work_rows < 1))
-        throw std::invalid_argument("inkling_attend_batch: q8 value cache needs workspace");
+    if ((kq || k4) && (kwork == nullptr || work_rows < 1))
+        throw std::invalid_argument("inkling_attend_batch: quantized key cache needs workspace");
+    if ((vq || v4) && (vwork == nullptr || work_rows < 1))
+        throw std::invalid_argument("inkling_attend_batch: quantized value cache needs workspace");
     const size_t cells = score_floats / 3 * 2;
     half* weight = (half*) (score + cells);
     for (int first = 0, c = 0; first < rows; first += c) {
@@ -724,15 +942,21 @@ void inkling_attend_batch(void* blas, const float* q, const uint16_t* kcache, co
         for (int k0 = 0, m = 0; k0 < n_keys; k0 += m) {
             const long long row = ring > 0 ? (lo0 + k0) % ring : lo0 + k0;
             m = (int) std::min<long long>(std::min(block, n_keys - k0), ring > 0 ? ring - row : n_keys);
-            if ((kq || vq) && m > work_rows) m = work_rows;
+            if ((kq || vq || k4 || v4) && m > work_rows) m = work_rows;
             if (kq)
                 dequant_q8_kernel<<<dim3(grid(width, 256), m), 256, 0, cs(stream)>>>(kq8.codes, kq8.scales,
                                                                                      (half*) kwork, width, row);
+            else if (k4)
+                dequant_q4_kernel<<<dim3(grid(width >> 1, 256), m), 256, 0, cs(stream)>>>(kq4.codes, kq4.scales,
+                                                                                          (half*) kwork, width, row);
             if (vq)
                 dequant_q8_kernel<<<dim3(grid(width, 256), m), 256, 0, cs(stream)>>>(vq8.codes, vq8.scales,
                                                                                      (half*) vwork, width, row);
-            const half* krow = kq ? (const half*) kwork : (const half*) kcache + size_t(row) * width;
-            const half* vrow = vq ? (const half*) vwork : (const half*) vcache + size_t(row) * width;
+            else if (v4)
+                dequant_q4_kernel<<<dim3(grid(width >> 1, 256), m), 256, 0, cs(stream)>>>(vq4.codes, vq4.scales,
+                                                                                          (half*) vwork, width, row);
+            const half* krow = (kq || k4) ? (const half*) kwork : (const half*) kcache + size_t(row) * width;
+            const half* vrow = (vq || v4) ? (const half*) vwork : (const half*) vcache + size_t(row) * width;
             blas_ck(cublasGemmStridedBatchedEx(h, CUBLAS_OP_T, CUBLAS_OP_N, m, (int) cols, dim, &scale,
                                                krow, CUDA_R_16F, width, dim, qg, CUDA_R_16F, dim, cols * dim, &zero,
                                                score, CUDA_R_32F, m, cols * m, kv_heads, CUBLAS_COMPUTE_32F,

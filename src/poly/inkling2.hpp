@@ -78,11 +78,17 @@ private:
         uint16_t* keys = nullptr;
         uint16_t* vals = nullptr;
         int8_t* k_codes = nullptr;
+        uint8_t* k_q4 = nullptr;
         uint16_t* k_scales = nullptr;
         int8_t* v_codes = nullptr;
+        uint8_t* v_q4 = nullptr;
         uint16_t* v_scales = nullptr;
     };
 
+    size_t kv_code_row_bytes() const;
+    size_t kv_scale_row_bytes() const;
+    uint8_t* slot_k_codes(const SlotCache& sc) const;
+    uint8_t* slot_v_codes(const SlotCache& sc) const;
     void apply_ctrl(const float* cur, const float* msg, const Block& B, int ctrl, float* out, int n);
     void store(const float* x, const SlotCache& sc, int64_t pos, int n, bool value);
     void attn(const Step& st, Block& B, SlotCache& sc, int64_t pos, int n);

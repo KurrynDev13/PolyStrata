@@ -308,10 +308,12 @@ int test_l2_clip() {
 
 int test_rel_and_attend() {
     int bad = 0;
-    const int dim = 128, n_head = 24, kv_heads = 8, n_rel = 16, n_extent = 1024;
+    const int dim = 128, n_rel = 16, n_extent = 1024;
     const float scale = 1.0f / std::sqrt((float) dim);
 
-    auto run_case = [&](const char* label, int total_keys, int window, int ring, int q_rows, bool q8, bool use_at) {
+    enum class Mode { kFp16, kQ8, kQ4 };
+    auto run_case = [&](const char* label, int n_head, int kv_heads, int total_keys, int window, int ring, int q_rows,
+                        Mode mode, bool use_at, bool via_gpu_store) {
         const int width = kv_heads * dim;
         const int cache_rows = ring > 0 ? ring : total_keys + q_rows;
         auto q = random_vec((size_t) q_rows * n_head * dim, 0.5f);
@@ -326,7 +328,9 @@ int test_rel_and_attend() {
 
         std::vector<uint16_t> kf16((size_t) cache_rows * width, 0), vf16((size_t) cache_rows * width, 0);
         std::vector<int8_t> kc((size_t) cache_rows * width, 0), vc((size_t) cache_rows * width, 0);
+        std::vector<uint8_t> k4((size_t) cache_rows * (width / 2), 0), v4((size_t) cache_rows * (width / 2), 0);
         std::vector<uint16_t> ks((size_t) cache_rows * (width / 32), 0), vs((size_t) cache_rows * (width / 32), 0);
+        std::vector<uint16_t> ks4((size_t) cache_rows * (width / 32), 0), vs4((size_t) cache_rows * (width / 32), 0);
 
         auto write_row = [&](int64_t j, const float* kp, const float* vp) {
             const int r = ring > 0 ? (int) (j % ring) : (int) j;
@@ -335,7 +339,7 @@ int test_rel_and_attend() {
                 vf16[(size_t) r * width + c] = __half_as_ushort(__float2half(vp[c]));
             }
             for (int b = 0; b < width / 32; ++b) {
-                auto qblock = [&](const float* src, int8_t* dstc, uint16_t* dsts) {
+                auto q8block = [&](const float* src, int8_t* dstc, uint16_t* dsts) {
                     float amax = 0.f;
                     for (int i = 0; i < 32; ++i) amax = std::max(amax, std::abs(src[b * 32 + i]));
                     const float d = amax / 127.f;
@@ -345,14 +349,34 @@ int test_rel_and_attend() {
                     for (int i = 0; i < 32; ++i)
                         dstc[(size_t) r * width + b * 32 + i] = df > 0.f ? (int8_t) std::llround(src[b * 32 + i] / df) : 0;
                 };
-                qblock(kp, kc.data(), ks.data());
-                qblock(vp, vc.data(), vs.data());
+                auto q4block = [&](const float* src, uint8_t* dstc, uint16_t* dsts) {
+                    float amax = 0.f;
+                    for (int i = 0; i < 32; ++i) amax = std::max(amax, std::abs(src[b * 32 + i]));
+                    const uint16_t dh = __half_as_ushort(__float2half(amax / 7.f));
+                    const float df = __half2float(__ushort_as_half(dh));
+                    dsts[(size_t) r * (width / 32) + b] = dh;
+                    for (int i = 0; i < 16; ++i) {
+                        auto qnib = [&](int idx) -> unsigned {
+                            if (df <= 0.f) return 8u;
+                            long long qv = std::llround(src[b * 32 + idx] / df);
+                            qv = std::clamp<long long>(qv, -8, 7);
+                            return (unsigned) (qv + 8);
+                        };
+                        dstc[(size_t) r * (width / 2) + b * 16 + i] = (uint8_t) (qnib(i) | (qnib(i + 16) << 4));
+                    }
+                };
+                q8block(kp, kc.data(), ks.data());
+                q8block(vp, vc.data(), vs.data());
+                q4block(kp, k4.data(), ks4.data());
+                q4block(vp, v4.data(), vs4.data());
             }
         };
-        for (int64_t j = 0; j < total_keys; ++j)
-            write_row(j, k_f32.data() + (size_t) j * width, v_f32.data() + (size_t) j * width);
-        for (int t = 0; t < q_rows; ++t)
-            write_row(total_keys + t, q_new_k.data() + (size_t) t * width, q_new_v.data() + (size_t) t * width);
+        if (!via_gpu_store) {
+            for (int64_t j = 0; j < total_keys; ++j)
+                write_row(j, k_f32.data() + (size_t) j * width, v_f32.data() + (size_t) j * width);
+            for (int t = 0; t < q_rows; ++t)
+                write_row(total_keys + t, q_new_k.data() + (size_t) t * width, q_new_v.data() + (size_t) t * width);
+        }
 
         float* d_q = dev(q);
         float* d_rcur = dev(r_cur);
@@ -371,15 +395,68 @@ int test_rel_and_attend() {
                         dot += (double) r_cur[((size_t) t * n_head + h) * n_rel + k] * rel_bias[(size_t) d * n_rel + k];
                     want_tbl[((size_t) t * n_head + h) * n_extent + d] = (float) (dot - sinks[(size_t) t * n_head + h]);
                 }
-        if (total_keys == 1500 && !q8) bad += report("inkling_rel_table", host(d_tbl, want_tbl.size()), want_tbl, 1e-5);
+        if (total_keys == 1500 && mode == Mode::kFp16 && n_head == 24)
+            bad += report("inkling_rel_table", host(d_tbl, want_tbl.size()), want_tbl, 1e-5);
 
         uint16_t *d_kf16 = dev(kf16), *d_vf16 = dev(vf16);
         int8_t *d_kc = dev(kc), *d_vc = dev(vc);
+        uint8_t *d_k4 = dev(k4), *d_v4 = dev(v4);
         uint16_t *d_ks = dev(ks), *d_vs = dev(vs);
+        uint16_t *d_ks4 = dev(ks4), *d_vs4 = dev(vs4);
+
+        if (via_gpu_store) {
+            // Exercise store_q4 + store_q4_at on GPU and read packed codes/scales back for exact FP64 reference
+            float* d_kf = dev(k_f32);
+            float* d_vf = dev(v_f32);
+            float* d_qnk = dev(q_new_k);
+            float* d_qnv = dev(q_new_v);
+            if (ring > 0) {
+                for (int64_t j = 0; j < total_keys; j += ring) {
+                    const int chunk_j = (int) std::min<int64_t>(ring, total_keys - j);
+                    const int at = (int) (j % ring), head = std::min(chunk_j, ring - at);
+                    store_q4(d_kf + (size_t) j * width, d_k4, d_ks4, width, at, head, nullptr);
+                    store_q4(d_vf + (size_t) j * width, d_v4, d_vs4, width, at, head, nullptr);
+                    if (head < chunk_j) {
+                        store_q4(d_kf + (size_t) (j + head) * width, d_k4, d_ks4, width, 0, chunk_j - head, nullptr);
+                        store_q4(d_vf + (size_t) (j + head) * width, d_v4, d_vs4, width, 0, chunk_j - head, nullptr);
+                    }
+                }
+            } else {
+                store_q4(d_kf, d_k4, d_ks4, width, 0, total_keys, nullptr);
+                store_q4(d_vf, d_v4, d_vs4, width, 0, total_keys, nullptr);
+            }
+            if (use_at) {
+                std::vector<long long> sat{total_keys, total_keys};
+                long long* d_sat = dev(sat);
+                store_q4_at(d_qnk, d_k4, d_ks4, width, d_sat, q_rows, ring, nullptr);
+                store_q4_at(d_qnv, d_v4, d_vs4, width, d_sat, q_rows, ring, nullptr);
+                cudaFree(d_sat);
+            } else {
+                const int at = ring > 0 ? (int) (total_keys % ring) : total_keys;
+                const int head = ring > 0 ? std::min(q_rows, ring - at) : q_rows;
+                store_q4(d_qnk, d_k4, d_ks4, width, at, head, nullptr);
+                store_q4(d_qnv, d_v4, d_vs4, width, at, head, nullptr);
+                if (head < q_rows) {
+                    store_q4(d_qnk + (size_t) head * width, d_k4, d_ks4, width, 0, q_rows - head, nullptr);
+                    store_q4(d_qnv + (size_t) head * width, d_v4, d_vs4, width, 0, q_rows - head, nullptr);
+                }
+            }
+            k4 = host(d_k4, k4.size());
+            v4 = host(d_v4, v4.size());
+            ks4 = host(d_ks4, ks4.size());
+            vs4 = host(d_vs4, vs4.size());
+            cudaFree(d_kf); cudaFree(d_vf); cudaFree(d_qnk); cudaFree(d_qnv);
+        }
+
+        const bool q8 = mode == Mode::kQ8;
+        const bool q4 = mode == Mode::kQ4;
+        const bool quant = q8 || q4;
         Kvq8 kq = q8 ? Kvq8{d_kc, d_ks} : Kvq8{};
         Kvq8 vq = q8 ? Kvq8{d_vc, d_vs} : Kvq8{};
+        Kvq4 kq4 = q4 ? Kvq4{d_k4, d_ks4} : Kvq4{};
+        Kvq4 vq4 = q4 ? Kvq4{d_v4, d_vs4} : Kvq4{};
 
-        const int n_splits = (total_keys + q_rows + 511) / 512 + 1;
+        const int n_splits = std::clamp((total_keys + q_rows + 511) / 512 + 1, 1, 64);
         const size_t score_n = std::max((size_t) q_rows * n_head * n_splits * (dim + 2),
                                         (size_t) q_rows * n_head * 2048);
         float* d_score = dev(std::vector<float>(score_n, 0.f));
@@ -387,24 +464,39 @@ int test_rel_and_attend() {
         float* d_out_bat = dev(std::vector<float>(q.size(), 0.f));
         float* d_work = dev(std::vector<float>((size_t) q_rows * n_head * (dim + dim / 2 + 3) + 1, 0.f));
         const size_t wh = (size_t) 2048 * width;
-        uint16_t* d_kw = q8 ? dev(std::vector<uint16_t>(wh, 0)) : nullptr;
-        uint16_t* d_vw = q8 ? dev(std::vector<uint16_t>(wh, 0)) : nullptr;
+        uint16_t* d_kw = quant ? dev(std::vector<uint16_t>(wh, 0)) : nullptr;
+        uint16_t* d_vw = quant ? dev(std::vector<uint16_t>(wh, 0)) : nullptr;
 
         std::vector<long long> at_v((size_t) q_rows * 2);
         for (int t = 0; t < q_rows; ++t) at_v[2 * t] = at_v[2 * t + 1] = total_keys + t;
         long long* d_at = use_at ? dev(at_v) : nullptr;
 
-        inkling_attend(d_q, q8 ? nullptr : d_kf16, q8 ? nullptr : d_vf16, d_tbl, d_snk, n_extent, total_keys, q_rows,
-                       d_score, q_rows, d_out_dec, dim, n_head, kv_heads, scale, nullptr, window, ring, d_at,
-                       use_at ? total_keys + q_rows + 16 : 0, kq, vq);
+        inkling_attend(d_q, quant ? nullptr : d_kf16, quant ? nullptr : d_vf16, d_tbl, d_snk, n_extent, total_keys,
+                       q_rows, d_score, q_rows, d_out_dec, dim, n_head, kv_heads, scale, nullptr, window, ring, d_at,
+                       use_at ? total_keys + q_rows + 16 : 0, kq, vq, kq4, vq4);
 
         void* blas = blas_create(nullptr);
-        inkling_attend_batch(blas, d_q, q8 ? nullptr : d_kf16, q8 ? nullptr : d_vf16, d_tbl, d_snk, n_extent,
+        inkling_attend_batch(blas, d_q, quant ? nullptr : d_kf16, quant ? nullptr : d_vf16, d_tbl, d_snk, n_extent,
                              total_keys, q_rows, d_score, score_n, d_work, d_out_bat, dim, n_head, kv_heads, scale,
-                             nullptr, window, ring, kq, vq, d_kw, d_vw, q8 ? wh : 0);
+                             nullptr, window, ring, kq, vq, d_kw, d_vw, quant ? wh : 0, kq4, vq4);
         blas_destroy(blas);
 
-        // Float64 reference reading the exact stored FP16 or Q8_0 cache values
+        auto read_host_val = [&](const std::vector<uint16_t>& f16, const std::vector<int8_t>& c8,
+                                 const std::vector<uint8_t>& c4, const std::vector<uint16_t>& sc, size_t r,
+                                 size_t col) -> double {
+            const size_t ei = r * width + col;
+            if (q8) return (double) c8[ei] * (double) __half2float(__ushort_as_half(sc[r * (width / 32) + col / 32]));
+            if (q4) {
+                const size_t blk = col / 32;
+                const size_t pos32 = col & 31;
+                const uint8_t packed = c4[r * (width / 2) + blk * 16 + (pos32 & 15)];
+                const int qv = (pos32 & 16) ? (packed >> 4) : (packed & 0x0f);
+                return (double) (qv - 8) * (double) __half2float(__ushort_as_half(sc[r * (width / 32) + blk]));
+            }
+            return (double) __half2float(__ushort_as_half(f16[ei]));
+        };
+
+        // Float64 reference reading the exact stored FP16, Q8_0, or Q4_0 cache values
         std::vector<float> want_att(q.size(), 0.f);
         const int per = n_head / kv_heads;
         for (int t = 0; t < q_rows; ++t) {
@@ -418,10 +510,7 @@ int test_rel_and_attend() {
                     const size_t r = (size_t) (ring > 0 ? j % ring : j);
                     double dot = 0.0;
                     for (int d = 0; d < dim; ++d) {
-                        const size_t ei = r * width + (size_t) kvh * dim + d;
-                        const double kv = q8
-                            ? (double) kc[ei] * (double) __half2float(__ushort_as_half(ks[r * (width / 32) + ((size_t) kvh * dim + d) / 32]))
-                            : (double) __half2float(__ushort_as_half(kf16[ei]));
+                        const double kv = read_host_val(kf16, kc, k4, q4 ? ks4 : ks, r, (size_t) kvh * dim + d);
                         dot += (double) q[((size_t) t * n_head + h) * dim + d] * kv;
                     }
                     const int64_t dist = qp - j;
@@ -439,10 +528,7 @@ int test_rel_and_attend() {
                     const double wj = std::exp(scores[(size_t) (j - lo)] - mx);
                     lsum += wj;
                     for (int d = 0; d < dim; ++d) {
-                        const size_t ei = r * width + (size_t) kvh * dim + d;
-                        const double vv = q8
-                            ? (double) vc[ei] * (double) __half2float(__ushort_as_half(vs[r * (width / 32) + ((size_t) kvh * dim + d) / 32]))
-                            : (double) __half2float(__ushort_as_half(vf16[ei]));
+                        const double vv = read_host_val(vf16, vc, v4, q4 ? vs4 : vs, r, (size_t) kvh * dim + d);
                         acc[(size_t) d] += wj * vv;
                     }
                 }
@@ -460,17 +546,22 @@ int test_rel_and_attend() {
         bad += report(buf, got_bat, got_dec, 5e-3);
 
         cudaFree(d_q); cudaFree(d_rcur); cudaFree(d_rb); cudaFree(d_snk); cudaFree(d_tbl);
-        cudaFree(d_kf16); cudaFree(d_vf16); cudaFree(d_kc); cudaFree(d_vc); cudaFree(d_ks); cudaFree(d_vs);
+        cudaFree(d_kf16); cudaFree(d_vf16); cudaFree(d_kc); cudaFree(d_vc); cudaFree(d_k4); cudaFree(d_v4);
+        cudaFree(d_ks); cudaFree(d_vs); cudaFree(d_ks4); cudaFree(d_vs4);
         cudaFree(d_score); cudaFree(d_out_dec); cudaFree(d_out_bat); cudaFree(d_work);
         if (d_kw) cudaFree(d_kw);
         if (d_vw) cudaFree(d_vw);
         if (d_at) cudaFree(d_at);
     };
 
-    run_case("SWA ring FP16", 1500, 1024, 1100, 32, false, false);
-    run_case("SWA ring Q8_0", 1500, 1024, 1100, 32, true, false);
-    run_case("Global >1024 FP16 + at", 1200, 0, 0, 16, false, true);
-    run_case("Global >1024 Q8_0", 1200, 0, 0, 16, true, false);
+    run_case("SWA ring FP16 (GQA3)", 24, 8, 1500, 1024, 1100, 32, Mode::kFp16, false, false);
+    run_case("SWA ring Q8_0 (GQA3)", 24, 8, 1500, 1024, 1100, 32, Mode::kQ8, false, false);
+    run_case("SWA ring Q4_0 GPU-store", 24, 8, 1500, 1024, 1100, 32, Mode::kQ4, false, true);
+    run_case("Global >1024 FP16 + at (GQA3)", 24, 8, 1200, 0, 0, 16, Mode::kFp16, true, false);
+    run_case("Global >1024 Q8_0 (GQA3)", 24, 8, 1200, 0, 0, 16, Mode::kQ8, false, false);
+    run_case("Global >1024 Q4_0 GPU-store + at", 24, 8, 1200, 0, 0, 16, Mode::kQ4, true, true);
+    run_case("Global >32K bounded-splits Q4_0", 24, 8, 35000, 0, 0, 2, Mode::kQ4, true, true);
+    run_case("Global >1024 generic fallback (GQA2)", 16, 8, 1200, 0, 0, 8, Mode::kQ4, false, true);
     return bad;
 }
 

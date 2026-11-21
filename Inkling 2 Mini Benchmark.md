@@ -25,7 +25,7 @@
 
 ### 2.1 CUDA Kernel & CPU SiTU Unit Test Suite (`poly_inkling2_test.exe`)
 
-All 19 unit tests in `poly_inkling2_test.exe` verify GPU kernels and CPU expert math against FP64 CPU reference implementations:
+All 27 checks in `poly_inkling2_test.exe` verify GPU kernels and CPU expert math against FP64 CPU reference implementations (including bounded split-K `>32K`, `GQA=3` & fallback kernels, and GPU `store_q4` / `store_q4_at`):
 
 | Kernel / Subsystem Test | Elements Checked | Max Relative Error | Result |
 | :--- | :---: | :---: | :---: |
@@ -40,14 +40,22 @@ All 19 unit tests in `poly_inkling2_test.exe` verify GPU kernels and CPU expert 
 | `inkling_conv4` speculative snapshot rollback | 768 | `0` | **PASS** |
 | `inkling_l2_clip` (global $\tau(\text{pos})$ + scale + graph `at`) | 12,288 | `2.14e-07` | **PASS** |
 | `inkling_rel_table` (relative bias projection - sink) | 786,432 | `2.95e-07` | **PASS** |
-| SWA ring FP16 `inkling_attend` vs FP64 ref | 98,304 | `2.95e-08` | **PASS** |
-| SWA ring FP16 `inkling_attend_batch` vs `inkling_attend` | 98,304 | `1.89e-05` | **PASS** |
-| SWA ring Q8_0 `inkling_attend` vs FP64 ref | 98,304 | `2.77e-08` | **PASS** |
-| SWA ring Q8_0 `inkling_attend_batch` vs `inkling_attend` | 98,304 | `2.60e-05` | **PASS** |
-| Global (`>1024`) FP16 + graph `at` `inkling_attend` vs FP64 | 49,152 | `2.49e-08` | **PASS** |
-| Global (`>1024`) FP16 `inkling_attend_batch` vs `inkling_attend` | 49,152 | `1.65e-05` | **PASS** |
-| Global (`>1024`) Q8_0 `inkling_attend` vs FP64 ref | 49,152 | `2.09e-08` | **PASS** |
-| Global (`>1024`) Q8_0 `inkling_attend_batch` vs `inkling_attend` | 49,152 | `1.96e-05` | **PASS** |
+| SWA ring FP16 (`GQA=3`) `inkling_attend` vs FP64 ref | 98,304 | `2.95e-08` | **PASS** |
+| SWA ring FP16 (`GQA=3`) `inkling_attend_batch` vs `inkling_attend` | 98,304 | `1.89e-05` | **PASS** |
+| SWA ring Q8_0 (`GQA=3`) `inkling_attend` vs FP64 ref | 98,304 | `2.77e-08` | **PASS** |
+| SWA ring Q8_0 (`GQA=3`) `inkling_attend_batch` vs `inkling_attend` | 98,304 | `2.60e-05` | **PASS** |
+| SWA ring Q4_0 GPU-store `inkling_attend` vs FP64 ref | 98,304 | `2.79e-08` | **PASS** |
+| SWA ring Q4_0 GPU-store `inkling_attend_batch` vs `inkling_attend` | 98,304 | `2.44e-05` | **PASS** |
+| Global (`>1024`) FP16 + graph `at` (`GQA=3`) `inkling_attend` vs FP64 | 49,152 | `2.17e-08` | **PASS** |
+| Global (`>1024`) FP16 (`GQA=3`) `inkling_attend_batch` vs `inkling_attend` | 49,152 | `1.53e-05` | **PASS** |
+| Global (`>1024`) Q8_0 (`GQA=3`) `inkling_attend` vs FP64 ref | 49,152 | `1.79e-08` | **PASS** |
+| Global (`>1024`) Q8_0 (`GQA=3`) `inkling_attend_batch` vs `inkling_attend` | 49,152 | `2.25e-05` | **PASS** |
+| Global (`>1024`) Q4_0 GPU-store + `at` `inkling_attend` vs FP64 ref | 49,152 | `2.10e-08` | **PASS** |
+| Global (`>1024`) Q4_0 GPU-store `inkling_attend_batch` vs `inkling_attend` | 49,152 | `2.03e-05` | **PASS** |
+| Global (`>32K`) bounded-splits Q4_0 `inkling_attend` vs FP64 ref | 6,144 | `3.71e-09` | **PASS** |
+| Global (`>32K`) bounded-splits Q4_0 `inkling_attend_batch` vs `inkling_attend` | 6,144 | `3.06e-06` | **PASS** |
+| Global (`>1024`) generic fallback (`GQA=2`) `inkling_attend` vs FP64 ref | 16,384 | `1.78e-08` | **PASS** |
+| Global (`>1024`) generic fallback (`GQA=2`) `inkling_attend_batch` vs `inkling_attend` | 16,384 | `2.29e-05` | **PASS** |
 
 ### 2.2 Greedy Parity & Throughput vs Reference `llama-completion.exe`
 
@@ -127,7 +135,40 @@ To benchmark realistic long-running multi-turn coding sessions, a single persist
 
 ---
 
-## 5. End-to-End Server, Conversation Cache Park/Restore & CPU Vision Telemetry
+## 5. Long-Context Scaling & Optimizations up to 1M `max_context` (`1048576`)
+
+To support context windows up to **1M tokens (`--max-context 1048576`)** on a 12 GB GPU and find the exact context limit where pure unassisted decode remains `>= 30 tok/s`, three engine optimizations were added to `strata-poly`:
+
+1. **Bounded Dynamic Split-K (`MAX_SPLITS = 64`):** Keeps split-K partial scratch (`score_`) and `chunk_dec_` constant in $O(1)$ VRAM regardless of `max_context`, allowing `--max-context 1048576` to reserve virtual address space and load in **`3.11–3.15 s`** (`1,567–1,613` experts in VRAM, `~32 MiB` initial global KV under `--kv-grow`).
+2. **GQA-Grouped Decode Kernel (`inkling_attend_split_gqa_kernel<3>`):** For Inkling 2 Mini's `24` query / `8` KV heads (`dim = 128`), loads each K/V row once in registers across all 3 query heads per KV head, cutting global KV DRAM bandwidth by **3$\times$**.
+3. **Opt-In `--kv q4_0` (Block-32 Symmetric 4-bit KV Cache):** Packs 32 elements into 16 code bytes + 1 FP16 scale (`576 B/row` per K/V tensor = **`9 KiB/token`** across 8 global layers vs `17 KiB/token` for `q8_0` and `32 KiB/token` for `fp16`). Matched FP16 **48/48 greedy tokens identically** on a 30-token prompt (`50.09 tok/s` @ `1048576` `max_context`).
+
+### 5.1 Growing-Context Sweep (`--max-context 1048576`, Pure `--window 1` Decode)
+
+Measured on unique, non-repetitive procedural subsystem modules (so n-gram lookup cannot artificially inflate decode speed; `96` tokens generated per checkpoint, `--vram-reserve-mib 1280 --prompt-batch 512 --ram-experts-mib -1 --prompt-cache 1`):
+
+| Filled Context | FP16 KV (`1,567` exp)<br>Decode / Prefill / Hit% / VRAM | `--kv q8_0` (`1,595` exp)<br>Decode / Prefill / Hit% / VRAM | `--kv q4_0` (`1,613` exp)<br>Decode / Prefill / Hit% / VRAM | `--kv q4_0 --skip-weight 0.05`<br>Decode / Prefill / Hit% / VRAM |
+| :---: | :---: | :---: | :---: | :---: |
+| **4,162** | **37.70 tok/s** / 445.4 / 81.6% / 11,108 MiB | **39.20 tok/s** / 339.5 / 82.5% / 11,003 MiB | **36.85 tok/s** / 222.8 / 82.8% / 10,778 MiB | **39.19 tok/s** / 432.4 / 83.4% / 10,860 MiB |
+| **16,440** | **40.38 tok/s** / 1,131.8 / 91.6% / 11,002 MiB | **43.11 tok/s** / 1,096.9 / 92.2% / 10,940 MiB | **42.18 tok/s** / 939.2 / 93.1% / 10,825 MiB | **42.06 tok/s** / 475.0 / 94.0% / 10,837 MiB |
+| **32,827** | **38.46 tok/s** / 1,116.2 / 92.0% / 11,006 MiB | **40.91 tok/s** / 1,044.1 / 93.0% / 10,956 MiB | **39.90 tok/s** / 1,076.3 / 93.8% / 10,815 MiB | **40.86 tok/s** / 1,071.4 / 95.1% / 10,812 MiB |
+| **65,547** | **32.53 tok/s** / 997.0 / 86.0% / 11,007 MiB | **36.52 tok/s** / 907.2 / 91.4% / 10,918 MiB | **36.91 tok/s** / 940.4 / 93.0% / 10,798 MiB | **36.66 tok/s** / 941.5 / 94.4% / 10,769 MiB |
+| **98,314** | 29.51 tok/s / 875.5 / 82.1% / 11,007 MiB | **32.07 tok/s** / 766.0 / 88.0% / 10,879 MiB | **33.83 tok/s** / 803.3 / 92.4% / 10,719 MiB | **32.97 tok/s** / 799.0 / 93.8% / 11,188 MiB |
+| **131,148 (128K)** | 26.71 tok/s / 775.2 / 77.0% / 11,044 MiB | 29.20 tok/s / 660.4 / 86.2% / 10,970 MiB | **30.60 tok/s** / 701.8 / 92.0% / 10,759 MiB | **31.45 tok/s** / 700.1 / 93.2% / 11,064 MiB |
+| **163,865** | 23.68 tok/s / 688.9 / 66.0% / 10,974 MiB | 26.34 tok/s / 577.7 / 82.5% / 10,918 MiB | 27.56 tok/s / 615.5 / 88.4% / 10,711 MiB | 26.81 tok/s / 614.5 / 90.3% / 11,017 MiB |
+| **196,615** | — | 25.14 tok/s / 518.5 / 79.7% / 10,464 MiB | 25.72 tok/s / 557.1 / 87.2% / 10,685 MiB | 25.41 tok/s / 553.3 / 88.5% / 10,736 MiB |
+| **229,386 (224K)** | — | 23.47 tok/s / 467.5 / 76.2% / 10,427 MiB | 24.21 tok/s / 503.5 / 86.0% / 10,650 MiB | 23.65 tok/s / 502.6 / 87.5% / 10,847 MiB |
+
+- **`>= 30 tok/s` Pure-Decode Ceilings (RTX 4070 SUPER 12 GB):**
+  - **FP16 KV (`32 KiB/tok`):** **~92K filled tokens** (`32.53` @ 65.5K $\rightarrow$ `29.51` @ 98.3K)
+  - **`--kv q8_0` (`17 KiB/tok`):** **~122K filled tokens** (`32.07` @ 98.3K $\rightarrow$ `29.20` @ 131.1K)
+  - **`--kv q4_0` (`9 KiB/tok`):** **~137K filled tokens** (**`30.60`** @ 131.1K $\rightarrow$ `27.56` @ 163.9K)
+  - **`--kv q4_0 --skip-weight 0.05`:** **~141K filled tokens** (**`31.45`** @ 131.1K $\rightarrow$ `26.81` @ 163.9K)
+- **Long-Context Needle Recall (`@ 229,386 tokens`, `--kv q4_0`):** Retrieved Turn 1's exact random Audit ID (`CHK-1-652386`) accurately with zero corruption after 224K tokens of intervening code blocks.
+
+---
+
+## 6. End-to-End Server, Conversation Cache Park/Restore & CPU Vision Telemetry
 
 Verified against live HTTP endpoints (`/v1/chat/completions`, `/v1/messages`, `/v1/status`):
 
@@ -141,16 +182,17 @@ Verified against live HTTP endpoints (`/v1/chat/completions`, `/v1/messages`, `/
 
 ---
 
-## 6. Optimization Reference & Production Configuration
+## 7. Optimization Reference & Production Configuration
 
 ### Summary of Engine Flags for Inkling 2 Mini on 12 GB VRAM
 
-1. **`--kv-grow` (Default ON):** Uses CUDA VMM (`kv_alloc` + `cover`) on the 8 global attention slots so `--max-context 131072` costs zero extra upfront KV VRAM at startup. The 40 SWA slots use fixed `1024 + prompt_batch` ring buffers.
-2. **`--vram-reserve-mib 1280`:** Prevents Windows WDDM shared-memory spill (which otherwise causes `~968 ms/tok` PCIe stalls when VRAM oversubscribes 12 GB) while fitting `1,561–1,589 / 3,072` routed experts in physical VRAM. *(Do not enable `--vram-pool` on Windows WDDM, as Windows includes shared system memory in the process DXGI budget.)*
+1. **`--kv-grow` (Default ON):** Uses CUDA VMM (`kv_alloc` + `cover`) on the 8 global attention slots paired with bounded split-K (`MAX_SPLITS = 64`), so configuring `--max-context 262144` or up to `1048576` (1M) costs only `~32 MiB` upfront global KV VRAM at startup. The 40 SWA slots use fixed `1024 + prompt_batch` ring buffers.
+2. **`--vram-reserve-mib 1280`:** Prevents Windows WDDM shared-memory spill (which otherwise causes `~968 ms/tok` PCIe stalls when VRAM oversubscribes 12 GB) while fitting `1,561–1,613 / 3,072` routed experts in physical VRAM. *(Do not enable `--vram-pool` on Windows WDDM, as Windows includes shared system memory in the process DXGI budget.)*
 3. **`--prompt-batch 512`:** Frees `~600 MiB` of scratch + SWA ring VRAM for `+124` additional GPU-cached experts and increases 5.4k prefill throughput by `+23.3%` (`1,307.3 tok/s`).
-4. **`--kv fp16` (Default) vs `--kv q8_0`:**
-   - Use **FP16 KV (default)** for general coding and multi-turn sessions up to ~40k tokens (`1,307 tok/s` prefill, up to `108 tok/s` multi-turn decode, 100% lossless).
-   - Use **`--kv q8_0`** when regularly filling `64k–128k` context in a single conversation (`17 KiB/token` vs `32 KiB/token` across the 8 global slots, saving `~1.9 GiB` of VRAM at 128k).
+4. **`--kv fp16` (Default) vs `--kv q8_0` vs `--kv q4_0`:**
+   - **FP16 KV (default, `32 KiB/token`):** Exact reference weights with peak single-shot prefill (`1,307 tok/s`), multi-turn decode up to `108 tok/s` with lookup drafts, and `>= 30 tok/s` pure unassisted decode through ~92K filled tokens (configured with `--max-context 262144` headroom).
+   - **`--kv q8_0` (`17 KiB/token`):** Halves global KV VRAM (`2.13 GiB` at 128K), extending pure `>= 30 tok/s` decode to ~122K tokens.
+   - **`--kv q4_0` (`9 KiB/token`):** Quarters global KV VRAM (`1.13 GiB` at 128K), keeping pure unassisted decode above **30 tok/s across the full 128K window** (~137K–141K limit) with verified recall past 224K tokens.
    - *Note:* `--kv k8v4` is specific to the Qwen 3.8 engine (`strata.exe`) and is not used in `strata-poly.exe`.
 
 ### Production Run Config ([strata-inkling2-ud-q4_k_xl.json](file:///d:/PolyStrata/strata-inkling2-ud-q4_k_xl.json))
@@ -162,7 +204,7 @@ Verified against live HTTP endpoints (`/v1/chat/completions`, `/v1/messages`, `/
     "--model",
     "D:\\Users\\Kurryn_PC\\Documents\\Strata\\Models\\models\\inkling2-UD-Q4_K_XL\\Inkling-2-Mini-UD-Q4_K_XL.gguf",
     "--max-context",
-    "131072",
+    "262144",
     "--vram-reserve-mib",
     "1280",
     "--prompt-batch",
