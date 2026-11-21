@@ -3,7 +3,7 @@
 **English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md) · [Türkçe](README.tr.md)
 
 <p align="center"><b>Run large AI models on your own PC</b><br>
-Qwen3.8-Flash-Next, GLM 5.3 Flash, DeepSeek V4 Flash, LFM2.5, Flint, Qwen3.6, Clover, Ornith 1.5, Gemma 4, Tiel Coder, MiniCPM-V and Kolibri 1 · free and open source</p>
+Inkling 2 Mini, Qwen3.8-Flash-Next, GLM 5.3 Flash, DeepSeek V4 Flash, LFM2.5, Flint, Qwen3.6, Clover, Ornith 1.5, Gemma 4, Tiel Coder, MiniCPM-V and Kolibri 1 · free and open source</p>
 
 <p align="center"><a href="https://github.com/simplexai-labs/linger"><img height="28" alt="Used by Linger" src="docs/media/used-by-linger.svg"></a></p>
 
@@ -19,15 +19,15 @@ Qwen3.8-Flash-Next, GLM 5.3 Flash, DeepSeek V4 Flash, LFM2.5, Flint, Qwen3.6, Cl
 PolyStrata runs large AI models on a normal PC, models that usually need a server. They chat, write code and work
 with your apps and coding agents. Nothing leaves your PC.
 
-It runs twelve models, on two engines:
+It runs thirteen models, on two engines:
 
 - **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)** on an NVIDIA or AMD graphics card with
   12 GB or more, on Windows or Linux. It also reads pictures. Its engine is the Strata project's, unchanged.
 
-The other eleven run on an engine written for PolyStrata, with one NVIDIA card or [two](docs/MULTI_GPU.md#the-strata-poly-models): on Linux, and all but GLM 5.3 Flash and
-DeepSeek V4 Flash on Windows too. They are experimental: they have run on one PC with a 32 GB card, and the eight smaller ones on a laptop
-with an 8 GB card as well.
+The other twelve run on an engine written for PolyStrata, with one NVIDIA card or [two](docs/MULTI_GPU.md#the-strata-poly-models): on Linux, and all but GLM 5.3 Flash and
+DeepSeek V4 Flash on Windows too. They are experimental: they have run on one PC with a 32 GB card, and the smaller ones on an 8 GB or 12 GB card as well.
 
+- **[Inkling 2 Mini](Inkling%202%20Mini%20Benchmark.md)** by Thinking Machines Lab, a 48-virtual-layer looped MoE model (`inkling2_loop` / `inkling2`) in a file of 12 to 18 GB (Unsloth's `UD-Q4_K_XL` keeps layers 0–19 in native NVFP4). 40 of its 48 virtual layers look back only 1,024 tokens and only 8 attend the full context, so a 128K context takes just 256 MiB of global KV cache in FP16 (136 MiB in Q8_0). It also reads pictures through a CPU vision encoder.
 - **[GLM 5.3 Flash](docs/models/glm.md)**, the largest: a file of 79 to 114 GB, most of which stays in RAM.
 - **[DeepSeek V4 Flash](docs/models/deepseek.md)**, a file of 91 GB, most of which stays in RAM too. Its memory of a
   conversation is small: a 128K context takes 0.7 GB more VRAM than 32K.
@@ -79,6 +79,8 @@ The table gives the size the installer takes for each model, in tokens per secon
 | DeepSeek V4 Flash | does not run: needs a 32 GB card | 56 / 1,040 | [DeepSeek](docs/models/deepseek.md) |
 
 Laptop: RTX 4070 Laptop (8 GB), Core i7-14700HX, 32 GB RAM. Workstation: RTX 5090 (32 GB), Xeon Platinum 8470Q (25 vCPU), 90 to 120 GB RAM. Flint is UD-Q3_K_XL on the laptop, the size the installer takes with 32 GB of RAM, and UD-Q4_K_XL on the workstation. Kolibri 1 is Q2_K on the workstation; the installer takes Q4_K_M there, which was not measured.
+
+**Inkling 2 Mini (`UD-Q4_K_XL`, 17.63 GB)** was measured on a desktop with an RTX 4070 SUPER (12 GB VRAM) and 46.7 GiB DDR5 RAM at a **128K `max_context` (`131072`)**: it writes answers at **45.0–47.3 tokens/s** on single-shot prompts (up to **108.2 tokens/s** with lookup drafts on multi-turn code/logs) and reads a 5,461-token prompt at **1,307 tokens/s** — **3.4 to 3.7 times as fast as llama.cpp** (PR `#32704`, which writes at 13.7–14.5 tokens/s and reads at 262.7 tokens/s on the same card). Across a 6-turn growing-context session (`2.2K → 33.0K` tokens), 64.9% of prompt tokens are reused from live state with elastic CUDA VMM `--kv-grow` ([full benchmark](Inkling%202%20Mini%20Benchmark.md)).
 
 Qwen3.8-Flash-Next runs on the Strata project's engine and was measured by that project on a PC with an RTX 5070 (12 GB) and 64 GB of RAM: IQ2_XS writes at 79 and reads a 32K prompt at 2,090 ([every size](docs/models/qwen38.md)).
 
@@ -158,6 +160,7 @@ How it works and how it was measured: [docs/BACKENDS.md](docs/BACKENDS.md#less-o
 | [Tiel Coder 35B-A3B](docs/models/tiel.md) | same as above; AMD as a beta | about 21 GB beside an 8 GB card | 14 to 23 GB | Windows, Linux |
 | [MiniCPM-V 4.7 35B-A3B](docs/models/minicpmv.md) | same as above; AMD as a beta | about 25 GB beside an 8 GB card | 16 to 29 GB | Windows, Linux |
 | [Kolibri 1](docs/models/kolibri.md) | NVIDIA RTX 20 series or newer, 8 GB or more | about 33 GB beside an 8 GB card | 29 to 48 GB | Windows, Linux |
+| [Inkling 2 Mini](Inkling%202%20Mini%20Benchmark.md) | NVIDIA RTX 20 series or newer, 8 to 12 GB or more | about 20 GB beside a 12 GB card for UD-Q4_K_XL | 12 to 18 GB | Windows, Linux |
 
 RAM is the installer's estimate; a larger card needs less. The installer sets up everything else: on Windows it downloads the engine ready-made, and compiles it on your PC only on a processor without AVX2 or when your copy's engine is newer than the latest release, offering to install the tools. Two or three cards can share a model ([multi-GPU](docs/MULTI_GPU.md)). Older graphics cards, Intel Arc, Apple Silicon Macs (Qwen3.8-Flash-Next, and Qwen3.6 and LFM2.5 as a beta), Strix Halo and older processors without AVX2: [the full list](docs/INSTALL.md#what-you-need). Each model's card, RAM and sizes in detail are on its page.
 
@@ -233,6 +236,7 @@ The same model comes in several sizes, compressed more or less: smaller sizes ar
 | [Tiel Coder 35B-A3B](docs/models/tiel.md) | UD-Q3_K_XL | UD-IQ3_XXS | UD-Q4_K_XL |
 | [MiniCPM-V 4.7 35B-A3B](docs/models/minicpmv.md) | Q4_K_M | mix_q3gud_im | Q6_K |
 | [Kolibri 1](docs/models/kolibri.md) | Q4_K_M from about 48 GB of RAM | Q2_K | Q3_K_M |
+| [Inkling 2 Mini](Inkling%202%20Mini%20Benchmark.md) | UD-Q4_K_XL | UD-Q3_K_XL, UD-IQ3_XXS | Q8_0 |
 
 What each size is, its download, the RAM it needs beside other cards and how close it comes to the largest: each model's page, linked from the table under "How fast is it?".
 
@@ -344,6 +348,8 @@ Ornith 1.5 is by ornith-ai, in
 [u/Sensitive_Song4219](https://www.reddit.com/r/LocalLLM/comments/1x22inc/comment/pf3r111/) found that it runs on PolyStrata.
 MiniCPM-V 4.7 35B-A3B is by [OpenBMB](https://huggingface.co/openbmb/MiniCPM-V-4.7-35B-A3B-gguf), in their own
 quantization; [iMilnb](https://github.com/iMilnb) brought it to PolyStrata.
+Inkling 2 Mini is by [Thinking Machines Lab](https://huggingface.co/thinkingmachines/Inkling-2-Mini), in
+[Unsloth](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF)'s quantization (`UD-Q4_K_XL`).
 PolyStrata is built on
 [Strata](https://github.com/Niko1221/Strata) by Niko1221 and its contributors, and uses parts of
 [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp). All credits:

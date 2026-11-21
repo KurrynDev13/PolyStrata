@@ -1,0 +1,205 @@
+# Inkling 2 Mini (`UD-Q4_K_XL`) — PolyStrata Engine Benchmark & Optimization Report
+
+## 1. Hardware, Model & Software Environment
+
+- **System Hardware:**
+  - **CPU:** AMD Ryzen 9 7900X (12 physical cores / 24 threads, AVX-512)
+  - **GPU:** NVIDIA GeForce RTX 4070 SUPER 12 GB (`12,282 MiB` physical VRAM, Compute Capability `sm_89`)
+  - **System RAM:** 32 GB DDR5 (`31.1 GiB` usable)
+  - **OS & Toolchain:** Windows 11 x64, Visual Studio 2026 (MSVC 19.51), CUDA Toolkit 13.5 (`v13.5.37`)
+- **Model & Multimodal Files:**
+  - **Text Model:** `Inkling-2-Mini-UD-Q4_K_XL.gguf` (`16.41 GiB`, 744 tensors)
+    - Architecture: `inkling2_loop` — 24 physical layers executed across **48 logical steps** (prelude layers `0..5`, looped core layers `6..17` $\times$ 3 passes with rank-64 cross-pass gated controllers, epilogue layers `18..23`).
+    - Hidden dimension: `2304`; Attention: `24` query heads, `8` KV heads, `head_dim = 128`; **40 SWA logical slots** (`sliding_window = 1024`) + **8 global attention slots** (layers `5, 11, 17, 23` across passes) with logarithmic position scale $\tau(\text{pos}) = 1 + 0.1 \ln(\max(1, (\text{pos}+1)/8192))$, learned L2 clipping (`qk_clip = 22.63`, `rel_clip = 8.0`), 16-dim factorized relative position bias (`extent = 1024`), and virtual zero attention sink.
+    - Residual & Convolutions: **6-stream Block Attention Residuals** (`block_size = 6`) + 4-tap causal short convolutions (`l_cache = 4`) on `K`, `V` (with input-dependent reversed-lag dynamic taps on global layers), `attn_out`, and `ffn_out`.
+    - Mixture-of-Experts: `128` routed experts (`n_ff_exp = 1152`), top-8 sigmoid routing with learned bias (`w_scale = 8.0`) and **SiTU** activation ($\beta = 4.0$, $\beta_{\text{linear}} = 25.0$). Layers `0..19` use `NVFP4` routed experts with shared `ffn_gate_up_exps.scale` (`F32[128]`) and `ffn_down_exps.scale` (`F32[128]`); layers `20..23` use `Q8_0` routed experts.
+    - Vocabulary: `200,058` unpadded tokens (`201,024` padded in `token_embd.weight` / `output.weight`), `GPT4O` pre-tokenizer (`tokenizer.ggml.pre = "inkling2"`), stop token `<|content_model_end_sampling|>` (`200006`).
+  - **Vision Projector:** `mmproj-F16.gguf` (`639.3 MB`, `inkling2v`, 23 blocks, patch size `20`, `2x2` spatial merge, projection dim `2304`), offloaded to CPU via `strata-vision-inkling2.exe` (`CUDA_VISIBLE_DEVICES=-1`) so 100% of GPU VRAM remains dedicated to the language model.
+- **Binaries Under Test:**
+  - **PolyStrata Engine:** `D:\PolyStrata\engine-poly-inkling2\strata-poly.exe` & `strata-vision-inkling2.exe` (branch `feat/inkling2-loop` synced onto `0.1.45-poly.10`).
+  - **Reference Engine:** `llama.cpp` (`b4628b3` — upstream `master` + cherry-picked PR `#32704` fixing `inkling2_loop` NVFP4 scale slot sharing, built with `-DCMAKE_CUDA_ARCHITECTURES=89` and `/arch:AVX512`).
+
+---
+
+## 2. Kernel Accuracy & Reference `llama.cpp` Parity
+
+### 2.1 CUDA Kernel & CPU SiTU Unit Test Suite (`poly_inkling2_test.exe`)
+
+All 19 unit tests in `poly_inkling2_test.exe` verify GPU kernels and CPU expert math against FP64 CPU reference implementations:
+
+| Kernel / Subsystem Test | Elements Checked | Max Relative Error | Result |
+| :--- | :---: | :---: | :---: |
+| `situ_rows` (with NVFP4 `ExpertScales`) | 320 | `1.47e-07` | **PASS** |
+| `cpu_experts` SiTU (multi-threaded F32 reference) | 64 | `1.11e-06` | **PASS** |
+| `inkling_mix` (4 residual streams, 3 queries) | 3,072 | `1.65e-07` | **PASS** |
+| `inkling_control_prep` (RMSNorm + concat) | 2,048 | `7.92e-08` | **PASS** |
+| `inkling_control_apply` (gain / forget tanh gating) | 1,024 | `1.37e-07` | **PASS** |
+| `inkling_conv4` dynamic reversed-lag batch output | 5,120 | `7.87e-08` | **PASS** |
+| `inkling_conv4` dynamic batch state update | 768 | `0` | **PASS** |
+| `inkling_conv4` static walk output | 1,536 | `6.84e-08` | **PASS** |
+| `inkling_conv4` speculative snapshot rollback | 768 | `0` | **PASS** |
+| `inkling_l2_clip` (global $\tau(\text{pos})$ + scale + graph `at`) | 12,288 | `2.14e-07` | **PASS** |
+| `inkling_rel_table` (relative bias projection - sink) | 786,432 | `2.95e-07` | **PASS** |
+| SWA ring FP16 `inkling_attend` vs FP64 ref | 98,304 | `2.95e-08` | **PASS** |
+| SWA ring FP16 `inkling_attend_batch` vs `inkling_attend` | 98,304 | `1.89e-05` | **PASS** |
+| SWA ring Q8_0 `inkling_attend` vs FP64 ref | 98,304 | `2.77e-08` | **PASS** |
+| SWA ring Q8_0 `inkling_attend_batch` vs `inkling_attend` | 98,304 | `2.60e-05` | **PASS** |
+| Global (`>1024`) FP16 + graph `at` `inkling_attend` vs FP64 | 49,152 | `2.49e-08` | **PASS** |
+| Global (`>1024`) FP16 `inkling_attend_batch` vs `inkling_attend` | 49,152 | `1.65e-05` | **PASS** |
+| Global (`>1024`) Q8_0 `inkling_attend` vs FP64 ref | 49,152 | `2.09e-08` | **PASS** |
+| Global (`>1024`) Q8_0 `inkling_attend_batch` vs `inkling_attend` | 49,152 | `1.96e-05` | **PASS** |
+
+### 2.2 Greedy Parity & Throughput vs Reference `llama-completion.exe`
+
+Measured with greedy decoding (`--temperature 0`, `--window 1` to disable speculative lookup for strict token-by-token comparison) against `llama-completion.exe -ngl 99 -cmoe --temp 0`:
+
+| Workload | Engine & Configuration | Load Time | Experts in VRAM | Prefill Speed | Decode Speed | Token Parity vs `llama.cpp` |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: |
+| **Short Prompt**<br>(`25` prompt + `48` gen) | **Reference `llama.cpp` (`-ngl 99 -cmoe`)** | 2.32 s | 0 / 3,072 | 10.75 tok/s | 13.72 tok/s | *Reference* |
+| | **`strata-poly` (FP16 KV, GPU+CPU experts)** | 2.60 s | 1,352 / 3,072 (`6.5 GiB`) | **25.70 tok/s** *(2.39x)* | **47.25 tok/s** *(3.44x)* | **48 / 48 (100% bit-identical)** |
+| | **`strata-poly` (`--no-gpu-experts`, CPU SiTU)** | **0.60 s** | 0 / 3,072 (`0.0 GiB`) | 15.20 tok/s *(1.41x)* | 21.31 tok/s *(1.55x)* | **48 / 48 (100% bit-identical)** |
+| | **`strata-poly` (`--kv q8_0`, GPU+CPU experts)** | 2.70 s | 1,381 / 3,072 (`6.6 GiB`) | 25.10 tok/s *(2.33x)* | 46.67 tok/s *(3.40x)* | **48 / 48 (100% bit-identical)** |
+| **Long Prompt**<br>(`1,833` prompt + `32` gen,<br>SWA wrap `>1024`) | **Reference `llama.cpp` (`-ngl 99 -cmoe`)** | 6.98 s | 0 / 3,072 | 262.72 tok/s | 14.46 tok/s | *Reference* |
+| | **`strata-poly` (FP16 KV, `--vram-reserve-mib 1536`)** | 2.80 s | 1,442 / 3,072 (`6.9 GiB`) | **934.40 tok/s** *(3.56x)* | **35.40 tok/s** *(2.45x)* | Exact prefix `0..3` (`p=1.000`), 3-way tie at tok 4 (`0.297` vs `0.285`) |
+| | **`strata-poly` (`--kv q8_0`, `--vram-reserve-mib 1536`)** | 2.80 s | 1,480 / 3,072 (`7.1 GiB`) | **966.60 tok/s** *(3.68x)* | **33.60 tok/s** *(2.32x)* | Exact prefix `0..3`, 23/32 positional token match |
+
+---
+
+## 3. Single-Shot 5.4k-Token Benchmark at 128k Context (`--max-context 131072`)
+
+- **Workload:** `5,461` prompt tokens (distributed tensor cache specification + Python implementation) $\rightarrow$ `256` generated tokens, `--max-context 131072`, `--ram-experts-mib -1`, cold start (no pre-existing `--expert-profile`), default `--window 8 --lookup 3` speculative n-gram lookup enabled, greedy (`temperature = 0`).
+
+| Configuration | Prefill Speed (`5,461` tok) | Decode Speed (`256` tok) | Wall Time (incl. load) | Experts in VRAM (`/ 3072`) | VRAM Hit % | CPU / Router Wait (`ms/tok`) | Lookup Drafts Accepted | Peak GPU VRAM (`MiB`) |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Config 1 — Baseline FP16 KV**<br>`--max-context 131072 --vram-reserve-mib 1536`<br>(`--prompt-batch 1024`, `17` threads, exact top-8) | 1,060.0 tok/s | 44.53 tok/s | 15.21 s | 1,437 (`6.9 GiB`) | 87.1% | 0.3 / 0.9 ms | 36 / 63 (`57.1%`) | 10,929 MiB |
+| **Config 2 — Tuned FP16 KV (Exact Winner)**<br>`--max-context 131072 --vram-reserve-mib 1280 --prompt-batch 512`<br>(`17` threads, exact top-8, `0` skipped) | **1,307.3 tok/s**<br>*(+23.3%)* | **45.00 tok/s** | **14.62 s** | **1,561 (`7.5 GiB`)**<br>*(+124 experts)* | **88.9%** | **0.2 / 0.9 ms** | 37 / 62 (`59.7%`) | 11,219 MiB |
+| **Config 3 — Tuned FP16 KV + `--skip-weight 0.05`**<br>`--max-context 131072 --vram-reserve-mib 1280 --prompt-batch 512 --skip-weight 0.05`<br>(`17` threads, `836` low-weight uncached experts skipped) | **1,308.8 tok/s**<br>*(+23.5%)* | 44.50 tok/s | **14.26 s** | **1,561 (`7.5 GiB`)** | **91.0%** | 0.2 / 1.0 ms | 17 / 46 (`37.0%`) | 11,211 MiB |
+| **Config 2-Q8 — Tuned Q8_0 KV (Exact Top-8)**<br>`--max-context 131072 --kv q8_0 --vram-reserve-mib 1280 --prompt-batch 512 --threads 12` | 1,061.5 tok/s | 39.63 tok/s | 16.98 s | **1,589 (`7.6 GiB`)**<br>*(+152 experts)* | 90.0% | 0.2 / 1.2 ms | 16 / 39 (`41.0%`) | 11,139 MiB |
+| **Config 3-Q8 — Tuned Q8_0 KV + `--skip-weight 0.05`**<br>`--max-context 131072 --kv q8_0 --vram-reserve-mib 1280 --prompt-batch 512 --threads 12 --skip-weight 0.05` | 1,239.0 tok/s<br>*(+16.9%)* | 42.94 tok/s | 15.40 s | **1,589 (`7.6 GiB`)** | 90.7% | 0.2 / 1.1 ms | 49 / 86 (`57.0%`) | 11,134 MiB |
+
+### Why `--prompt-batch 512` + `--vram-reserve-mib 1280` Won
+1. **+124 Extra Routed Experts in VRAM (`1,561` vs `1,437`):** Lowering `--prompt-batch` from `1024` to `512` halves per-row device scratch + MMQ buffers (`~1.4 MiB/token`) and shrinks all 40 SWA rings (`ring_ = 1024 + rows_`) from `2,048` rows to `1,536` rows. Combined with `--vram-reserve-mib 1280`, this frees `~600 MiB` of physical VRAM directly into the routed expert cache while keeping peak VRAM at `11,219 / 12,282 MiB` (zero WDDM spill).
+2. **+23.3% Faster 5.4k Prefill (`1,307.3 tok/s` vs `1,060.0 tok/s`):** `512`-token batches keep full Tensor Core/MMQ occupancy while reducing staging-buffer contention and improving initial VRAM expert hit rate (`88.9%` vs `87.1%`).
+
+---
+
+## 4. Long-Running Multi-Turn Growing Context Benchmark (`2.2k -> 33.0k` at 128k Context)
+
+To benchmark realistic long-running multi-turn coding sessions, a single persistent `strata-poly.exe --serve` instance was driven through **6 consecutive turns** expanding the conversation from **`2,248` tokens to `32,994` tokens** (`128` tokens generated per turn, appended to the history for the next turn).
+
+- **Cumulative Prefix Reuse:** Out of `92,292` total prompt tokens submitted across the 6 turns, **`59,933` tokens (`64.9%`) were reused directly from the live KV + 48-slot `conv4` + SWA ring state** without being read again.
+
+### 4.1 Session A — Tuned FP16 KV (`--max-context 131072 --vram-reserve-mib 1280 --prompt-batch 512 --ram-experts-mib -1`)
+- **Initial Load:** `3.12 s` | `1,561 / 3,072` routed experts in VRAM (`7.5 GiB`)
+
+| Turn | Total Prompt Tokens | Reused Prefix Tokens | Fresh Tokens Read | Fresh Prefill Speed | Decode Speed (`128` tok) | Expert VRAM Hit % | Lookup Drafts Accepted | GPU VRAM Used | Elastic VMM `--kv-grow` Event |
+| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :--- |
+| **Turn 1** | 2,248 | 0 (`0.0%`) | 2,248 | 840.4 tok/s (`2,675 ms`) | 43.20 tok/s | 85.8% | 6 / 16 | 11,007 MiB | — |
+| **Turn 2** | 5,126 | 2,375 (`46.3%`) | 2,751 | 893.3 tok/s (`3,080 ms`) | 93.10 tok/s | 94.1% | 94 / 105 | 11,106 MiB | — |
+| **Turn 3** | 10,560 | 5,253 (`49.7%`) | 5,307 | **1,087.1 tok/s** (`4,882 ms`) | **108.15 tok/s** | **95.3%** | 103 / 111 | 11,121 MiB | — |
+| **Turn 4** | 16,432 | 10,687 (`65.0%`) | 5,745 | 1,060.5 tok/s (`5,418 ms`) | 95.34 tok/s | 93.2% | 103 / 114 | 10,441 MiB | `1588 -> 1437` experts (`6.50 GiB`), `1,315 MiB` left |
+| **Turn 5** | 24,932 | 16,559 (`66.4%`) | 8,373 | **1,126.6 tok/s** (`7,432 ms`) | 89.05 tok/s | 92.5% | 103 / 111 | 10,436 MiB | — |
+| **Turn 6** | **32,994** | **25,059 (`76.0%`)** | 7,935 | **1,032.0 tok/s** (`7,689 ms`) | **82.44 tok/s** | 88.4% | 104 / 111 | 10,458 MiB | `1,321 MiB` VRAM free at end |
+
+### 4.2 Session B — Tuned Q8_0 KV (`--max-context 131072 --kv q8_0 --vram-reserve-mib 1280 --prompt-batch 512 --ram-experts-mib -1`)
+- **Initial Load:** `3.13 s` | `1,589 / 3,072` routed experts in VRAM (`7.6 GiB`)
+
+| Turn | Total Prompt Tokens | Reused Prefix Tokens | Fresh Tokens Read | Fresh Prefill Speed | Decode Speed (`128` tok) | Expert VRAM Hit % | Lookup Drafts Accepted | GPU VRAM Used | Elastic VMM `--kv-grow` Event |
+| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :--- |
+| **Turn 1** | 2,248 | 0 (`0.0%`) | 2,248 | 861.2 tok/s (`2,610 ms`) | 39.17 tok/s | 86.4% | 6 / 16 | 10,918 MiB | — |
+| **Turn 2** | 5,126 | 2,375 (`46.3%`) | 2,751 | 892.3 tok/s (`3,083 ms`) | 81.93 tok/s | 94.6% | 94 / 103 | 11,124 MiB | — |
+| **Turn 3** | 10,560 | 5,253 (`49.7%`) | 5,307 | 1,073.8 tok/s (`4,942 ms`) | 104.38 tok/s | **95.5%** | 108 / 120 | 11,142 MiB | — |
+| **Turn 4** | 16,432 | 10,687 (`65.0%`) | 5,745 | 1,022.9 tok/s (`5,617 ms`) | **99.99 tok/s** | **95.5%** | 108 / 120 | 11,158 MiB | *(no expert trim needed at 16.4k)* |
+| **Turn 5** | 24,932 | 16,559 (`66.4%`) | 8,373 | 1,078.8 tok/s (`7,761 ms`) | **89.25 tok/s** | **94.1%** | 108 / 120 | 10,460 MiB | `1616 -> 1464` experts (`6.62 GiB`), `1,355 MiB` left |
+| **Turn 6** | **32,994** | **25,059 (`76.0%`)** | 7,935 | 974.1 tok/s (`8,146 ms`) | 76.86 tok/s | **90.2%** | 108 / 120 | 10,446 MiB | `1,286 MiB` VRAM free at end |
+
+### 4.3 Session C — Tuned Q8_0 KV + `--skip-weight 0.05`
+- **Initial Load:** `3.17 s` | `1,589 / 3,072` routed experts in VRAM (`7.6 GiB`)
+
+| Turn | Total Prompt Tokens | Reused Prefix Tokens | Fresh Tokens Read | Fresh Prefill Speed | Decode Speed (`128` tok) | Expert VRAM Hit % | Lookup Drafts Accepted | GPU VRAM Used |
+| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Turn 1** | 2,248 | 0 (`0.0%`) | 2,248 | **864.2 tok/s** (`2,601 ms`) | 39.17 tok/s | 87.2% | 6 / 16 | 10,970 MiB |
+| **Turn 2** | 5,126 | 2,375 (`46.3%`) | 2,751 | **901.6 tok/s** (`3,051 ms`) | 44.79 tok/s | 94.7% | 20 / 45 | 11,008 MiB |
+| **Turn 3** | 10,560 | 5,253 (`49.7%`) | 5,307 | 1,077.4 tok/s (`4,926 ms`) | 93.97 tok/s | 95.1% | 101 / 107 | 11,102 MiB |
+| **Turn 4** | 16,432 | 10,687 (`65.0%`) | 5,745 | 1,017.0 tok/s (`5,649 ms`) | 93.51 tok/s | **95.6%** | 104 / 113 | 11,118 MiB |
+| **Turn 5** | 24,932 | 16,559 (`66.4%`) | 8,373 | 1,077.2 tok/s (`7,773 ms`) | **92.76 tok/s** | **95.6%** | 107 / 112 | 11,120 MiB |
+| **Turn 6** | **32,994** | **25,059 (`76.0%`)** | 7,935 | 978.2 tok/s (`8,112 ms`) | 77.36 tok/s | **91.9%** | 106 / 117 | 11,120 MiB |
+
+---
+
+## 5. End-to-End Server, Conversation Cache Park/Restore & CPU Vision Telemetry
+
+Verified against live HTTP endpoints (`/v1/chat/completions`, `/v1/messages`, `/v1/status`):
+
+| Feature / Subsystem | Measured Performance & Verification |
+| :--- | :--- |
+| **OpenAI `/v1/chat/completions` Streaming** | Separated `reasoning_content` (`<|content_thinking|>`) and `content` (`<|content_text|>`), clean termination (`finish_reason = "stop"`) on `<|content_model_end_sampling|>` (`200006`), `44.5–58.7 tok/s` decode on conversational prompts. |
+| **Anthropic `/v1/messages` Streaming** | Clean `thinking` + `text` content blocks with `stop_reason = "end_turn"`, `57.6 tok/s` decode. |
+| **Multi-Turn Tool Calling** | Emits `<|message_model|>NAME<|content_invoke_tool_json|>{"name":...,"args":{...}}<|end_message|>`, parsed into OpenAI `tool_calls` (`finish_reason = "tool_calls"`), and reuses `116 / 173` prompt tokens on the tool-result follow-up turn (`50.0 tok/s`). |
+| **RAM Conversation Cache Park & Restore** | `3,840 MiB` auto-sized RAM pool (up to 4 parked conversations). Parked a `1,175`-token conversation (8 global KV caches + 40 SWA rings + 48 `conv4` states = `381,714,432` bytes / `364.0 MiB`) in **`5.0 ms`** (`72.8 GB/s`), served an unrelated conversation, and restored all `1,175` tokens back to VRAM in **`7.3 ms`** (`cached_tokens: 1175`), recalling the exact passcode (`BLUEBERRY-7492`). |
+| **CPU-Offloaded Vision (`strata-vision-inkling2.exe`)** | Loads `mmproj-F16.gguf` on CPU (`12` threads, `CUDA_VISIBLE_DEVICES=-1`) in `0.8–0.9 s`. Encodes a `160x120` image (`12` tokens $\times$ `2304` dim) in **`46 ms`** and a `200x200` image in `<100 ms`; `strata-poly` skips `token_embd_norm.weight` on injected `<|unused_200054|>` image rows (`54.5 tok/s` decode, `0 MiB` GPU VRAM taken by vision encoder). |
+
+---
+
+## 6. Optimization Reference & Production Configuration
+
+### Summary of Engine Flags for Inkling 2 Mini on 12 GB VRAM
+
+1. **`--kv-grow` (Default ON):** Uses CUDA VMM (`kv_alloc` + `cover`) on the 8 global attention slots so `--max-context 131072` costs zero extra upfront KV VRAM at startup. The 40 SWA slots use fixed `1024 + prompt_batch` ring buffers.
+2. **`--vram-reserve-mib 1280`:** Prevents Windows WDDM shared-memory spill (which otherwise causes `~968 ms/tok` PCIe stalls when VRAM oversubscribes 12 GB) while fitting `1,561–1,589 / 3,072` routed experts in physical VRAM. *(Do not enable `--vram-pool` on Windows WDDM, as Windows includes shared system memory in the process DXGI budget.)*
+3. **`--prompt-batch 512`:** Frees `~600 MiB` of scratch + SWA ring VRAM for `+124` additional GPU-cached experts and increases 5.4k prefill throughput by `+23.3%` (`1,307.3 tok/s`).
+4. **`--kv fp16` (Default) vs `--kv q8_0`:**
+   - Use **FP16 KV (default)** for general coding and multi-turn sessions up to ~40k tokens (`1,307 tok/s` prefill, up to `108 tok/s` multi-turn decode, 100% lossless).
+   - Use **`--kv q8_0`** when regularly filling `64k–128k` context in a single conversation (`17 KiB/token` vs `32 KiB/token` across the 8 global slots, saving `~1.9 GiB` of VRAM at 128k).
+   - *Note:* `--kv k8v4` is specific to the Qwen 3.8 engine (`strata.exe`) and is not used in `strata-poly.exe`.
+
+### Production Run Config ([strata-inkling2-ud-q4_k_xl.json](file:///d:/PolyStrata/strata-inkling2-ud-q4_k_xl.json))
+
+```json
+{
+  "exe": "D:\\PolyStrata\\engine-poly-inkling2\\strata-poly.exe",
+  "args": [
+    "--model",
+    "D:\\Users\\Kurryn_PC\\Documents\\Strata\\Models\\models\\inkling2-UD-Q4_K_XL\\Inkling-2-Mini-UD-Q4_K_XL.gguf",
+    "--max-context",
+    "131072",
+    "--vram-reserve-mib",
+    "1280",
+    "--prompt-batch",
+    "512",
+    "--ram-experts-mib",
+    "-1",
+    "--expert-profile",
+    "D:\\Users\\Kurryn_PC\\Documents\\Strata\\Models\\packs\\inkling2-ud-q4_k_xl\\expert-profile.txt",
+    "--conversation-cache-mib",
+    "auto"
+  ],
+  "cwd": "D:\\PolyStrata",
+  "tokenizer": "D:\\Users\\Kurryn_PC\\Documents\\Strata\\Models\\packs\\inkling2-ud-q4_k_xl\\tokenizer",
+  "model_name": "inkling-2-mini-ud-q4_k_xl",
+  "display_name": "Inkling 2 Mini UD-Q4_K_XL",
+  "log": "D:\\PolyStrata\\strata-inkling2-ud-q4_k_xl.log",
+  "lib_dirs": [
+    "D:\\PolyStrata\\.venv\\Lib\\site-packages\\nvidia\\cu13\\bin\\x86_64"
+  ],
+  "port": 8080,
+  "gpu": 0,
+  "gpus_asked": true,
+  "cors_origins": [
+    "*"
+  ],
+  "reasoning_close_retry": true,
+  "repeat_stop_tokens": 64,
+  "vision": {
+    "exe": "D:\\PolyStrata\\engine-poly-inkling2\\strata-vision-inkling2.exe",
+    "mmproj": "D:\\Users\\Kurryn_PC\\Documents\\Strata\\Models\\models\\inkling2-UD-Q4_K_XL\\mmproj-F16.gguf",
+    "model": "D:\\Users\\Kurryn_PC\\Documents\\Strata\\Models\\models\\inkling2-UD-Q4_K_XL\\Inkling-2-Mini-UD-Q4_K_XL.gguf",
+    "gpu": false,
+    "threads": 12
+  },
+  "sampling": {
+    "temperature": 1.0,
+    "top_p": 1.0
+  }
+}
+```
