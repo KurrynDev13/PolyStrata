@@ -565,6 +565,142 @@ int test_rel_and_attend() {
     return bad;
 }
 
+int test_dspark_kernels() {
+    int bad = 0;
+    const int rows = 7, n_embd = 288, n_streams = 9;
+    const float eps = 1e-6f;
+
+    // 1. extract_taps + mix_norm
+    auto r_host = random_vec((size_t) rows * n_streams * n_embd, 1.5f);
+    auto tap3_host = random_vec((size_t) rows * n_embd, 1.5f);
+    auto w_norm = random_vec(n_embd, 0.8f);
+    const float a0 = 0.41f, a1 = 0.19f, a2 = 0.27f, a3 = 0.13f;
+
+    float* d_r = dev(r_host);
+    float* d_taps = dev(std::vector<float>((size_t) rows * 3 * n_embd, 0.f));
+    float* d_tap3 = dev(tap3_host);
+    float* d_wn = dev(w_norm);
+    float* d_mix = dev(std::vector<float>((size_t) rows * n_embd, 0.f));
+
+    inkling_dspark_extract_taps(d_r, n_streams, 6, d_taps, n_embd, rows, nullptr);
+    inkling_dspark_mix_norm(d_taps, d_tap3, a0, a1, a2, a3, d_wn, d_mix, n_embd, rows, eps, nullptr);
+    cudaDeviceSynchronize();
+
+    std::vector<float> want_taps((size_t) rows * 3 * n_embd);
+    std::vector<float> want_mix((size_t) rows * n_embd);
+    for (int r = 0; r < rows; ++r) {
+        std::vector<double> m(n_embd);
+        double ss = 0.0;
+        for (int t = 0; t < 3; ++t)
+            for (int i = 0; i < n_embd; ++i)
+                want_taps[((size_t) r * 3 + t) * n_embd + i] =
+                    r_host[((size_t) r * n_streams + (6 + t)) * n_embd + i];
+        for (int i = 0; i < n_embd; ++i) {
+            m[i] = (double) a0 * want_taps[(size_t) r * 3 * n_embd + i] +
+                   (double) a1 * want_taps[((size_t) r * 3 + 1) * n_embd + i] +
+                   (double) a2 * want_taps[((size_t) r * 3 + 2) * n_embd + i] +
+                   (double) a3 * tap3_host[(size_t) r * n_embd + i];
+            ss += m[i] * m[i];
+        }
+        const double inv = 1.0 / std::sqrt(ss / n_embd + eps);
+        for (int i = 0; i < n_embd; ++i)
+            want_mix[(size_t) r * n_embd + i] = (float) (m[i] * inv * (double) w_norm[i]);
+    }
+    bad += report("DSpark extract_taps", host(d_taps, want_taps.size()), want_taps, 1e-6);
+    bad += report("DSpark mix_norm vs FP64", host(d_mix, want_mix.size()), want_mix, 1e-5);
+
+    cudaFree(d_r); cudaFree(d_taps); cudaFree(d_tap3); cudaFree(d_wn); cudaFree(d_mix);
+
+    // 2. rnn_gate (two sequential updates)
+    const int rank = 256;
+    auto g1 = random_vec(3 * rank, 1.2f), g2 = random_vec(3 * rank, 1.2f), rb = random_vec(3 * rank, 0.3f);
+    std::vector<float> st_init(rank, 0.f);
+    float* d_g = dev(g1);
+    float* d_rb = dev(rb);
+    float* d_st = dev(st_init);
+    float* d_lat = dev(std::vector<float>(rank, 0.f));
+
+    auto ref_gate = [&](const std::vector<float>& g, std::vector<double>& s_ref, std::vector<float>& l_ref) {
+        for (int i = 0; i < rank; ++i) {
+            const double k = 1.0 / (1.0 + std::exp(-((double) g[i] + rb[i])));
+            const double u = std::tanh((double) g[rank + i] + rb[rank + i]);
+            const double l = std::tanh((double) g[2 * rank + i] + rb[2 * rank + i]);
+            s_ref[i] = k * s_ref[i] + (1.0 - k) * u;
+            l_ref[i] = (float) l;
+        }
+    };
+    std::vector<double> st_ref(rank, 0.0);
+    std::vector<float> lat_ref(rank);
+    inkling_dspark_rnn_gate(d_g, d_rb, d_st, d_lat, rank, nullptr);
+    ref_gate(g1, st_ref, lat_ref);
+    cudaMemcpy(d_g, g2.data(), g2.size() * sizeof(float), cudaMemcpyHostToDevice);
+    inkling_dspark_rnn_gate(d_g, d_rb, d_st, d_lat, rank, nullptr);
+    ref_gate(g2, st_ref, lat_ref);
+    cudaDeviceSynchronize();
+    std::vector<float> st_ref_f(rank);
+    for (int i = 0; i < rank; ++i) st_ref_f[i] = (float) st_ref[i];
+    bad += report("DSpark rnn_gate state vs FP64", host(d_st, rank), st_ref_f, 1e-5);
+    bad += report("DSpark rnn_gate latent vs FP64", host(d_lat, rank), lat_ref, 1e-5);
+    cudaFree(d_g); cudaFree(d_rb); cudaFree(d_st); cudaFree(d_lat);
+
+    // 3. add_softcap
+    const int n_voc = 4099;
+    const float cap = 30.0f;
+    auto base = random_vec(n_voc, 12.f), delta = random_vec(n_voc, 6.f), fbias = random_vec(n_voc, 2.f);
+    float* d_base = dev(base);
+    float* d_delta = dev(delta);
+    float* d_fb = dev(fbias);
+    float* d_out = dev(std::vector<float>(n_voc, 0.f));
+    inkling_dspark_add_softcap(d_base, d_delta, d_fb, d_out, n_voc, cap, nullptr);
+    cudaDeviceSynchronize();
+    std::vector<float> want_cap(n_voc);
+    for (int i = 0; i < n_voc; ++i) {
+        const double v = (double) base[i] + delta[i] + fbias[i];
+        want_cap[i] = (float) (cap * std::tanh(v / cap));
+    }
+    bad += report("DSpark add_softcap vs FP64", host(d_out, n_voc), want_cap, 1e-5);
+    cudaFree(d_base); cudaFree(d_delta); cudaFree(d_fb); cudaFree(d_out);
+
+    // 4. pack_q8_0_block dequant verification via ggml
+    const int pv = 137, n_blocks = 2;
+    auto col0 = random_vec(32 * pv, 2.5f), col1 = random_vec(32 * pv, 1.5f);
+    float* d_cols = dev(col0);
+    uint8_t* d_q8 = nullptr;
+    cudaMalloc(&d_q8, (size_t) pv * n_blocks * 34);
+    cudaMemset(d_q8, 0, (size_t) pv * n_blocks * 34);
+    inkling_dspark_pack_q8_0_block(d_cols, d_q8, pv, 0, n_blocks, nullptr);
+    cudaMemcpy(d_cols, col1.data(), col1.size() * sizeof(float), cudaMemcpyHostToDevice);
+    inkling_dspark_pack_q8_0_block(d_cols, d_q8, pv, 1, n_blocks, nullptr);
+    cudaDeviceSynchronize();
+
+    std::vector<uint8_t> h_q8((size_t) pv * n_blocks * 34);
+    cudaMemcpy(h_q8.data(), d_q8, h_q8.size(), cudaMemcpyDeviceToHost);
+    const auto* tt = ggml_get_type_traits(GGML_TYPE_Q8_0);
+    std::vector<float> deq((size_t) pv * 64);
+    tt->to_float(h_q8.data(), deq.data(), (int64_t) pv * 64);
+    double max_q_err = 0.0;
+    for (int v = 0; v < pv; ++v) {
+        float amax0 = 0.f, amax1 = 0.f;
+        for (int j = 0; j < 32; ++j) {
+            amax0 = std::max(amax0, std::abs(col0[(size_t) j * pv + v]));
+            amax1 = std::max(amax1, std::abs(col1[(size_t) j * pv + v]));
+        }
+        const double bound0 = (amax0 / 127.0) * 0.52 + 1e-3 * amax0 + 1e-5;
+        const double bound1 = (amax1 / 127.0) * 0.52 + 1e-3 * amax1 + 1e-5;
+        for (int j = 0; j < 32; ++j) {
+            const double e0 = std::abs((double) deq[(size_t) v * 64 + j] - (double) col0[(size_t) j * pv + v]);
+            const double e1 = std::abs((double) deq[(size_t) v * 64 + 32 + j] - (double) col1[(size_t) j * pv + v]);
+            if (e0 > bound0) ++bad;
+            if (e1 > bound1) ++bad;
+            max_q_err = std::max({max_q_err, e0, e1});
+        }
+    }
+    std::printf("%-42s %8d vals  err=%.3g  %s\n", "DSpark pack_q8_0_block vs ggml_to_float",
+                pv * 64, max_q_err, bad == 0 ? "PASS" : "FAIL");
+    cudaFree(d_cols); cudaFree(d_q8);
+    return bad;
+}
+
 }  // namespace
 
 int main() {
@@ -574,6 +710,7 @@ int main() {
     bad += test_conv4();
     bad += test_l2_clip();
     bad += test_rel_and_attend();
+    bad += test_dspark_kernels();
     std::printf("\n%s\n", bad ? "FAILED" : "ALL PASSED");
     return bad ? 1 : 0;
 }

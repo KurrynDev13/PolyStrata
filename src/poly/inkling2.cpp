@@ -11,6 +11,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cfloat>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -62,6 +63,7 @@ void Inkling2::begin_pass() {
 }
 
 void Inkling2::load_geometry() {
+    std::unique_ptr<Shards> other = std::move(dg_);
     const MetaValue* arch = gg_->get("general.architecture");
     root_layout_ = arch && arch->s == "inkling2";
 
@@ -165,6 +167,71 @@ void Inkling2::load_geometry() {
     off_attn_post_ = 2 * off_v_conv_;
     off_ffn_post_ = off_attn_post_ + (size_t) (l_conv_ - 1) * n_embd_;
     slot_conv_floats_ = off_ffn_post_ + (size_t) (l_conv_ - 1) * n_embd_;
+
+    if (other) {
+        if (split_) throw std::runtime_error("Inkling2 DSpark does not support --layer-split");
+        const MetaValue* darch = other->get("general.architecture");
+        if (!darch || darch->s != "inkling2_dspark")
+            throw std::runtime_error(opt_.draft_model + " is not an inkling2_dspark draft GGUF");
+        auto d_u = [&](const char* key) -> int64_t {
+            const MetaValue* v = other->get(std::string("inkling2_dspark.") + key);
+            need(v != nullptr, key);
+            return (int64_t) v->u;
+        };
+        auto d_f = [&](const char* key) -> float {
+            const MetaValue* v = other->get(std::string("inkling2_dspark.") + key);
+            need(v != nullptr, key);
+            return (float) v->num();
+        };
+        dspark_layers_ = (int) d_u("block_count");
+        need(dspark_layers_ == 3, "inkling2_dspark.block_count must be 3");
+        need((int) d_u("embedding_length") == n_embd_, "inkling2_dspark embedding_length mismatch");
+        dspark_ff_ = (int) d_u("feed_forward_length");
+        dspark_heads_ = (int) d_u("attention.head_count");
+        dspark_kv_ = (int) d_u("attention.head_count_kv");
+        dspark_head_dim_ = (int) d_u("attention.key_length");
+        need((int) d_u("attention.value_length") == dspark_head_dim_, "inkling2_dspark key_length != value_length");
+        need(dspark_heads_ == 24 && dspark_kv_ == 8 && dspark_head_dim_ == 128 && dspark_ff_ > 0 && dspark_ff_ % 32 == 0,
+             "unsupported inkling2_dspark attention/ffn dimensions");
+        dspark_window_ = (int) d_u("attention.sliding_window");
+        dspark_eps_ = d_f("attention.layer_norm_rms_epsilon");
+        dspark_rope_theta_ = d_f("rope.freq_base");
+        dspark_block_ = (int) d_u("block_size");
+        dspark_rank_ = (int) d_u("markov_rank");
+        dspark_w1_vocab_ = (int) d_u("vocab_size");
+        need(dspark_window_ > 0 && dspark_block_ == 8 && dspark_rank_ == 256 && dspark_w1_vocab_ >= n_vocab_,
+             "unsupported inkling2_dspark block/markov geometry");
+        const MetaValue* htype = other->get("inkling2_dspark.markov_head_type");
+        need(htype != nullptr && htype->s == "rnn_hidden", "inkling2_dspark.markov_head_type must be rnn_hidden");
+        const MetaValue* taps = other->get("inkling2_dspark.target_layer_ids");
+        need(taps != nullptr && taps->type == MetaType::ARRAY && taps->items.size() == 4,
+             "inkling2_dspark.target_layer_ids must have 4 entries");
+        for (int i = 0; i < 3; ++i) {
+            dspark_taps_[i] = (int) taps->items[(size_t) i].u;
+            need(dspark_taps_[i] >= 0 && dspark_taps_[i] < exec_steps() &&
+                     (i == 0 || dspark_taps_[i] > dspark_taps_[i - 1]),
+                 "bad inkling2_dspark.target_layer_ids");
+        }
+        need((int) taps->items[3].u == exec_steps(), "inkling2_dspark last target_layer_id must equal exec_steps");
+        dspark_l_.assign((size_t) dspark_layers_, DsparkLayer{});
+        const MetaValue* locs = other->get("inkling2_dspark.local_layer_ids");
+        need(locs != nullptr && locs->type == MetaType::ARRAY, "bad inkling2_dspark.local_layer_ids");
+        for (const MetaValue& it : locs->items) {
+            need((int64_t) it.u >= 0 && (int64_t) it.u < dspark_layers_, "local_layer_id out of range");
+            dspark_l_[(size_t) it.u].local = true;
+        }
+        dspark_ring_ = dspark_window_ + dspark_block_;
+        dspark_theta_scale_ = std::pow(dspark_rope_theta_, -2.0f / (float) dspark_head_dim_);
+        dspark_ = true;
+        draft_ = true;
+        block_layer_ = false;
+        dg_ = std::move(other);
+        block_ = dg_.get();
+        std::fprintf(stderr,
+                     "strata-poly: Inkling2 DSpark MTP loaded (block=%d, rank=%d, window=%d, taps=[%d,%d,%d,%d])\n",
+                     dspark_block_, dspark_rank_, dspark_window_, dspark_taps_[0], dspark_taps_[1], dspark_taps_[2],
+                     exec_steps());
+    }
 }
 
 void Inkling2::load_layer(int il) {
@@ -386,6 +453,19 @@ void Inkling2::alloc_caches() {
         }
     }
 
+    if (dspark_) {
+        const size_t d_row = (size_t) dspark_kv_ * dspark_head_dim_ * sizeof(uint16_t);
+        for (DsparkLayer& dl : dspark_l_) {
+            if (dl.local) {
+                dl.dk = (uint16_t*) seq_alloc((size_t) dspark_ring_ * d_row, "dspark swa k");
+                dl.dv = (uint16_t*) seq_alloc((size_t) dspark_ring_ * d_row, "dspark swa v");
+            } else {
+                dl.dk = (uint16_t*) kv_alloc(d_row, 1);
+                dl.dv = (uint16_t*) kv_alloc(d_row, 1);
+            }
+        }
+    }
+
     const int n_splits_max = std::clamp((opt_.max_context + 511) / 512, 1, 64);
     chunk_batch_ = std::min(rows_, 64);
     chunk_dec_ = (int) std::clamp<size_t>(
@@ -394,7 +474,9 @@ void Inkling2::alloc_caches() {
 }
 
 int Inkling2::widest() const {
-    return std::max({2 * n_embd_, n_head_ * head_dim_});
+    int w = std::max({2 * n_embd_, n_head_ * head_dim_});
+    if (dspark_) w = std::max({w, dspark_ff_, 2 * dspark_rank_ + 2 * n_embd_});
+    return w;
 }
 
 void Inkling2::assign_scratch() {
@@ -427,15 +509,30 @@ void Inkling2::assign_scratch() {
     const size_t n_splits_max = (size_t) std::clamp((opt_.max_context + 511) / 512, 1, 64);
     score_n_ = std::max((size_t) chunk_dec_ * n_head_ * n_splits_max * (head_dim_ + 2),
                         (size_t) chunk_batch_ * n_head_ * 1536);
+    if (dspark_) score_n_ = std::max(score_n_, (size_t) dspark_block_ * dspark_heads_ * 1536);
     score_ = fbuf(score_n_);
 
-    if (rows_ >= kStageRows) {
-        const size_t ch = (size_t) chunk_batch_ * n_head_;
-        awork_ = fbuf(ch * (head_dim_ + head_dim_ / 2 + 3) + 1);
-    }
+    const size_t ch_base = rows_ >= kStageRows ? (size_t) chunk_batch_ * n_head_ : 0;
+    const size_t ch = dspark_ ? std::max(ch_base, (size_t) dspark_block_ * dspark_heads_) : ch_base;
+    if (ch > 0) awork_ = fbuf(ch * (head_dim_ + head_dim_ / 2 + 3) + 1);
     if (rows_ >= kStageRows && (opt_.kv_format == KvFmt::kQ8_0 || opt_.kv_format == KvFmt::kQ4_0)) {
         work_halves_ = kQ8WorkRows * (size_t) n_kv_ * head_dim_;
         q8w_ = fbuf((2 * work_halves_ + 1) / 2);
+    }
+    if (dspark_) {
+        d_taps_ = fbuf((size_t) std::max(rows_, opt_.window) * 3 * n_embd_);
+        d_f_rnn_ = fbuf((size_t) n_embd_);
+        d_blk_x_ = fbuf((size_t) dspark_block_ * n_embd_);
+        d_blk_h_ = fbuf((size_t) (dspark_block_ - 1) * n_embd_);
+        d_blk_qraw_ = fbuf((size_t) dspark_block_ * dspark_heads_ * dspark_head_dim_);
+        d_blk_gate_ = fbuf((size_t) dspark_block_ * dspark_ff_);
+        d_blk_up_ = fbuf((size_t) dspark_block_ * dspark_ff_);
+        d_base_logits_ = fbuf((size_t) (dspark_block_ - 1) * n_vocab_);
+        d_markov_bias_ = fbuf((size_t) n_vocab_);
+        d_rnn_in_ = fbuf((size_t) (2 * dspark_rank_ + 2 * n_embd_));
+        d_rnn_gates_ = fbuf((size_t) (3 * dspark_rank_));
+        d_rnn_state_ = fbuf((size_t) dspark_rank_);
+        d_rnn_latent_ = fbuf((size_t) dspark_rank_);
     }
 }
 
@@ -445,7 +542,13 @@ size_t Inkling2::card_row_bytes() const {
     size_t layers = 0;
     for (const SlotCache& sc : slots_)
         if (!sc.swa && slot_k_codes(sc) != nullptr) ++layers;
-    return layers * 2 * (code_row + scale_row);
+    size_t bytes = layers * 2 * (code_row + scale_row);
+    if (dspark_) {
+        const size_t d_row = (size_t) dspark_kv_ * dspark_head_dim_ * sizeof(uint16_t);
+        for (const DsparkLayer& dl : dspark_l_)
+            if (!dl.local && dl.dk != nullptr) bytes += 2 * d_row;
+    }
+    return bytes;
 }
 
 void Inkling2::save_card_rows(int64_t first, int64_t n, uint8_t* dst) {
@@ -475,6 +578,17 @@ void Inkling2::save_card_rows(int64_t first, int64_t n, uint8_t* dst) {
         for (const uint8_t* cache : {kptr, vptr}) {
             ck(cudaMemcpy(dst, cache + at_c, n_c, cudaMemcpyDeviceToHost), "save rows");
             dst += n_c;
+        }
+    }
+    if (dspark_ && n > 0) {
+        const size_t d_row = (size_t) dspark_kv_ * dspark_head_dim_ * sizeof(uint16_t);
+        const size_t dat = (size_t) first * d_row, dn = (size_t) n * d_row;
+        for (const DsparkLayer& dl : dspark_l_) {
+            if (dl.local || dl.dk == nullptr) continue;
+            ck(cudaMemcpy(dst, (const uint8_t*) dl.dk + dat, dn, cudaMemcpyDeviceToHost), "save dspark rows");
+            dst += dn;
+            ck(cudaMemcpy(dst, (const uint8_t*) dl.dv + dat, dn, cudaMemcpyDeviceToHost), "save dspark rows");
+            dst += dn;
         }
     }
 }
@@ -511,6 +625,18 @@ void Inkling2::load_card_rows(const uint8_t* src, int64_t from, int64_t count, i
             src += all_c;
         }
     }
+    if (dspark_ && n > 0) {
+        const size_t d_row = (size_t) dspark_kv_ * dspark_head_dim_ * sizeof(uint16_t);
+        const size_t dat = (size_t) first * d_row, dn = (size_t) n * d_row;
+        const size_t dsk = (size_t) (first - from) * d_row, dall = (size_t) count * d_row;
+        for (DsparkLayer& dl : dspark_l_) {
+            if (dl.local || dl.dk == nullptr) continue;
+            ck(cudaMemcpy((uint8_t*) dl.dk + dat, src + dsk, dn, cudaMemcpyHostToDevice), "load dspark rows");
+            src += dall;
+            ck(cudaMemcpy((uint8_t*) dl.dv + dat, src + dsk, dn, cudaMemcpyHostToDevice), "load dspark rows");
+            src += dall;
+        }
+    }
 }
 
 template <class F>
@@ -523,7 +649,15 @@ void Inkling2::window_runs(int64_t pos, F&& f) const {
 }
 
 size_t Inkling2::extra_bytes() const {
-    return (size_t) n_swa_slots_ * 2 * (size_t) keep_ * (kv_code_row_bytes() + kv_scale_row_bytes());
+    size_t bytes = (size_t) n_swa_slots_ * 2 * (size_t) keep_ * (kv_code_row_bytes() + kv_scale_row_bytes());
+    if (dspark_) {
+        const size_t kv_row = (size_t) dspark_kv_ * dspark_head_dim_ * sizeof(uint16_t);
+        size_t n_local = 0;
+        for (const DsparkLayer& dl : dspark_l_)
+            if (dl.local) ++n_local;
+        bytes += (size_t) n_embd_ * sizeof(float) + n_local * 2 * (size_t) dspark_window_ * kv_row;
+    }
+    return bytes;
 }
 
 void Inkling2::save_layer(int slot, int64_t pos, uint8_t* dst) {
@@ -583,6 +717,30 @@ void Inkling2::load_extra(const uint8_t* src, int64_t pos) {
         load_ring(kptr, code_row);
         load_ring(vptr, code_row);
     }
+    if (!dspark_) return;
+    const size_t f_bytes = (size_t) n_embd_ * sizeof(float);
+    ck(cudaMemcpyAsync(d_f_rnn_, src, f_bytes, cudaMemcpyHostToDevice, cs(st_)), "load dspark f_rnn");
+    src += f_bytes;
+    const size_t kv_row = (size_t) dspark_kv_ * dspark_head_dim_ * sizeof(uint16_t);
+    const size_t keep_d = (size_t) dspark_window_;
+    const int64_t lo = std::max<int64_t>(0, pos - dspark_window_);
+    for (const DsparkLayer& dl : dspark_l_) {
+        if (!dl.local) continue;
+        auto load_d_ring = [&](uint16_t* cache) {
+            for (int64_t p = lo; p < pos;) {
+                const int64_t at = p % dspark_ring_, m = std::min<int64_t>(pos - p, dspark_ring_ - at);
+                const size_t s_at = (size_t) (p - (pos - dspark_window_));
+                ck(cudaMemcpyAsync((uint8_t*) cache + (size_t) at * kv_row, src + s_at * kv_row, (size_t) m * kv_row,
+                                   cudaMemcpyHostToDevice, cs(st_)),
+                   "load dspark kv");
+                p += m;
+            }
+            src += keep_d * kv_row;
+        };
+        load_d_ring(dl.dk);
+        load_d_ring(dl.dv);
+    }
+    ck(cudaStreamSynchronize(cs(st_)), "load dspark extra");
 }
 
 int Inkling2::head_key(int slot, int n) const {
@@ -636,9 +794,10 @@ void Inkling2::attn(const Step& st, Block& B, SlotCache& sc, int64_t pos, int n)
     float* in1 = inputs_buf_ + (size_t) n * n_embd_;
     float* in2 = inputs_buf_ + 2 * (size_t) n * n_embd_;
 
+    const int ns_all = streams();
     // 1. Attention Residual mix over blocks so far + current stream 0
     if (ip == 0) {
-        inkling_read_stream(r_, 6, 0, in0, n_embd_, n, st_);
+        inkling_read_stream(r_, ns_all, 0, in0, n_embd_, n, st_);
     } else {
         MixSlots ms{};
         int ns = 2;
@@ -656,7 +815,7 @@ void Inkling2::attn(const Step& st, Block& B, SlotCache& sc, int64_t pos, int n)
             ns = 5;
         }
         if (B.swa) {
-            inkling_mix(r_, 6, ms, ns, fp(B.attn_res_query), 1, in0, n_embd_, n, 1e-6f, st_);
+            inkling_mix(r_, ns_all, ms, ns, fp(B.attn_res_query), 1, in0, n_embd_, n, 1e-6f, st_);
             if (pass > 0) {
                 ck(cudaMemcpyAsync(in1, in0, (size_t) n * n_embd_ * sizeof(float), cudaMemcpyDeviceToDevice, cs(st_)),
                    "copy input");
@@ -664,7 +823,7 @@ void Inkling2::attn(const Step& st, Block& B, SlotCache& sc, int64_t pos, int n)
                    "copy input");
             }
         } else {
-            inkling_mix(r_, 6, ms, ns, fp(B.attn_res_query), 3, in0, n_embd_, n, 1e-6f, st_);
+            inkling_mix(r_, ns_all, ms, ns, fp(B.attn_res_query), 3, in0, n_embd_, n, 1e-6f, st_);
         }
     }
 
@@ -761,6 +920,11 @@ void Inkling2::attn(const Step& st, Block& B, SlotCache& sc, int64_t pos, int n)
 }
 
 void Inkling2::layer_head(Layer& L, int slot, int n) {
+    const int ns_all = streams();
+    if (dspark_) {
+        for (int t = 0; t < 3; ++t)
+            if (slot == dspark_taps_[t]) inkling_copy_stream(r_, ns_all, 6 + t, 0, n_embd_, n, st_);
+    }
     const Step& st = schedule_[(size_t) slot];
     const int ip = st.phys, pass = st.pass;
     Block& B = blocks_[(size_t) ip];
@@ -768,21 +932,21 @@ void Inkling2::layer_head(Layer& L, int slot, int n) {
 
     if (pass > 0) {
         const MixSlots bank_slots{{5, 4, 0, 0, 0, 0}};
-        inkling_mix(r_, 6, bank_slots, 2, fp(B.loop_msg_query), 4, msg_, n_embd_, n, 1e-6f, st_);
+        inkling_mix(r_, ns_all, bank_slots, 2, fp(B.loop_msg_query), 4, msg_, n_embd_, n, 1e-6f, st_);
     }
 
     attn(st, B, sc, pos_, n);
     dbg("attn", slot, ao_, n_embd_);
 
     // Block AttnRes update: at ip % block_size_ == 0 push inpSA (stream 0) and replace stream 0 = ao_ (no add).
-    if (ip == 12) inkling_copy_stream(r_, 6, 3, 0, n_embd_, n, st_);
-    else if (ip == core_end_) inkling_copy_stream(r_, 6, 4, 0, n_embd_, n, st_);
+    if (ip == 12) inkling_copy_stream(r_, ns_all, 3, 0, n_embd_, n, st_);
+    else if (ip == core_end_) inkling_copy_stream(r_, ns_all, 4, 0, n_embd_, n, st_);
 
     if (ip % block_size_ == 0) {
-        inkling_write_stream(ao_, r_, 6, 0, n_embd_, n, st_);
+        inkling_write_stream(ao_, r_, ns_all, 0, n_embd_, n, st_);
     } else {
-        inkling_read_stream(r_, 6, 0, inp_sa_, n_embd_, n, st_);
-        inkling_add_to_stream(inp_sa_, ao_, r_, 6, 0, n_embd_, n, st_);
+        inkling_read_stream(r_, ns_all, 0, inp_sa_, n_embd_, n, st_);
+        inkling_add_to_stream(inp_sa_, ao_, r_, ns_all, 0, n_embd_, n, st_);
     }
 
     // FFN Block AttnRes mix + optional loop control + ffn_norm -> xn_, xq_
@@ -793,7 +957,7 @@ void Inkling2::layer_head(Layer& L, int slot, int n) {
     else if (ip < core_end_) { ffn_slots = {{0, 1, 2, 3, 0, 0}}; ffn_n = 4; }
     else { ffn_slots = {{0, 1, 2, 3, 4, 0}}; ffn_n = 5; }
 
-    inkling_mix(r_, 6, ffn_slots, ffn_n, fp(B.ffn_res_query), 1, cur_, n_embd_, n, 1e-6f, st_);
+    inkling_mix(r_, ns_all, ffn_slots, ffn_n, fp(B.ffn_res_query), 1, cur_, n_embd_, n, 1e-6f, st_);
     if (pass > 0) apply_ctrl(cur_, msg_ + 3 * (size_t) n * n_embd_, B, 3, cur_, n);
 
     const int threads = sum_threads(n_embd_);
@@ -808,25 +972,28 @@ void Inkling2::layer_tail(Layer&, int slot, int n) {
     Block& B = blocks_[(size_t) ip];
     SlotCache& sc = slots_[(size_t) slot];
 
+    const int ns_all = streams();
     inkling_conv4(fo_, state_ + sc.state_off + off_ffn_post_, fp(B.ffn_post_conv), nullptr, 0, cur_, n_embd_, n, st_,
                   snap_bits_ ? snap_at_ + sc.state_off + off_ffn_post_ : nullptr, rec_n_, snap_bits_);
-    inkling_read_stream(r_, 6, 0, inp_sa_, n_embd_, n, st_);
-    inkling_add_to_stream(inp_sa_, cur_, r_, 6, 0, n_embd_, n, st_);
+    inkling_read_stream(r_, ns_all, 0, inp_sa_, n_embd_, n, st_);
+    inkling_add_to_stream(inp_sa_, cur_, r_, ns_all, 0, n_embd_, n, st_);
 
     if (ip == core_start_ - 1) {
-        inkling_copy_stream(r_, 6, 2, 0, n_embd_, n, st_);
+        inkling_copy_stream(r_, ns_all, 2, 0, n_embd_, n, st_);
     } else if (ip == core_end_ - 1 && pass < n_passes_ - 1) {
-        inkling_copy_stream(r_, 6, 4, 3, n_embd_, n, st_);
-        inkling_copy_stream(r_, 6, 5, 0, n_embd_, n, st_);
-        inkling_copy_stream(r_, 6, 0, 2, n_embd_, n, st_);
+        inkling_copy_stream(r_, ns_all, 4, 3, n_embd_, n, st_);
+        inkling_copy_stream(r_, ns_all, 5, 0, n_embd_, n, st_);
+        inkling_copy_stream(r_, ns_all, 0, 2, n_embd_, n, st_);
     }
 }
 
 void Inkling2::output_rows(int first, int rows, float* h) {
+    const int ns_all = streams();
     const MixSlots out_slots{{0, 1, 2, 3, 4, 0}};
-    inkling_mix(r_ + (size_t) first * 6 * n_embd_, 6, out_slots, 5, fp(output_res_query_), 1, cur_, n_embd_, rows,
-                1e-6f, st_);
+    inkling_mix(r_ + (size_t) first * ns_all * n_embd_, ns_all, out_slots, 5, fp(output_res_query_), 1, cur_, n_embd_,
+                rows, 1e-6f, st_);
     rms_norm(cur_, fp(out_norm_), h, n_embd_, rows, rms_eps_, st_);
+    if (dspark_) inkling_dspark_extract_taps(r_ + (size_t) first * ns_all * n_embd_, ns_all, 6, d_taps_, n_embd_, rows, st_);
 }
 
 void Inkling2::finish_logits(float* logits, int rows) {
@@ -865,6 +1032,315 @@ bool Inkling2::route_card(int il, int n, int32_t* ids, float* w) {
 
 void Inkling2::moe_shared(const Layer&, int, int n) {
     ck(cudaMemsetAsync(fo_, 0, (size_t) n * n_embd_ * sizeof(float), cs(st_)), "experts");
+}
+
+void Inkling2::load_drafter() {
+    if (!dspark_) return;
+    auto dtensor = [&](const std::string& name) -> const TensorInfo* {
+        const TensorInfo* t = dg_->find(name);
+        if (!t) throw std::runtime_error(opt_.draft_model + ": missing DSpark tensor " + name);
+        return t;
+    };
+    auto dmat = [&](const std::string& name, int64_t a, int64_t b) -> Dev {
+        return upload(dtensor(name), name, a, b, kGuessMat);
+    };
+    auto dvec = [&](const std::string& name, int64_t a) -> Dev {
+        return upload(dtensor(name), name, a, 1, kF32);
+    };
+
+    dspark_mask_ = dvec("mask_embed", n_embd_);
+    dspark_norm_ = dvec("norm.weight", n_embd_);
+    dspark_rnn_norm_ = dvec("markov_head.dflare_norm.weight", n_embd_);
+    dspark_rnn_proj_ = dmat("markov_head.rnn_proj.weight", 2 * (int64_t) dspark_rank_ + 2 * n_embd_,
+                            3 * (int64_t) dspark_rank_);
+    dspark_rnn_bias_ = dvec("markov_head.rnn_proj.bias", 3 * (int64_t) dspark_rank_);
+
+    for (int i = 0; i < dspark_layers_; ++i) {
+        DsparkLayer& dl = dspark_l_[(size_t) i];
+        const std::string p = "layers." + std::to_string(i) + ".";
+        const std::string a = p + "self_attn.";
+        const int64_t q_dim = (int64_t) dspark_heads_ * dspark_head_dim_;
+        const int64_t kv_dim = (int64_t) dspark_kv_ * dspark_head_dim_;
+        dl.dflare_norm = dvec(p + "dflare_norm.weight", n_embd_);
+        dl.input_norm = dvec(p + "input_layernorm.weight", n_embd_);
+        dl.ff_norm = dvec(p + "post_attention_layernorm.weight", n_embd_);
+        dl.q_norm = dvec(a + "q_norm.weight", dspark_head_dim_);
+        dl.k_norm = dvec(a + "k_norm.weight", dspark_head_dim_);
+        dl.k_norm_ctx = dvec(a + "k_norm_ctx.weight", dspark_head_dim_);
+        dl.q_proj = dmat(a + "q_proj.weight", n_embd_, q_dim);
+        dl.k_proj = dmat(a + "k_proj.weight", n_embd_, kv_dim);
+        dl.v_proj = dmat(a + "v_proj.weight", n_embd_, kv_dim);
+        dl.k_proj_ctx = dmat(a + "k_proj_ctx.weight", n_embd_, kv_dim);
+        dl.v_proj_ctx = dmat(a + "v_proj_ctx.weight", n_embd_, kv_dim);
+        dl.o_proj = dmat(a + "o_proj.weight", q_dim, n_embd_);
+        dl.gate_proj = dmat(p + "mlp.gate_proj.weight", n_embd_, dspark_ff_);
+        dl.up_proj = dmat(p + "mlp.up_proj.weight", n_embd_, dspark_ff_);
+        dl.down_proj = dmat(p + "mlp.down_proj.weight", dspark_ff_, n_embd_);
+    }
+
+    auto reserve_dense = [&](size_t bytes, uint32_t type, int n_in, int n_out) -> Dev {
+        const size_t aligned = (bytes + 255) & ~size_t(255);
+        const Dev d{dense_ ? dense_ + dense_at_ : nullptr, type, n_in, n_out};
+        dense_at_ += aligned + kTail;
+        if (dense_ && dense_at_ > dense_bytes_)
+            throw std::logic_error("the dense arena is too small for dspark fold weights");
+        return d;
+    };
+    const size_t fold_w_bytes = ggml_row_size(GGML_TYPE_Q8_0, dspark_rank_) * (size_t) n_vocab_;
+    const size_t fold_b_bytes = (size_t) n_vocab_ * sizeof(float);
+    dspark_fold_w_ = reserve_dense(fold_w_bytes, (uint32_t) GGML_TYPE_Q8_0, dspark_rank_, n_vocab_);
+    dspark_fold_b_ = reserve_dense(fold_b_bytes, kTypeF32, n_vocab_, 1);
+
+    if (!dense_) return;
+
+    const ggml_type_traits* bf16 = ggml_get_type_traits((ggml_type) kTypeBF16);
+    if (!bf16 || !bf16->to_float) throw std::logic_error("ggml BF16 to_float unavailable");
+
+    const TensorInfo* fw = dtensor("fuse_weight");
+    if (fw->type != kTypeBF16 || fw->shape.size() != 2 || fw->shape[0] != 4 || fw->shape[1] != 4)
+        throw std::runtime_error("dspark fuse_weight must be [4, 4] BF16");
+    float fw_raw[16];
+    bf16->to_float(dg_->data(*fw), fw_raw, 16);
+    for (int r = 0; r < 4; ++r) {
+        float mx = fw_raw[r * 4];
+        for (int c = 1; c < 4; ++c) mx = std::max(mx, fw_raw[r * 4 + c]);
+        double sum = 0.0;
+        for (int c = 0; c < 4; ++c) {
+            const float e = std::exp(fw_raw[r * 4 + c] - mx);
+            dspark_fuse_[r][c] = e;
+            sum += e;
+        }
+        for (int c = 0; c < 4; ++c) dspark_fuse_[r][c] = (float) (dspark_fuse_[r][c] / sum);
+    }
+
+    const TensorInfo* w1 = dtensor("markov_head.markov_w1.weight");
+    if (w1->type != kTypeBF16 || w1->shape.size() != 2 || (int64_t) w1->shape[0] != dspark_rank_ ||
+        (int64_t) w1->shape[1] != dspark_w1_vocab_)
+        throw std::runtime_error("dspark markov_w1.weight has wrong shape or type");
+    dspark_w1_data_ = (const uint8_t*) dg_->data(*w1);
+    dspark_w1_row_bytes_ = (size_t) dspark_rank_ * 2;
+
+    const TensorInfo* hw = dtensor("markov_head.hidden_out.weight");
+    const TensorInfo* hb = dtensor("markov_head.hidden_out.bias");
+    if (hw->type != kTypeBF16 || hw->shape.size() != 2 || (int64_t) hw->shape[0] != dspark_rank_ ||
+        (int64_t) hw->shape[1] != n_embd_)
+        throw std::runtime_error("dspark markov_head.hidden_out.weight has wrong shape or type");
+    if (hb->type != kTypeBF16 || (int64_t) hb->elements() != n_embd_)
+        throw std::runtime_error("dspark markov_head.hidden_out.bias has wrong shape or type");
+
+    std::vector<float> hw_f((size_t) n_embd_ * dspark_rank_);
+    bf16->to_float(dg_->data(*hw), hw_f.data(), (int64_t) hw_f.size());
+    h_hidden_out_wt_.resize((size_t) dspark_rank_ * n_embd_);
+    for (int j = 0; j < n_embd_; ++j)
+        for (int k = 0; k < dspark_rank_; ++k)
+            h_hidden_out_wt_[(size_t) k * n_embd_ + j] = hw_f[(size_t) j * dspark_rank_ + k];
+
+    h_hidden_out_b_.resize((size_t) n_embd_);
+    bf16->to_float(dg_->data(*hb), h_hidden_out_b_.data(), n_embd_);
+
+    h_dspark_anchor_.resize((size_t) n_embd_);
+    h_dspark_prev_.resize((size_t) dspark_rank_);
+}
+
+void Inkling2::init_drafter() {
+    if (!dspark_) return;
+    float* tmp_in = (float*) dmalloc((size_t) 32 * n_embd_ * sizeof(float), "dspark fold in");
+    float* tmp_out = (float*) dmalloc((size_t) 32 * n_vocab_ * sizeof(float), "dspark fold out");
+
+    ck(cudaMemcpyAsync(tmp_in, h_hidden_out_b_.data(), (size_t) n_embd_ * sizeof(float), cudaMemcpyHostToDevice,
+                       cs(st_)),
+       "dspark fold bias");
+    lin(output_, tmp_in, (float*) dspark_fold_b_.p, 1);
+
+    const int n_blocks = dspark_rank_ / 32;
+    const int step = std::min(rows_, 8);
+    for (int b = 0; b < n_blocks; ++b) {
+        ck(cudaMemcpyAsync(tmp_in, h_hidden_out_wt_.data() + (size_t) b * 32 * n_embd_,
+                           (size_t) 32 * n_embd_ * sizeof(float), cudaMemcpyHostToDevice, cs(st_)),
+           "dspark fold weight");
+        for (int c0 = 0; c0 < 32;) {
+            const int m = std::min(32 - c0, step);
+            lin(output_, tmp_in + (size_t) c0 * n_embd_, tmp_out + (size_t) c0 * n_vocab_, m);
+            c0 += m;
+        }
+        inkling_dspark_pack_q8_0_block(tmp_out, (uint8_t*) dspark_fold_w_.p, n_vocab_, b, n_blocks, st_);
+    }
+    ck(cudaStreamSynchronize(cs(st_)), "init_drafter");
+    cudaFree(tmp_in);
+    cudaFree(tmp_out);
+    std::vector<float>().swap(h_hidden_out_wt_);
+    std::vector<float>().swap(h_hidden_out_b_);
+}
+
+void Inkling2::reset_drafter() {
+    if (!dspark_) return;
+    if (d_f_rnn_) ck(cudaMemsetAsync(d_f_rnn_, 0, (size_t) n_embd_ * sizeof(float), cs(st_)), "reset dspark");
+    block_n_ = 0;
+}
+
+void Inkling2::draft_commit(int64_t pos, int n) {
+    if (!dspark_ || n <= 0) return;
+    cover(pos + n);
+    inkling_dspark_mix_norm(d_taps_ + (size_t) (n - 1) * 3 * n_embd_, hn_ + (size_t) n * n_embd_, dspark_fuse_[3][0],
+                            dspark_fuse_[3][1], dspark_fuse_[3][2], dspark_fuse_[3][3], fp(dspark_rnn_norm_), d_f_rnn_,
+                            n_embd_, 1, dspark_eps_, st_);
+
+    const int kv_width = dspark_kv_ * dspark_head_dim_;
+    auto store_d_kv = [&](const float* x, uint16_t* cache, int ring) {
+        if (ring <= 0) {
+            store_f16(x, cache, kv_width, pos, n, st_);
+            return;
+        }
+        for (int done = 0; done < n;) {
+            const int64_t at = (pos + done) % ring;
+            const int m = (int) std::min<int64_t>(n - done, ring - at);
+            store_f16(x + (size_t) done * kv_width, cache, kv_width, at, m, st_);
+            done += m;
+        }
+    };
+
+    for (int l = 0; l < dspark_layers_; ++l) {
+        DsparkLayer& dl = dspark_l_[(size_t) l];
+        inkling_dspark_mix_norm(d_taps_, hn_ + n_embd_, dspark_fuse_[l][0], dspark_fuse_[l][1], dspark_fuse_[l][2],
+                                dspark_fuse_[l][3], fp(dl.dflare_norm), cur_, n_embd_, n, dspark_eps_, st_);
+        lin(dl.k_proj_ctx, cur_, q_, n);
+        head_norm_rope(q_, dspark_head_dim_, fp(dl.k_norm_ctx), k_, dspark_head_dim_, dspark_kv_, dspark_head_dim_,
+                       dspark_theta_scale_, pos, n, dspark_eps_, st_);
+        store_d_kv(k_, dl.dk, dl.local ? dspark_ring_ : 0);
+        lin(dl.v_proj_ctx, cur_, v_, n);
+        store_d_kv(v_, dl.dv, dl.local ? dspark_ring_ : 0);
+    }
+}
+
+void Inkling2::draft_block(int32_t token) {
+    if (!dspark_ || pos_ <= 0 || pos_ + dspark_block_ > opt_.max_context) {
+        block_n_ = 0;
+        return;
+    }
+    cover(pos_ + dspark_block_);
+
+    embed(token, h_dspark_anchor_.data());
+    norm_text_embed(h_dspark_anchor_.data());
+    ck(cudaMemcpyAsync(d_blk_x_, h_dspark_anchor_.data(), (size_t) n_embd_ * sizeof(float), cudaMemcpyHostToDevice,
+                       cs(st_)),
+       "dspark anchor");
+    for (int r = 1; r < dspark_block_; ++r)
+        ck(cudaMemcpyAsync(d_blk_x_ + (size_t) r * n_embd_, dspark_mask_.p, (size_t) n_embd_ * sizeof(float),
+                           cudaMemcpyDeviceToDevice, cs(st_)),
+           "dspark mask");
+
+    const int kv_width = dspark_kv_ * dspark_head_dim_;
+    auto store_d_blk = [&](const float* x, uint16_t* cache, int ring) {
+        if (ring <= 0) {
+            store_f16(x, cache, kv_width, pos_, dspark_block_, st_);
+            return;
+        }
+        for (int done = 0; done < dspark_block_;) {
+            const int64_t at = (pos_ + done) % ring;
+            const int m = (int) std::min<int64_t>(dspark_block_ - done, ring - at);
+            store_f16(x + (size_t) done * kv_width, cache, kv_width, at, m, st_);
+            done += m;
+        }
+    };
+
+    const float scale = 1.0f / std::sqrt((float) dspark_head_dim_);
+    for (int l = 0; l < dspark_layers_; ++l) {
+        DsparkLayer& dl = dspark_l_[(size_t) l];
+        rms_norm(d_blk_x_, fp(dl.input_norm), cur_, n_embd_, dspark_block_, dspark_eps_, st_);
+        lin(dl.q_proj, cur_, d_blk_qraw_, dspark_block_);
+        head_norm_rope(d_blk_qraw_, dspark_head_dim_, fp(dl.q_norm), q_, dspark_head_dim_, dspark_heads_,
+                       dspark_head_dim_, dspark_theta_scale_, pos_, dspark_block_, dspark_eps_, st_);
+        lin(dl.k_proj, cur_, d_blk_qraw_, dspark_block_);
+        head_norm_rope(d_blk_qraw_, dspark_head_dim_, fp(dl.k_norm), k_, dspark_head_dim_, dspark_kv_, dspark_head_dim_,
+                       dspark_theta_scale_, pos_, dspark_block_, dspark_eps_, st_);
+        store_d_blk(k_, dl.dk, dl.local ? dspark_ring_ : 0);
+        lin(dl.v_proj, cur_, v_, dspark_block_);
+        store_d_blk(v_, dl.dv, dl.local ? dspark_ring_ : 0);
+
+        attend_batch(blas_, q_, dl.dk, dl.dv, pos_, dspark_block_, score_, score_n_, awork_, att_, dspark_head_dim_,
+                     dspark_heads_, dspark_kv_, scale, st_, dl.local ? (dspark_window_ + 1) : 0,
+                     dl.local ? dspark_ring_ : 0, true);
+        lin(dl.o_proj, att_, cur_, dspark_block_);
+        axpy(cur_, 1.0f, d_blk_x_, dspark_block_ * n_embd_, true, st_);
+
+        rms_norm(d_blk_x_, fp(dl.ff_norm), cur_, n_embd_, dspark_block_, dspark_eps_, st_);
+        lin(dl.gate_proj, cur_, d_blk_gate_, dspark_block_);
+        lin(dl.up_proj, cur_, d_blk_up_, dspark_block_);
+        swiglu_clamp(d_blk_gate_, d_blk_up_, d_blk_gate_, dspark_block_ * dspark_ff_, FLT_MAX, st_);
+        lin(dl.down_proj, d_blk_gate_, cur_, dspark_block_);
+        axpy(cur_, 1.0f, d_blk_x_, dspark_block_ * n_embd_, true, st_);
+    }
+
+    const int n_cand = dspark_block_ - 1;
+    rms_norm(d_blk_x_ + n_embd_, fp(dspark_norm_), d_blk_h_, n_embd_, n_cand, dspark_eps_, st_);
+    lin(output_, d_blk_h_, d_base_logits_, n_cand);
+
+    const int n_steps = std::min({n_cand, opt_.window - 1, (int) std::max<int64_t>(0, opt_.max_context - pos_ - 1)});
+    if (n_steps <= 0) {
+        block_n_ = 0;
+        return;
+    }
+
+    ck(cudaMemsetAsync(d_rnn_state_, 0, (size_t) dspark_rank_ * sizeof(float), cs(st_)), "dspark state");
+    ck(cudaMemcpyAsync(d_rnn_in_ + 2 * (size_t) dspark_rank_ + n_embd_, d_f_rnn_, (size_t) n_embd_ * sizeof(float),
+                       cudaMemcpyDeviceToDevice, cs(st_)),
+       "dspark f_rnn");
+
+    const ggml_type_traits* bf16 = ggml_get_type_traits((ggml_type) kTypeBF16);
+    int32_t prev = token;
+    for (int i = 0; i < n_steps; ++i) {
+        ck(cudaMemcpyAsync(d_rnn_in_, d_rnn_state_, (size_t) dspark_rank_ * sizeof(float), cudaMemcpyDeviceToDevice,
+                           cs(st_)),
+           "dspark in st");
+        bf16->to_float(dspark_w1_data_ + (size_t) prev * dspark_w1_row_bytes_, h_dspark_prev_.data(), dspark_rank_);
+        ck(cudaMemcpyAsync(d_rnn_in_ + dspark_rank_, h_dspark_prev_.data(), (size_t) dspark_rank_ * sizeof(float),
+                           cudaMemcpyHostToDevice, cs(st_)),
+           "dspark prev");
+        ck(cudaMemcpyAsync(d_rnn_in_ + 2 * (size_t) dspark_rank_, d_blk_h_ + (size_t) i * n_embd_,
+                           (size_t) n_embd_ * sizeof(float), cudaMemcpyDeviceToDevice, cs(st_)),
+           "dspark h");
+
+        lin(dspark_rnn_proj_, d_rnn_in_, d_rnn_gates_, 1);
+        inkling_dspark_rnn_gate(d_rnn_gates_, fp(dspark_rnn_bias_), d_rnn_state_, d_rnn_latent_, dspark_rank_, st_);
+        lin(dspark_fold_w_, d_rnn_latent_, d_markov_bias_, 1);
+        inkling_dspark_add_softcap(d_base_logits_ + (size_t) i * n_vocab_, d_markov_bias_, fp(dspark_fold_b_), logits_,
+                                   n_vocab_, final_logit_softcapping_, st_);
+        likeliest(logits_, n_vocab_, h_block_ + i, st_);
+        ck(cudaStreamSynchronize(cs(st_)), "dspark step");
+        prev = h_block_[i].token;
+    }
+    block_n_ = n_steps;
+}
+
+void Inkling2::save_draft_extra(int64_t pos, uint8_t* dst) {
+    if (!dspark_) return;
+    ck(cudaStreamSynchronize(cs(st_)), "save dspark extra");
+    const size_t base_swa = (size_t) n_swa_slots_ * 2 * (size_t) keep_ * (kv_code_row_bytes() + kv_scale_row_bytes());
+    dst += state_n_ * sizeof(float) + base_swa;
+    const size_t f_bytes = (size_t) n_embd_ * sizeof(float);
+    ck(cudaMemcpy(dst, d_f_rnn_, f_bytes, cudaMemcpyDeviceToHost), "save dspark f_rnn");
+    dst += f_bytes;
+
+    const size_t kv_row = (size_t) dspark_kv_ * dspark_head_dim_ * sizeof(uint16_t);
+    const size_t keep_d = (size_t) dspark_window_;
+    const int64_t lo = std::max<int64_t>(0, pos - dspark_window_);
+    for (const DsparkLayer& dl : dspark_l_) {
+        if (!dl.local) continue;
+        auto save_d_ring = [&](const uint16_t* cache) {
+            std::memset(dst, 0, keep_d * kv_row);
+            for (int64_t p = lo; p < pos;) {
+                const int64_t at = p % dspark_ring_, m = std::min<int64_t>(pos - p, dspark_ring_ - at);
+                const size_t s_at = (size_t) (p - (pos - dspark_window_));
+                ck(cudaMemcpy(dst + s_at * kv_row, (const uint8_t*) cache + (size_t) at * kv_row, (size_t) m * kv_row,
+                              cudaMemcpyDeviceToHost),
+                   "save dspark kv");
+                p += m;
+            }
+            dst += keep_d * kv_row;
+        };
+        save_d_ring(dl.dk);
+        save_d_ring(dl.dv);
+    }
 }
 
 }  // namespace strata::poly

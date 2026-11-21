@@ -496,4 +496,16 @@ void inkling_read_stream(const float* r, int streams, int src_stream, float* out
 void inkling_add_to_stream(const float* a, const float* b, float* r, int streams, int dst_stream, int n_embd, int rows,
                            void* stream);
 
+/// DSpark MTP kernels (see src/poly/inkling2.cpp).
+void inkling_dspark_extract_taps(const float* r, int n_streams, int first_tap_stream, float* taps012, int n_embd,
+                                 int rows, void* stream);
+void inkling_dspark_mix_norm(const float* taps012, const float* tap3, float a0, float a1, float a2, float a3,
+                             const float* w_norm, float* out, int n_embd, int rows, float eps, void* stream);
+void inkling_dspark_rnn_gate(const float* gates, const float* bias, float* state, float* latent, int rank,
+                             void* stream);
+void inkling_dspark_add_softcap(const float* base, const float* delta, const float* bias, float* out, int n, float cap,
+                                void* stream);
+void inkling_dspark_pack_q8_0_block(const float* cols32, uint8_t* dst_q8, int n_vocab, int block_idx, int n_blocks,
+                                    void* stream);
+
 }  // namespace strata::poly

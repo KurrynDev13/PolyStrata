@@ -795,6 +795,90 @@ __global__ void inkling_add_to_stream_kernel(const float* __restrict__ a, const 
     r[(size_t(blockIdx.y) * streams + dst_stream) * n_embd + i] = a[src_i] + b[src_i];
 }
 
+__global__ void inkling_dspark_extract_taps_kernel(const float* __restrict__ r, int n_streams, int first_tap_stream,
+                                                   float* __restrict__ taps012, int n_embd) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_embd) return;
+    const size_t row = blockIdx.y;
+    const float* src = r + (row * n_streams + first_tap_stream) * n_embd + i;
+    float* dst = taps012 + row * 3 * n_embd + i;
+    dst[0] = src[0];
+    dst[n_embd] = src[n_embd];
+    dst[2 * size_t(n_embd)] = src[2 * size_t(n_embd)];
+}
+
+__global__ void inkling_dspark_mix_norm_kernel(const float* __restrict__ taps012, const float* __restrict__ tap3,
+                                               float a0, float a1, float a2, float a3, const float* __restrict__ w_norm,
+                                               float* __restrict__ out, int n_embd, float eps) {
+    __shared__ float part[8];
+    const size_t row = blockIdx.x;
+    const float* t0 = taps012 + row * 3 * n_embd;
+    const float* t1 = t0 + n_embd;
+    const float* t2 = t1 + n_embd;
+    const float* t3 = tap3 + row * n_embd;
+    float* y = out + row * n_embd;
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < n_embd; i += blockDim.x) {
+        const float m = a0 * t0[i] + a1 * t1[i] + a2 * t2[i] + a3 * t3[i];
+        ss += m * m;
+    }
+    ss = block_sum(ss, part);
+    const float inv = rsqrtf(ss / float(n_embd) + eps);
+    for (int i = threadIdx.x; i < n_embd; i += blockDim.x) {
+        const float m = a0 * t0[i] + a1 * t1[i] + a2 * t2[i] + a3 * t3[i];
+        y[i] = m * inv * (w_norm ? w_norm[i] : 1.0f);
+    }
+}
+
+__global__ void inkling_dspark_rnn_gate_kernel(const float* __restrict__ gates, const float* __restrict__ bias,
+                                               float* __restrict__ state, float* __restrict__ latent, int rank) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rank) return;
+    const float g0 = gates[i] + (bias ? bias[i] : 0.0f);
+    const float g1 = gates[rank + i] + (bias ? bias[rank + i] : 0.0f);
+    const float g2 = gates[2 * rank + i] + (bias ? bias[2 * rank + i] : 0.0f);
+    const float keep = 1.0f / (1.0f + expf(-g0));
+    const float upd = tanhf(g1);
+    const float lat = tanhf(g2);
+    state[i] = keep * state[i] + (1.0f - keep) * upd;
+    latent[i] = lat;
+}
+
+__global__ void inkling_dspark_add_softcap_kernel(const float* __restrict__ base, const float* __restrict__ delta,
+                                                  const float* __restrict__ bias, float* __restrict__ out, int n,
+                                                  float cap) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float v = base[i] + (delta ? delta[i] : 0.0f) + (bias ? bias[i] : 0.0f);
+    out[i] = cap > 0.0f ? cap * tanhf(v / cap) : v;
+}
+
+__global__ void inkling_dspark_pack_q8_0_block_kernel(const float* __restrict__ cols32, uint8_t* __restrict__ dst_q8,
+                                                      int n_vocab, int block_idx, int n_blocks) {
+    const int v = blockIdx.x * blockDim.x + threadIdx.x;
+    if (v >= n_vocab) return;
+    float vals[32];
+    float amax = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 32; ++j) {
+        const float x = cols32[size_t(j) * n_vocab + v];
+        vals[j] = x;
+        amax = fmaxf(amax, fabsf(x));
+    }
+    const float d = amax / 127.0f;
+    const float id = d != 0.0f ? 1.0f / d : 0.0f;
+    uint8_t* blk = dst_q8 + (size_t(v) * n_blocks + block_idx) * 34;
+    const uint16_t dh = __half_as_ushort(__float2half(d));
+    blk[0] = uint8_t(dh & 0xff);
+    blk[1] = uint8_t((dh >> 8) & 0xff);
+    int8_t* qs = (int8_t*) (blk + 2);
+#pragma unroll
+    for (int j = 0; j < 32; ++j) {
+        const int q = (int) roundf(vals[j] * id);
+        qs[j] = (int8_t) (q < -127 ? -127 : q > 127 ? 127 : q);
+    }
+}
+
 }  // namespace
 
 void situ_rows(const float* gate_up, float* out, int n, int rows, float beta, float linear_beta, void* stream,
@@ -1007,6 +1091,43 @@ void inkling_add_to_stream(const float* a, const float* b, float* r, int streams
     inkling_add_to_stream_kernel<<<dim3(grid(n_embd, 256), rows), 256, 0, cs(stream)>>>(a, b, r, streams, dst_stream,
                                                                                         n_embd);
     ck("inkling_add_to_stream");
+}
+
+void inkling_dspark_extract_taps(const float* r, int n_streams, int first_tap_stream, float* taps012, int n_embd,
+                                 int rows, void* stream) {
+    if (rows <= 0) return;
+    inkling_dspark_extract_taps_kernel<<<dim3(grid(n_embd, 256), rows), 256, 0, cs(stream)>>>(
+        r, n_streams, first_tap_stream, taps012, n_embd);
+    ck("inkling_dspark_extract_taps");
+}
+
+void inkling_dspark_mix_norm(const float* taps012, const float* tap3, float a0, float a1, float a2, float a3,
+                             const float* w_norm, float* out, int n_embd, int rows, float eps, void* stream) {
+    if (rows <= 0) return;
+    inkling_dspark_mix_norm_kernel<<<rows, 256, 0, cs(stream)>>>(taps012, tap3, a0, a1, a2, a3, w_norm, out, n_embd, eps);
+    ck("inkling_dspark_mix_norm");
+}
+
+void inkling_dspark_rnn_gate(const float* gates, const float* bias, float* state, float* latent, int rank,
+                             void* stream) {
+    if (rank <= 0) return;
+    inkling_dspark_rnn_gate_kernel<<<grid(rank, 256), 256, 0, cs(stream)>>>(gates, bias, state, latent, rank);
+    ck("inkling_dspark_rnn_gate");
+}
+
+void inkling_dspark_add_softcap(const float* base, const float* delta, const float* bias, float* out, int n, float cap,
+                                void* stream) {
+    if (n <= 0) return;
+    inkling_dspark_add_softcap_kernel<<<grid(n, 256), 256, 0, cs(stream)>>>(base, delta, bias, out, n, cap);
+    ck("inkling_dspark_add_softcap");
+}
+
+void inkling_dspark_pack_q8_0_block(const float* cols32, uint8_t* dst_q8, int n_vocab, int block_idx, int n_blocks,
+                                    void* stream) {
+    if (n_vocab <= 0) return;
+    inkling_dspark_pack_q8_0_block_kernel<<<grid(n_vocab, 256), 256, 0, cs(stream)>>>(
+        cols32, dst_q8, n_vocab, block_idx, n_blocks);
+    ck("inkling_dspark_pack_q8_0_block");
 }
 
 }  // namespace strata::poly

@@ -313,7 +313,7 @@ public:
     /// saved (Clover on an 8 GB laptop wrote 57.7 tokens/s after a 32K prompt with its guesses, 61.6 without).
     bool drafts() const { return next_ ? next_->drafts() : draft_ || (block_guess_ && all_cached()); }
     /// The guesses of a window come out of draft(token, 0, &p) together: asking for one more costs nothing.
-    bool guesses_at_once() const { return next_ ? next_->guesses_at_once() : block_guess_; }
+    bool guesses_at_once() const { return next_ ? next_->guesses_at_once() : block_guess_ || draft_at_once(); }
     /// Test only: the calls read()'s layer-major path gave the draft block's rows (draft_rows()) on the card that has
     /// the block, since load.  Two or more in one read are back-to-back refills of its pinned input rows.
     int64_t read_draft_calls_for_test() const { return next_ ? next_->read_draft_calls_for_test() : read_draft_calls_; }
@@ -413,6 +413,13 @@ protected:
     virtual void check_draft_block() {}
     /// The weights of what guesses ahead, to VRAM.  The engine's own: the draft block's parts beside its layer.
     virtual void load_drafter();
+    /// Architecture-owned block drafter (e.g. Inkling2 DSpark) that proposes a window at once via draft_block().
+    virtual bool draft_at_once() const { return false; }
+    virtual void init_drafter() {}
+    virtual void reset_drafter() {}
+    virtual void draft_commit(int64_t /*pos*/, int /*n*/) {}
+    virtual void draft_block(int32_t /*token*/) {}
+    virtual void save_draft_extra(int64_t /*pos*/, uint8_t* /*dst*/) {}
     /// One guess (draft()): the token through what guesses ahead, its scores into logits_.  hn_'s first row is the
     /// model's output for the token before pos(); the second is this step's to leave and the next step's to read.
     /// The engine's own runs the draft block.

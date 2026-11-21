@@ -38,7 +38,14 @@ protected:
     void alloc_caches() override;
     void assign_scratch() override;
     int widest() const override;
-    int streams() const override { return 6; }
+    int streams() const override { return dspark_ ? 9 : 6; }
+    bool draft_at_once() const override { return dspark_; }
+    void load_drafter() override;
+    void init_drafter() override;
+    void reset_drafter() override;
+    void draft_commit(int64_t pos, int n) override;
+    void draft_block(int32_t token) override;
+    void save_draft_extra(int64_t pos, uint8_t* dst) override;
     void layer_head(Layer& L, int slot, int n) override;
     void layer_tail(Layer& L, int slot, int n) override;
     void output_rows(int first, int rows, float* h) override;
@@ -85,6 +92,13 @@ private:
         uint16_t* v_scales = nullptr;
     };
 
+    struct DsparkLayer {
+        bool local = false;
+        Dev input_norm, ff_norm, dflare_norm, q_norm, k_norm, k_norm_ctx;
+        Dev q_proj, k_proj, v_proj, k_proj_ctx, v_proj_ctx, o_proj, gate_proj, up_proj, down_proj;
+        uint16_t *dk = nullptr, *dv = nullptr;
+    };
+
     size_t kv_code_row_bytes() const;
     size_t kv_scale_row_bytes() const;
     uint8_t* slot_k_codes(const SlotCache& sc) const;
@@ -126,6 +140,24 @@ private:
     float* awork_ = nullptr;
     float* q8w_ = nullptr;
     size_t work_halves_ = 0;
+
+    bool dspark_ = false;
+    int dspark_layers_ = 0, dspark_ff_ = 0, dspark_heads_ = 0, dspark_kv_ = 0, dspark_head_dim_ = 0;
+    int dspark_window_ = 0, dspark_ring_ = 0, dspark_block_ = 0, dspark_rank_ = 0, dspark_w1_vocab_ = 0;
+    float dspark_eps_ = 1e-6f, dspark_rope_theta_ = 1000000.f, dspark_theta_scale_ = 0.f;
+    int dspark_taps_[3] = {5, 23, 41};
+    float dspark_fuse_[4][4] = {};
+    std::vector<DsparkLayer> dspark_l_;
+    Dev dspark_mask_, dspark_norm_, dspark_rnn_norm_, dspark_rnn_proj_, dspark_rnn_bias_;
+    Dev dspark_fold_w_, dspark_fold_b_;
+    const uint8_t* dspark_w1_data_ = nullptr;
+    size_t dspark_w1_row_bytes_ = 0;
+    std::vector<float> h_hidden_out_wt_, h_hidden_out_b_;
+    mutable std::vector<float> h_dspark_anchor_, h_dspark_prev_;
+    float *d_taps_ = nullptr, *d_f_rnn_ = nullptr, *d_blk_x_ = nullptr, *d_blk_h_ = nullptr;
+    float *d_blk_qraw_ = nullptr, *d_blk_gate_ = nullptr, *d_blk_up_ = nullptr;
+    float *d_base_logits_ = nullptr, *d_markov_bias_ = nullptr;
+    float *d_rnn_in_ = nullptr, *d_rnn_gates_ = nullptr, *d_rnn_state_ = nullptr, *d_rnn_latent_ = nullptr;
 };
 
 }  // namespace strata::poly

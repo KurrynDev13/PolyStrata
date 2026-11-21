@@ -2826,6 +2826,7 @@ void Engine::load(const Options& o) {
                    !split_;
     if (block_guess_) std::fprintf(stderr, "strata-poly: STRATA_BLOCK_GUESS: the model guesses its own blocks\n");
     alloc();
+    if (draft_) init_drafter();
     if (!opt_.profile.empty()) read_profile(opt_.profile, (int) layers_.size(), n_expert_, prior_);
     fill_expert_cache();
     ensure_stage();
@@ -3097,7 +3098,7 @@ void Engine::alloc() {
         hn_ = state_ + rec_n_;
         h_guess_ = (Likeliest*) hmalloc(sizeof(Likeliest), "pinned memory");   // likeliest() writes it
     }
-    if (block_guess_) h_block_ = (Likeliest*) hmalloc((size_t) opt_.window * sizeof(Likeliest), "pinned memory");
+    if (block_guess_ || draft_at_once()) h_block_ = (Likeliest*) hmalloc((size_t) opt_.window * sizeof(Likeliest), "pinned memory");
     // window(): the state after tokens of it, for keep(), and every token's logits
     snap_places_ = snaps_spread() ? std::min(opt_.window - 1, kSnapPlaces) : opt_.window - 1;
     if (snap_places_ > 0)
@@ -3105,7 +3106,7 @@ void Engine::alloc() {
     // step() with guesses: every sequence's state after its first row
     if (opt_.batch_mtp && opt_.batch > 0 && rec_n_ > 0)
         step_snap_ = (float*) dmalloc(size_t(opt_.batch + 1) * rec_n_ * sizeof(float), "the recurrent state");
-    if (opt_.batch_mtp && opt_.batch > 0 && draft_) {
+    if (opt_.batch_mtp && opt_.batch > 0 && draft_ && !draft_at_once()) {
         step_h_ = (float*) dmalloc(size_t(opt_.batch + 1) * n_embd_ * sizeof(float), "scratch");
         h_guesses_ = (Likeliest*) hmalloc(size_t(opt_.batch + 1) * sizeof(Likeliest), "pinned memory");
     }
@@ -3274,6 +3275,7 @@ void Engine::reset() {
     ck(cudaMemsetAsync(state_, 0, state_n_ * sizeof(float), cs(st_)), "reset");
     pos_ = 0;
     ahead_pos_ = -1;
+    if (draft_) reset_drafter();
     if (next_) next_->reset();
 }
 
@@ -3303,6 +3305,7 @@ void Engine::save_state(uint8_t* dst) {
             if (runs(il)) save_layer(il, pos_, dst);
     }
     save_last(dst);
+    if (draft_) save_draft_extra(pos_, dst);
     if (next_) next_->save_state(dst + card_state_bytes());
 }
 
@@ -5065,7 +5068,7 @@ void Engine::run(const int32_t* tokens, int n) {
 void Engine::step(const int* seqs, const int32_t* tokens, int n) { step(seqs, tokens, n, nullptr); }
 
 bool Engine::steps_guesses() const {
-    return opt_.batch_mtp && draft_ && step_h_ && !block_guess_ && !next_ && !pass_ && batch_heads() &&
+    return opt_.batch_mtp && draft_ && !draft_at_once() && step_h_ && !block_guess_ && !next_ && !pass_ && batch_heads() &&
            (rec_n_ == 0 || (rows_snaps() && step_snap_));
 }
 
@@ -5639,6 +5642,7 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
                     if (k == turns - 1) {   // what no turn is for: a layer behind the model's, the last output
                         for (int j = n_layer_; j < (int) layers_.size(); ++j) save_layer(j, pos, state);
                         save_last(state);
+                        if (draft_) save_draft_extra(pos, state);
                     }
                 }
                 // The card's work on the next call starts now.  This call's rows leave beside it, unless this was
@@ -5837,7 +5841,9 @@ float* Engine::draft_input(const int32_t* tokens, int64_t row, const float* h, i
 // the rest of the block is not computed for it.  Then the call's last output is the one the next token pairs with.
 void Engine::draft_rows(const int32_t* tokens, int first, int n) {
     const size_t e = (size_t) n_embd_;
-    if (block_layer_ && first < n) {
+    if (draft_at_once()) {
+        if (n > 0) draft_commit(pos_, n);
+    } else if (block_layer_ && first < n) {
         draft_input(tokens + first, pos_ + first, hn_ + (size_t) first * e, n - first);
         block_rows(pos_ + first, n - first);
     }
@@ -5904,8 +5910,11 @@ int32_t Engine::draft(int32_t token, int i, float* prob) {
     if (!draft_ && !block_guess_) throw std::logic_error("draft: this model has no block that guesses ahead");
     if (token < 0 || token >= n_vocab_) throw std::runtime_error("a token id is outside the vocabulary");
     if (i < 0 || pos_ + i >= opt_.max_context) throw std::logic_error("draft: the position is outside the context");
-    if (block_guess_) {
-        if (i == 0) guess_block(token);
+    if (block_guess_ || draft_at_once()) {
+        if (i == 0) {
+            if (block_guess_) guess_block(token);
+            else draft_block(token);
+        }
         *prob = i < block_n_ ? h_block_[i].prob : 0.f;
         return i < block_n_ ? h_block_[i].token : 0;
     }
