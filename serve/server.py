@@ -59,9 +59,10 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
-from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
-                            forced_call, gemma_model_turn, images_of, literal_tags, mark_think_literals,
-                            openai_to_messages, tool_choice_of, unmark_think_literals)
+from serve.frontend import (INKLING_END, INKLING_MODEL, INKLING_TEXT, THINK_END, ChatTemplate, Event,  # noqa: E402
+                            OutputParser, anthropic_to_messages, forced_call, gemma_model_turn, images_of,
+                            literal_tags, mark_think_literals, openai_to_messages, tool_arguments, tool_choice_of,
+                            unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
 from serve import models as registry  # noqa: E402
@@ -152,7 +153,8 @@ VISION_START = "<|vision_start|>"
 # ends the first turn: the system prompt with the tools, which "warm_start" keeps.
 TURN_OPENERS = {"function": ("<|im_start|>",), "gemma": ("<|turn>",),
                 "glm": ("<|system|>", "<|developer|>", "<|user|>", "<|assistant|>", "<|observation|>"),
-                "dsml": ("<｜User｜>", "<｜Assistant｜>"), "lfm2": ("<|im_start|>",)}
+                "dsml": ("<｜User｜>", "<｜Assistant｜>"), "lfm2": ("<|im_start|>",),
+                "inkling2": ("<|message_user|>", "<|message_model|>", "<|message_system|>", "<|message_tool|>")}
 WARM_MIN_TOKENS = 2048           # a shorter prompt start is quick to read again: not kept
 # #606: a reply that repeats one token this many times in a row is ended there ("length"): a model in a loop, or a
 # broken state that answers one token forever (an issue saw 36,689 tokens of "!"). The config's "repeat_stop_tokens"
@@ -171,7 +173,10 @@ REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my 
 def closed_with(text: str, think_end: str) -> str:
     """REASONING_CLOSE or REASONING_WRAP_UP for a model whose thinking ends with think_end (OutputParser).  Gemma 4
     ends it with <channel|>, its answer right after: a </think> there is text inside the thought, and the model
-    thought on until max_tokens (Discussion 60)."""
+    thought on until max_tokens (Discussion 60).  Inkling 2 ends thinking with <|end_message|> and opens its answer
+    with <|message_model|><|content_text|>."""
+    if think_end == INKLING_END:
+        return text.replace(THINK_END + "\n\n", INKLING_END + INKLING_MODEL + INKLING_TEXT)
     return text if think_end == THINK_END else text.replace(THINK_END + "\n\n", think_end)
 # #728: opt-in handling of reasoning that repeats whole passages (which the single-token guard above cannot see).
 # "reasoning_loop_recovery": "stop" ends the reply there; "recover" (or true) goes on from the same output with the
@@ -3406,7 +3411,8 @@ class Service:
         # how the model writes a tool call (serve/frontend.py's OutputParser)
         pre = getattr(tokenizer, "pre", "")
         self.call_format = "glm" if pre in ("glm4", "glm5", "flint") else "gemma" if pre == "gemma4" else \
-            "dsml" if pre in ("joyai-llm", "deepseek-v3") else "lfm2" if pre == "lfm2" else "function"
+            "dsml" if pre in ("joyai-llm", "deepseek-v3") else "lfm2" if pre == "lfm2" else \
+            "inkling2" if pre == "inkling2" else "function"
         self.turn_ids = frozenset(t[0] for t in (tokenizer.encode(s, parse_special=True)
                                                  for s in TURN_OPENERS[self.call_format]) if len(t) == 1)
         self.engine.turn_ids = self.turn_ids            # the GEN line's turn_at (StrataEngine.turn_key)
@@ -3429,12 +3435,16 @@ class Service:
             for end in ("<|user|>", "<|observation|>", "<|developer|>"):
                 ids = tokenizer.encode(end, parse_special=True)
                 self.stop_ids |= set(ids if len(ids) == 1 else [])
+        elif self.call_format == "inkling2":
+            end_sampling = tokenizer.encode("<|content_model_end_sampling|>", parse_special=True)
+            self.stop_ids |= set(end_sampling if len(end_sampling) == 1 else [])
         # an image in a prompt (prepare()): the token the template writes for it, which stands for each of its rows;
         # the token the template writes before that one, if it writes one; the tokens to put around the rows, if
         # the template leaves that to the program
         # A template that writes the marker alone (MiniCPM-V 4.7's, like Gemma 4's) has no token before it to tell
         # an image's marker from the same text in a message: the first ones are the images (prepare()).
         self.image_marks = ("<|image|>", None, ("<|image>", "<image|>")) if self.call_format == "gemma" else \
+            ("<|unused_200054|>", "<|content_image|>", None) if self.call_format == "inkling2" else \
             (IMAGE_PAD, VISION_START if VISION_START in getattr(self.template, "source", VISION_START) else None, None)
         # #567: a prompt re-encodes only what follows the last special token it shares with a recent prompt (the
         # same ids as a full encode: tools/strata_tokenizer.py PromptEncoder).  Tokenizers without resume points
@@ -4499,7 +4509,21 @@ class Service:
                   "enable_thinking": not off}
         if self.call_format in ("gemma", "dsml") and tools:   # their templates read a tool as OpenAI sends it
             tools = [{"type": "function", "function": t} for t in tools]
-        if not self.effort_end or (not off and effort in (None, "", "xhigh", "high")):
+        if not self.effort_end or self.call_format == "inkling2" or (not off and effort in (None, "", "xhigh", "high")):
+            if self.call_format == "inkling2":
+                # Inkling 2's chat_template.jinja reads `reasoning_effort` directly (defaults to 0.9 if unset)
+                # and requires tool_calls[*].function.arguments to be parsed dicts.
+                if off or effort in ("off", "none", "false", "disabled"):
+                    kwargs["reasoning_effort"] = "none"
+                elif effort in (None, ""):
+                    kwargs.pop("reasoning_effort", None)
+                messages = [{**m, "tool_calls": [
+                    {**tc, "function": {**tc["function"], "arguments": tool_arguments(tc["function"].get("arguments"))}}
+                    if isinstance(tc, dict) and isinstance(tc.get("function"), dict)
+                    and isinstance(tc["function"].get("arguments"), str) else tc
+                    for tc in m["tool_calls"]]}
+                    if isinstance(m, dict) and m.get("role") == "assistant" and m.get("tool_calls") else m
+                    for m in messages]
             prompt = self.template.render(messages, tools=tools, **kwargs)
             if self.call_format == "gemma":
                 return gemma_model_turn(prompt, not off)

@@ -516,6 +516,15 @@ protected:
     /// The other names of a tensor or a metadata key in the files of this architecture, or null.
     virtual const Names* tensor_alias(const char* name) const { (void) name; return nullptr; }
     virtual const Names* meta_alias(const char* key) const { (void) key; return nullptr; }
+    /// Execution schedule: maps logical step [0, exec_steps()) to physical layer `phys` and state/graph `slot`.
+    struct ExecStep {
+        int phys;
+        int slot;
+    };
+    virtual int exec_steps() const { return n_layer_; }
+    virtual ExecStep exec_step(int step) const { return {step, step}; }
+    /// Text-only embedding normalization applied inside input() when the row is not an image.
+    virtual void norm_text_embed(float* dst) const { (void) dst; }
 
     // ---- what it builds on ----
     /// Whether layer il is this engine's: one of [lo_, hi_), or the draft block on the card that ends the model.
@@ -530,9 +539,9 @@ protected:
     /// exact one costs a wrong guess now and then and no token.
     enum Want { kF32, kFloatMat, kAnyMat, kGuessMat };
     Dev upload(const TensorInfo* t, const std::string& name, int64_t n_in, int64_t n_out, Want want,
-               float (*fix)(float) = nullptr);
+               float (*fix)(float) = nullptr, int64_t file_n_out = 0);
     Dev upload_as(const TensorInfo* t, const std::string& name, int64_t n_in, int64_t n_out, Want want,
-                  float (*fix)(float));
+                  float (*fix)(float), int64_t file_n_out = 0);
     float global_scale(const TensorInfo& t) const;
     const TensorInfo* tensor(int il, const char* name) const;
     const Shards& home(const TensorInfo& t) const;
@@ -716,13 +725,20 @@ protected:
     void* ev_in_[2] = {};     ///< marks a call's rows in each half of r_
     void* ev_out_[2] = {};    ///< marks the card done with a call in each half
     float rms_eps_ = 0;
+    enum class ExpAct { kSwiGLU = 0, kGeGLU = 1, kSiTU = 2 };
+    ExpAct exp_act_ = ExpAct::kSwiGLU;
     bool gelu_ = false;       ///< the routed experts' activation: GELU of the gate, else SiLU within the layer's limits
+    float situ_beta_ = 0.f, situ_linear_beta_ = 0.f;
+    int n_vocab_padded_ = 0;  ///< 0: equals n_vocab_; > n_vocab_: embd/output table rows in GGUF
     std::vector<float> clamp_exp_, clamp_shexp_;   ///< a layer's SwiGLU limits: the routed experts', the shared one's
     /// a prompt batch's products go through guard_half_sums(): the model's activations can sum past a half's range
     /// in a block.  Off for the models whose sums stay in range: it cost LFM2.5 4% of a 30K prompt's read on a 5090.
     bool half_sum_guard_ = false;
 
     std::vector<Layer> layers_;   ///< the model's, and after them the draft block
+    std::vector<std::vector<void*>> slot_heads_;
+    std::vector<std::vector<void*>> slot_tail_;
+    std::vector<std::map<std::vector<int>, void*>> slot_rows_heads_;
     Dev out_norm_, output_;
     bool draft_ = false;
     bool block_layer_ = false;    ///< what guesses ahead is a block after the model's layers (layers_' last)
@@ -768,6 +784,7 @@ protected:
         std::vector<Buf> bufs;
         std::vector<Image> images;
         std::vector<std::vector<void*>> heads;   ///< Layer::heads, by layer
+        std::vector<std::vector<void*>> slot_heads;
         std::map<std::vector<int>, void*> passes;
         void* tail = nullptr;
         // A sequence's own fp16 twin of its int8 caches (Gemma 4's --kv int8), and the halves of it that have

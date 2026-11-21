@@ -715,6 +715,13 @@ THINK_END = "</think>"
 CALL_START = "<tool_call>"
 CALL_END = "</tool_call>"
 
+INKLING_MODEL = "<|message_model|>"
+INKLING_THINK = "<|content_thinking|>"
+INKLING_TEXT = "<|content_text|>"
+INKLING_TOOL = "<|content_invoke_tool_json|>"
+INKLING_END = "<|end_message|>"
+INKLING_STOP = "<|content_model_end_sampling|>"
+
 
 PARAM_END = "</parameter>"
 FUNC_START = "<function="
@@ -1176,6 +1183,7 @@ class OutputParser:
 
     def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False,
                  recover: bool = False, call_format: str = "function", opened: bool = False):
+        self.call_format = call_format
         # GLM's <arg_key>/<arg_value> calls and Gemma's call:NAME{...} instead of <function=...>: such a call is
         # announced when its name is complete and its arguments follow whole.  (its name, its end, its parser)
         # What tells a <function=...> call from a quoted one, or recovers one written beside the template's form
@@ -1195,14 +1203,17 @@ class OutputParser:
         # template writes it after a tool's answer), so the reply starts inside the reasoning.  GLM's calls come
         # with <think> either way: GLM's template opens it in the prompt (`opened`), Flint writes it itself.
         self.think_open, self.think_end = ("<|channel>thought\n", "<channel|>") if call_format == "gemma" \
-            else ("<think>", THINK_END) if call_format == "glm" else ("", THINK_END)
+            else ("<think>", THINK_END) if call_format == "glm" \
+            else ("", INKLING_END) if call_format == "inkling2" else ("", THINK_END)
         # #537 tells a quoted </think> by the line break the end has after it.  GLM's and Gemma's answers follow
         # their end tag at once ('say "Paris."</think>Paris'), so there every end tag ends the reasoning
         self.quotes_end = call_format == "function"
         # the reply may still start with think_open.  Asked not to think, Gemma can still open with a thought
         # (an empty one, after a tool's answer): it is read either way
         self.opening = bool(self.think_open) and not opened
-        self.state = "reasoning" if thinking and (opened or not self.think_open) else "content"
+        self.state = "ink_wait" if call_format == "inkling2" \
+            else "reasoning" if thinking and (opened or not self.think_open) else "content"
+        self.ink_tool_name = ""
         self.buf = ""
         # newlines the answer starts with are dropped: LFM2 writes one after the </think> its prompt ends on
         self.lead = self.state == "content"
@@ -1507,6 +1518,8 @@ class OutputParser:
         return best
 
     def feed(self, delta: str) -> list[Event]:
+        if self.call_format == "inkling2":
+            return self._feed_inkling2(delta)
         self.buf += delta
         out: list[Event] = []
         while True:
@@ -1768,11 +1781,162 @@ class OutputParser:
                 if batch and out[-1].kind == "tool_call":
                     self.state, self.lead = "call", False
 
+    def _parse_inkling2_tool(self, raw: str, fallback_name: str) -> Event:
+        text = raw.strip()
+        try:
+            data = json.loads(text)
+        except ValueError:
+            if not self.recover:
+                return Event("content", f"{INKLING_MODEL}{fallback_name}{INKLING_TOOL}{raw}{INKLING_END}")
+            raise
+        if not isinstance(data, dict):
+            return Event("content", f"{INKLING_MODEL}{fallback_name}{INKLING_TOOL}{raw}{INKLING_END}")
+        name = data.get("name")
+        if not isinstance(name, str) or not name.strip():
+            name = fallback_name
+        args = data.get("args") if "args" in data else data.get("arguments", {})
+        if args is None:
+            args = {}
+        elif isinstance(args, str):
+            try:
+                parsed = json.loads(args)
+                args = parsed if isinstance(parsed, dict) else {"arguments": args}
+            except ValueError:
+                args = {"arguments": args}
+        elif not isinstance(args, dict):
+            args = {"value": args}
+        return Event("tool_call", call=ToolCall(name=name.strip(), arguments=args))
+
+    def _feed_inkling2(self, delta: str) -> list[Event]:
+        self.buf += delta
+        out: list[Event] = []
+        while self.buf:
+            if self.state == "ink_wait":
+                stripped = self.buf.lstrip()
+                if len(stripped) < len(self.buf):
+                    self.buf = stripped
+                    continue
+                if self.buf.startswith(INKLING_STOP):
+                    self.buf = self.buf[len(INKLING_STOP):]
+                    continue
+                if self.buf.startswith(INKLING_MODEL):
+                    self.buf = self.buf[len(INKLING_MODEL):]
+                    self.state = "ink_head"
+                    continue
+                if INKLING_MODEL.startswith(self.buf) or INKLING_STOP.startswith(self.buf):
+                    return out
+                m_at = self.buf.find(INKLING_MODEL)
+                s_at = self.buf.find(INKLING_STOP)
+                hits = [x for x in (m_at, s_at) if x >= 0]
+                if hits:
+                    at = min(hits)
+                    out.append(Event("content", self.buf[:at]))
+                    self.buf = self.buf[at:]
+                    continue
+                keep = self._hold(self.buf, (INKLING_MODEL, INKLING_STOP))
+                if len(self.buf) > keep:
+                    out.append(Event("content", self.buf[:len(self.buf) - keep]))
+                    self.buf = self.buf[len(self.buf) - keep:]
+                return out
+            if self.state == "ink_head":
+                if self.buf.startswith(INKLING_THINK):
+                    self.buf = self.buf[len(INKLING_THINK):]
+                    self.state = "reasoning"
+                    continue
+                if self.buf.startswith(INKLING_TEXT):
+                    self.buf = self.buf[len(INKLING_TEXT):]
+                    self.state = "content"
+                    continue
+                tj = self.buf.find(INKLING_TOOL)
+                if tj >= 0:
+                    self.ink_tool_name = self.buf[:tj].strip()
+                    self.buf = self.buf[tj + len(INKLING_TOOL):]
+                    self.state = "ink_tool"
+                    continue
+                end = self.buf.find(INKLING_END)
+                if end >= 0:
+                    if end:
+                        out.append(Event("content", self.buf[:end]))
+                    self.buf = self.buf[end + len(INKLING_END):]
+                    self.state = "ink_wait"
+                    continue
+                if any(tag.startswith(self.buf) for tag in (INKLING_THINK, INKLING_TEXT, INKLING_END)):
+                    return out
+                # Hold up to a bounded prefix while waiting for `<name><|content_invoke_tool_json|>`.
+                if len(self.buf) < 256:
+                    return out
+                keep = self._hold(self.buf, (INKLING_TOOL, INKLING_END))
+                out.append(Event("content", self.buf[:len(self.buf) - keep]))
+                self.buf = self.buf[len(self.buf) - keep:]
+                self.state = "content"
+                continue
+            if self.state in ("reasoning", "content"):
+                i = self.buf.find(INKLING_END)
+                if i >= 0:
+                    if i:
+                        out.append(Event(self.state, self.buf[:i]))
+                    self.buf = self.buf[i + len(INKLING_END):]
+                    self.state = "ink_wait"
+                    continue
+                keep = self._hold(self.buf, (INKLING_END,))
+                if len(self.buf) > keep:
+                    out.append(Event(self.state, self.buf[:len(self.buf) - keep]))
+                    self.buf = self.buf[len(self.buf) - keep:]
+                return out
+            if self.state == "ink_tool":
+                i = self.buf.find(INKLING_END)
+                if i < 0:
+                    return out
+                raw = self.buf[:i]
+                self.buf = self.buf[i + len(INKLING_END):]
+                self.state = "ink_wait"
+                name_fb, self.ink_tool_name = self.ink_tool_name, ""
+                out.append(self._parse_inkling2_tool(raw, name_fb))
+                continue
+        return out
+
+    def _finish_inkling2(self, reason: str | None = None) -> list[Event]:
+        out: list[Event] = []
+        if self.state == "ink_tool":
+            raw = self.buf.strip()
+            self.buf = ""
+            name_fb, self.ink_tool_name = self.ink_tool_name, ""
+            if raw:
+                try:
+                    data = json.loads(raw)
+                except ValueError:
+                    data = None
+                if isinstance(data, dict):
+                    out.append(self._parse_inkling2_tool(raw, name_fb))
+                else:
+                    out.append(Event("content", f"{INKLING_MODEL}{name_fb}{INKLING_TOOL}{raw}"))
+            self.state = "ink_wait"
+            return out
+        if self.state in ("reasoning", "content") and self.buf:
+            text = self.buf
+            if text != INKLING_END:
+                out.append(Event(self.state, text))
+            self.buf = ""
+            return out
+        if self.state == "ink_head" and self.buf:
+            if not any(tag.startswith(self.buf) for tag in (INKLING_THINK, INKLING_TEXT, INKLING_TOOL, INKLING_END)):
+                out.append(Event("content", self.buf))
+            self.buf = ""
+            return out
+        if self.state == "ink_wait" and self.buf:
+            s = self.buf.strip()
+            if s and not INKLING_STOP.startswith(s) and not INKLING_MODEL.startswith(s):
+                out.append(Event("content", s))
+            self.buf = ""
+        return out
+
     def finish(self, reason: str | None = None) -> list[Event]:
         """End of generation: flush whatever is held (an unterminated tool call is returned as content; one that was
         already announced stays unfinished: its JSON is not closed and no "tool_call" follows it, #211).  `reason` is
         how the turn ended: calls waiting from the reasoning become real calls only on a natural stop (None = stop);
         a turn cut by max tokens (or cancelled, or failed) keeps them as reasoning text (#1058)."""
+        if self.call_format == "inkling2":
+            return self._finish_inkling2(reason)
         out = []
         if self.pending:
             out += self._release(reason in (None, "stop") and self.state == "reasoning" and not self.buf)

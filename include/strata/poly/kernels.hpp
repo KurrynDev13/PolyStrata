@@ -417,4 +417,68 @@ void dsv4_attend(const float* q, const uint16_t* raw, int ring, int window, cons
 /// y[g][t] = x[t][g] for `rows` tokens of `groups` groups of n values; with back, y[t][g] = x[g][t].
 void permute_groups(const float* x, float* y, int n, int groups, int rows, bool back, void* stream);
 
+// ---- Inkling 2 (inkling2_loop / inkling2) ----
+
+struct MixSlots {
+    int s[6] = {};
+};
+
+/// SiTU gated activation on rows of [gate (n) | up (n)], writing n values per row to `out`.
+/// out[i] = beta * tanh(gate / beta) * sigmoid(gate) * (linear_beta > 0 ? linear_beta * tanh(up / linear_beta) : up).
+void situ_rows(const float* gate_up, float* out, int n, int rows, float beta, float linear_beta, void* stream,
+               const ExpertScales* scales = nullptr);
+
+/// Block Attention Residual mixing over `n_slots` (`<= 6`) streams inside `r` ([rows, streams, n_embd]).
+/// Each slot vector is RMS-normed without weights (eps), scored against `query[q]` * rsqrt(n_embd),
+/// softmaxed across slots, and summed into `out[(q * rows + t) * n_embd]`.
+void inkling_mix(const float* r, int streams, MixSlots slots, int n_slots, const float* query, int n_queries,
+                 float* out, int n_embd, int rows, float eps, void* stream);
+
+/// Prep cross-pass control input: out_concat[t] = [rms_norm(cur[t], eps) | rms_norm(msg[t], eps)].
+void inkling_control_prep(const float* cur, const float* msg, float* out_concat, int n_embd, int rows, float eps,
+                          void* stream);
+
+/// Apply cross-pass control gates: out = cur * (1 - tanh(forget_raw)) + msg * tanh(gain_raw).
+void inkling_control_apply(const float* cur, const float* msg, const float* gain_raw, const float* forget_raw,
+                           float* out, int n_embd, int rows, void* stream);
+
+/// Causal 4-tap short convolution + residual + 1/sqrt(5) (static) or 1/3 (dynamic) scaling.
+/// `state` holds 3 past inputs per channel, oldest first. When `dyn` is non-null ([rows, n_heads, 4]),
+/// dynamic taps apply in reverse lag order: lag 0 multiplies x[t], lag 3 multiplies x[t - 3].
+void inkling_conv4(const float* x, float* state, const float* w, const float* dyn, int head_dim, float* out,
+                   int channels, int rows, void* stream, float* snap = nullptr, size_t stride = 0,
+                   unsigned snaps = 0);
+
+/// Optional per-channel `scale` multiply, per-head L2 norm clamp `<= threshold`, and (if `is_global`)
+/// log-scale tau(pos) = 1 + log_alpha * ln(max(1, (pos + 1) / log_floor)). Supports `at` for CUDA graphs.
+void inkling_l2_clip(const float* x, const float* scale, float* out, int dim, int heads, float threshold,
+                     int64_t pos, bool is_global, float log_floor, float log_alpha, int rows,
+                     const long long* at, void* stream);
+
+/// Per-query relative-position distance bias table:
+/// table[(t * n_head + h) * n_extent + d] = dot(r_cur[t, h], rel_bias[d]) - sinks[t, h] for d in [0, n_extent).
+void inkling_rel_table(const float* r_cur, const float* rel_bias, const float* sinks, float* table, int n_rel,
+                       int n_extent, int n_head, int rows, void* stream);
+
+/// Inkling 2 decode/window attention with per-query distance bias table (`table`), beyond-extent fallback (`-sinks`),
+/// and virtual zero-value sink (m = 0, l = 1). Supports FP16 and --kv q8_0 caches, SWA rings, and CUDA graph `at`.
+void inkling_attend(const float* q, const uint16_t* kcache, const uint16_t* vcache, const float* table,
+                    const float* sinks, int n_extent, int64_t pos, int rows, float* score, int chunk, float* out,
+                    int dim, int n_head, int kv_heads, float scale, void* stream, int window = 0, int ring = 0,
+                    const long long* at = nullptr, int room = 0, Kvq8 kq8 = {}, Kvq8 vq8 = {});
+
+/// Inkling 2 prompt-batch attention using cuBLAS GEMM tiles + online block softmax with distance bias + zero sink.
+void inkling_attend_batch(void* blas, const float* q, const uint16_t* kcache, const uint16_t* vcache,
+                          const float* table, const float* sinks, int n_extent, int64_t pos, int rows, float* score,
+                          size_t score_floats, float* work, float* out, int dim, int n_head, int kv_heads,
+                          float scale, void* stream, int window = 0, int ring = 0, Kvq8 kq8 = {}, Kvq8 vq8 = {},
+                          uint16_t* kwork = nullptr, uint16_t* vwork = nullptr, size_t work_halves = 0);
+
+/// Copy stream `src_stream` into stream `dst_stream` inside `r` ([rows, streams, n_embd]), or from flat `x`.
+void inkling_copy_stream(float* r, int streams, int dst_stream, int src_stream, int n_embd, int rows, void* stream);
+void inkling_write_stream(const float* x, float* r, int streams, int dst_stream, int n_embd, int rows, void* stream);
+void inkling_read_stream(const float* r, int streams, int src_stream, float* out, int n_embd, int rows, void* stream);
+void inkling_add_to_stream(const float* a, const float* b, float* r, int streams, int dst_stream, int n_embd, int rows,
+                           void* stream);
+
 }  // namespace strata::poly

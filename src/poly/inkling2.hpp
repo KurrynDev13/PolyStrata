@@ -1,0 +1,125 @@
+// src/poly/inkling2.hpp - Thinking Machines Lab's Inkling 2 Mini (inkling2_loop and inkling2).
+//
+// 24 physical layers executed over 48 logical steps (prelude 0..5, looped core 6..17 x 3 passes, epilogue 18..23).
+// 6 residual streams carry Block Attention Residuals and cross-pass loop messages across the schedule.
+// 40 logical steps attend over a 1024-token sliding window; 8 steps attend globally with log-scale tau(pos).
+// Causal 4-tap short convolutions run on K, V (with reversed-lag dynamic taps on global layers), attn_out, and ffn_out.
+// MoE uses 128 routed experts (top-8 sigmoid routing, bias, w_scale=8.0) with SiTU activation.
+#pragma once
+
+#include "engine.hpp"
+
+#include <vector>
+
+namespace strata::poly {
+
+class Inkling2 final : public Engine {
+public:
+    size_t card_row_bytes() const override;
+    void save_card_rows(int64_t first, int64_t n, uint8_t* dst) override;
+    void load_card_rows(const uint8_t* src, int64_t from, int64_t count, int64_t first, int64_t n) override;
+    bool sees() const override { return true; }
+
+protected:
+    void load_geometry() override;
+    void load_layer(int il) override;
+    void begin_pass() override;
+    int exec_steps() const override { return (int) schedule_.size(); }
+    ExecStep exec_step(int step) const override {
+        const Step& s = schedule_[(size_t) step];
+        return {s.phys, s.slot};
+    }
+    void norm_text_embed(float* dst) const override;
+    size_t recurrent_floats() const override;
+    bool snaps_spread() const override { return true; }
+    void save_layer(int slot, int64_t pos, uint8_t* dst) override;
+    size_t extra_bytes() const override;
+    void load_extra(const uint8_t* src, int64_t pos) override;
+    void alloc_caches() override;
+    void assign_scratch() override;
+    int widest() const override;
+    int streams() const override { return 6; }
+    void layer_head(Layer& L, int slot, int n) override;
+    void layer_tail(Layer& L, int slot, int n) override;
+    void output_rows(int first, int rows, float* h) override;
+    void finish_logits(float* logits, int rows) override;
+    void route(int il, const float* logits, int32_t token, int* ids, float* w, float* tmp) const override;
+    bool route_card(int il, int n, int32_t* ids, float* w) override;
+    void moe_shared(const Layer& L, int il, int n) override;
+    int head_key(int slot, int n) const override;
+    const Names* tensor_alias(const char* name) const override;
+    const Names* meta_alias(const char* key) const override;
+
+private:
+    struct Step {
+        int phys = 0;
+        int slot = 0;
+        int pass = 0;
+    };
+
+    struct Block {
+        bool swa = false;
+        Dev wq, wk, wv, wo, wqkv_gate;
+        Dev attn_q_clip, attn_sink_proj, attn_rel, attn_rel_bias, attn_rel_clip;
+        Dev attn_k_conv, attn_v_conv, attn_post_conv, ffn_post_conv;
+        Dev q_inp_norm, k_inp_norm, v_inp_norm, k_conv_proj, v_conv_proj;
+        Dev attn_res_query, ffn_res_query;
+        // Loop controller weights (only for phys in [core_start_, core_end_))
+        Dev loop_msg_query;
+        Dev ctrl_down[4], ctrl_gain[4], ctrl_forget[4];
+        std::vector<float> probs_b;
+        Dev probs_b_dev;
+    };
+
+    struct SlotCache {
+        bool swa = false;
+        int swa_idx = -1;       ///< index among SWA slots for extra_bytes layout
+        size_t state_off = 0;   ///< float offset into state_ / snap_
+        uint16_t* keys = nullptr;
+        uint16_t* vals = nullptr;
+        int8_t* k_codes = nullptr;
+        uint16_t* k_scales = nullptr;
+        int8_t* v_codes = nullptr;
+        uint16_t* v_scales = nullptr;
+    };
+
+    void apply_ctrl(const float* cur, const float* msg, const Block& B, int ctrl, float* out, int n);
+    void store(const float* x, const SlotCache& sc, int64_t pos, int n, bool value);
+    void attn(const Step& st, Block& B, SlotCache& sc, int64_t pos, int n);
+    template <class F>
+    void window_runs(int64_t pos, F&& f) const;
+
+    bool root_layout_ = false;
+    std::vector<Step> schedule_;
+    std::vector<Block> blocks_;
+    std::vector<SlotCache> slots_;
+
+    // Global weights
+    Dev tok_norm_dev_, output_res_query_;
+    std::vector<float> tok_norm_host_;
+
+    // Model parameters
+    int n_head_ = 0, n_kv_ = 0, head_dim_ = 0;
+    int n_rel_ = 0, n_rel_extent_ = 0, window_ = 0;
+    int ring_ = 0, keep_ = 0;
+    int core_start_ = 0, core_end_ = 0, n_passes_ = 0, gate_rank_ = 0;
+    int block_size_ = 6, l_conv_ = 4, log_floor_ = 8192;
+    float qk_clip_ = 0.f, rel_clip_ = 0.f, log_alpha_ = 0.f;
+    float w_scale_ = 8.f, final_logit_softcapping_ = 0.f;
+    int n_swa_slots_ = 0, n_global_slots_ = 0;
+    size_t slot_conv_floats_ = 0, off_k_conv_ = 0, off_v_conv_ = 0, off_attn_post_ = 0, off_ffn_post_ = 0;
+    int chunk_dec_ = 1, chunk_batch_ = 64;
+
+    // Device scratch
+    float *inputs_buf_ = nullptr, *msg_ = nullptr, *ctrl_cat_ = nullptr, *ctrl_r_ = nullptr, *ctrl_g_ = nullptr,
+          *ctrl_f_ = nullptr, *inp_sa_ = nullptr;
+    float *qraw_ = nullptr, *q_ = nullptr, *kraw_ = nullptr, *k_ = nullptr, *v_ = nullptr;
+    float *r_raw_ = nullptr, *r_cur_ = nullptr, *dyn_ = nullptr, *sinks_ = nullptr, *gate_ = nullptr;
+    float *att_ = nullptr, *table_ = nullptr, *score_ = nullptr;
+    size_t score_n_ = 0;
+    float* awork_ = nullptr;
+    float* q8w_ = nullptr;
+    size_t work_halves_ = 0;
+};
+
+}  // namespace strata::poly
