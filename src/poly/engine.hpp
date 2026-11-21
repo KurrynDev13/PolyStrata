@@ -48,7 +48,7 @@ struct Likeliest;
 /// int8 and int8k are Gemma 4's - the two readers are not the same arithmetic, so a model has one or the other rather
 /// than a choice between them.  Auto is resolved from model geometry before allocation on Metal; other backends default
 /// to fp16.
-enum class KvFmt { kAuto = -1, kFp16 = 0, kQ8_0 = 1, kInt8 = 2, kInt8K = 3, kQ4_0 = 4 };
+enum class KvFmt { kAuto = -1, kFp16 = 0, kQ8_0 = 1, kInt8 = 2, kInt8K = 3, kQ4_0 = 4, kK8V4 = 5 };
 
 struct Options {
 #if defined(STRATA_GPU_METAL)
@@ -415,6 +415,7 @@ protected:
     virtual void load_drafter();
     /// Architecture-owned block drafter (e.g. Inkling2 DSpark) that proposes a window at once via draft_block().
     virtual bool draft_at_once() const { return false; }
+    virtual bool exps_scale_any_type() const { return false; }
     virtual void init_drafter() {}
     virtual void reset_drafter() {}
     virtual void draft_commit(int64_t /*pos*/, int /*n*/) {}
@@ -461,6 +462,9 @@ protected:
     /// for, or -1 where it has none (a picture's row, the draft block).  tmp: 2 * n_expert_ floats of scratch.  A
     /// prompt batch's tokens are routed by several threads at once: it changes nothing of the engine's.
     virtual void route(int il, const float* logits, int32_t token, int* ids, float* w, float* tmp) const = 0;
+    /// Unbiased expert weights for already-chosen expert `ids[0..n_used_)`, called when `--cache-bias` selected
+    /// experts using biased scores. Default: softmax(logits[ids]).
+    virtual void route_weights(int il, const float* logits, const int* ids, float* w) const;
     /// A prompt batch's routing on the card: n tokens' experts and weights from their scores in rl_, n_used_ a token
     /// into ids and w (on the card), what route() gives them up to the last bits of a weight.  False: the host routes.
     virtual bool route_card(int il, int n, int32_t* ids, float* w) {
@@ -593,6 +597,7 @@ protected:
     void moe_add(int n);
     template <class F>
     void* record(F&& work);
+    void* record_fn(const std::function<void()>& work);
     void moe_rows(Layer& L, int il, int n);
     void stage(const Layer& L, const int32_t* experts, int m, void* stream, bool alone = false);
     void mind_memory();

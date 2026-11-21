@@ -1626,12 +1626,13 @@ void Engine::load_moe(int il, bool shared) {
     // NVFP4 experts converted from NVIDIA's checkpoints carry each expert's global scale of gate, up and down
     // (llama.cpp's ffn_*_exps_s).  Gate's and up's go on their products ahead of the activation (ExpertScales),
     // down's on the expert's weight in its token's sum.  Only NVFP4's: Gemma 4's ffn_down_exps.scale is its own.
-    const bool nv = L.gu_type == GGML_TYPE_NVFP4 || L.u_type == GGML_TYPE_NVFP4 || L.d_type == GGML_TYPE_NVFP4;
+    const bool any_sc = exps_scale_any_type();
+    const bool nv = any_sc || L.gu_type == GGML_TYPE_NVFP4 || L.u_type == GGML_TYPE_NVFP4 || L.d_type == GGML_TYPE_NVFP4;
     // A projection of another type in the same layer has none (Qwen3.6 NVFP4-MTP-HQ: some ups are Q4_K).
     const auto one = [&](const char* n, uint32_t type, Dev& d, std::vector<float>& h) {
         const TensorInfo* t = tensor(il, n);
         h.clear();
-        if (type != GGML_TYPE_NVFP4 || !t) return;
+        if ((!any_sc && type != GGML_TYPE_NVFP4) || !t) return;
         if (t->type != kTypeF32) throw std::runtime_error(t->name + " is not F32");
         d = upload(t, blk(il, n), n_expert_, 1, kF32);
         h.resize((size_t) n_expert_);
@@ -1666,16 +1667,18 @@ std::unique_ptr<Engine> Engine::open(const Options& o) {
         !inkling2)
         throw std::runtime_error("--kv q8_0 is supported for qwen35moe, kolibri1, flint, lfm2moe and inkling2 models "
                                  "in v1; this is a '" + name + "' model");
-    if (o.kv_format == KvFmt::kQ4_0 && !inkling2)
-        throw std::runtime_error("--kv q4_0 is supported for inkling2 models in v1; this is a '" + name + "' model");
+    if ((o.kv_format == KvFmt::kQ4_0 || o.kv_format == KvFmt::kK8V4) && !inkling2)
+        throw std::runtime_error(std::string("--kv ") + (o.kv_format == KvFmt::kK8V4 ? "k8v4" : "q4_0") +
+                                 " is supported for inkling2 models in v1; this is a '" + name + "' model");
     // int8 and int8k are Gemma 4's: their readers are not the arithmetic q8_0's are, so a model takes one
     // family or the other rather than a choice between them.
     if (name != "gemma4" && (o.kv_format == KvFmt::kInt8 || o.kv_format == KvFmt::kInt8K))
         throw std::runtime_error("--kv int8 and --kv int8k are Gemma 4's; for a qwen35moe or kolibri1 model use "
                                  "--kv q8_0 (this is a '" + name + "' model)");
-    // moe() weighs the picks as a softmax of their scores, which is how only this architecture's router does
-    if (o.cache_bias > 0.f && !qwen35)
-        throw std::runtime_error("--cache-bias is supported for qwen35moe models; this is a '" + name + "' model");
+    // moe() weighs the picks as a softmax of their scores, which is how qwen35moe / inkling2 routers work
+    if (o.cache_bias > 0.f && !qwen35 && !inkling2)
+        throw std::runtime_error("--cache-bias is supported for qwen35moe and inkling2 models; this is a '" + name +
+                                 "' model");
     if (inkling2 && !o.layer_split.empty())
         throw std::runtime_error("--layer-split is not supported for '" + name + "' models in v1");
     const auto make = [&]() -> std::unique_ptr<Engine> {
@@ -1768,7 +1771,7 @@ Dev Engine::upload(const TensorInfo* t, const std::string& name, int64_t n_in, i
 // blocks' E4M3 scales.  1 for any other matrix.
 float Engine::global_scale(const TensorInfo& t) const {
     static const std::string w = ".weight";
-    if (t.type != GGML_TYPE_NVFP4 || t.name.size() <= w.size() ||
+    if ((!exps_scale_any_type() && t.type != GGML_TYPE_NVFP4) || t.name.size() <= w.size() ||
         t.name.compare(t.name.size() - w.size(), w.size(), w) != 0)
         return 1.0f;
     const TensorInfo* s = home(t).find(t.name.substr(0, t.name.size() - w.size()) + ".scale");
@@ -4022,6 +4025,13 @@ const float* Engine::biased(const Layer& L, const float* scores) {
     return bias_rl_.data();
 }
 
+void Engine::route_weights(int, const float* scores, const int* ids, float* w) const {
+    float mx = scores[ids[0]], sum = 0.f;
+    for (int k = 1; k < n_used_; ++k) mx = std::max(mx, scores[ids[k]]);
+    for (int k = 0; k < n_used_; ++k) sum += w[k] = std::exp(scores[ids[k]] - mx);
+    for (int k = 0; k < n_used_; ++k) w[k] /= sum;
+}
+
 // The call's experts from pool_'s slots.  One not there takes the slot pool_victim() gives and goes on
 // pool_reads_, which moe() hands the read threads ahead of everything else.
 void Engine::pool_take(const Layer& L, int il, CpuExpert* host, int n) {
@@ -4112,14 +4122,7 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
             const float* scores = h_rl_ + (size_t) (at + t) * n_expert_;
             route(il, opt_.cache_bias > 0.f ? biased(L, scores) : scores, tok_ ? tok_[at + t] : -1, ids, w,
                   route_tmp_.data());
-            if (opt_.cache_bias > 0.f) {
-                // --cache-bias: the biased scores chose the experts; the weights are the router's own, a softmax of
-                // the scores it gave the chosen ones
-                float mx = scores[ids[0]], sum = 0.f;
-                for (int k = 1; k < n_used_; ++k) mx = std::max(mx, scores[ids[k]]);
-                for (int k = 0; k < n_used_; ++k) sum += w[k] = std::exp(scores[ids[k]] - mx);
-                for (int k = 0; k < n_used_; ++k) w[k] /= sum;
-            }
+            if (opt_.cache_bias > 0.f) route_weights(il, scores, ids, w);
             float w_all = 0.f;
             for (int k = 0; k < n_used_; ++k) w_all += w[k];
             for (int k = 0; k < n_used_; ++k) {
@@ -4830,6 +4833,10 @@ void* Engine::record(F&& work) {
     ck(made, "cudaGraphInstantiate");
     graphs_.push_back(exec);
     return exec;
+}
+
+void* Engine::record_fn(const std::function<void()>& work) {
+    return record([&] { work(); });
 }
 
 // n tokens from pos() through every layer.  The sequence is not longer for it: the caller says by how much.

@@ -611,37 +611,70 @@ int test_dspark_kernels() {
 
     cudaFree(d_r); cudaFree(d_taps); cudaFree(d_tap3); cudaFree(d_wn); cudaFree(d_mix);
 
-    // 2. rnn_gate (two sequential updates)
-    const int rank = 256;
-    auto g1 = random_vec(3 * rank, 1.2f), g2 = random_vec(3 * rank, 1.2f), rb = random_vec(3 * rank, 0.3f);
+    // 2. rnn_gate with gates_sp + gates_h + gates_f (two sequential updates) + prep_rnn_step
+    const int rank = 256, w1_voc = 12;
+    auto g1 = random_vec(3 * rank, 1.2f), g2 = random_vec(3 * rank, 1.2f),
+         gh = random_vec(3 * rank, 0.8f), gf = random_vec(3 * rank, 0.6f), rb = random_vec(3 * rank, 0.3f);
     std::vector<float> st_init(rank, 0.f);
     float* d_g = dev(g1);
+    float* d_gh = dev(gh);
+    float* d_gf = dev(gf);
     float* d_rb = dev(rb);
     float* d_st = dev(st_init);
     float* d_lat = dev(std::vector<float>(rank, 0.f));
 
     auto ref_gate = [&](const std::vector<float>& g, std::vector<double>& s_ref, std::vector<float>& l_ref) {
         for (int i = 0; i < rank; ++i) {
-            const double k = 1.0 / (1.0 + std::exp(-((double) g[i] + rb[i])));
-            const double u = std::tanh((double) g[rank + i] + rb[rank + i]);
-            const double l = std::tanh((double) g[2 * rank + i] + rb[2 * rank + i]);
+            const double k = 1.0 / (1.0 + std::exp(-((double) g[i] + gh[i] + gf[i] + rb[i])));
+            const double u = std::tanh((double) g[rank + i] + gh[rank + i] + gf[rank + i] + rb[rank + i]);
+            const double l = std::tanh((double) g[2 * rank + i] + gh[2 * rank + i] + gf[2 * rank + i] + rb[2 * rank + i]);
             s_ref[i] = k * s_ref[i] + (1.0 - k) * u;
             l_ref[i] = (float) l;
         }
     };
     std::vector<double> st_ref(rank, 0.0);
     std::vector<float> lat_ref(rank);
-    inkling_dspark_rnn_gate(d_g, d_rb, d_st, d_lat, rank, nullptr);
+    inkling_dspark_rnn_gate(d_g, d_gh, d_gf, d_rb, d_st, d_lat, rank, nullptr);
     ref_gate(g1, st_ref, lat_ref);
     cudaMemcpy(d_g, g2.data(), g2.size() * sizeof(float), cudaMemcpyHostToDevice);
-    inkling_dspark_rnn_gate(d_g, d_rb, d_st, d_lat, rank, nullptr);
+    inkling_dspark_rnn_gate(d_g, d_gh, d_gf, d_rb, d_st, d_lat, rank, nullptr);
     ref_gate(g2, st_ref, lat_ref);
     cudaDeviceSynchronize();
     std::vector<float> st_ref_f(rank);
     for (int i = 0; i < rank; ++i) st_ref_f[i] = (float) st_ref[i];
     bad += report("DSpark rnn_gate state vs FP64", host(d_st, rank), st_ref_f, 1e-5);
     bad += report("DSpark rnn_gate latent vs FP64", host(d_lat, rank), lat_ref, 1e-5);
-    cudaFree(d_g); cudaFree(d_rb); cudaFree(d_st); cudaFree(d_lat);
+
+    // 2b. prep_rnn_step: reads anchor (-1 -> picks[anchor_slot]) on step 0 and picks[step - 1] on step > 0 + BF16 w1
+    auto w1_f = random_vec((size_t) w1_voc * rank, 1.4f);
+    std::vector<ggml_bf16_t> w1_bf16((size_t) w1_voc * rank);
+    ggml_fp32_to_bf16_row(w1_f.data(), w1_bf16.data(), (int64_t) w1_f.size());
+    std::vector<float> w1_deq((size_t) w1_voc * rank);
+    ggml_get_type_traits(GGML_TYPE_BF16)->to_float(w1_bf16.data(), w1_deq.data(), (int64_t) w1_f.size());
+    std::vector<uint16_t> w1_u16((size_t) w1_voc * rank);
+    std::memcpy(w1_u16.data(), w1_bf16.data(), w1_u16.size() * sizeof(uint16_t));
+    uint16_t* d_w1 = dev(w1_u16);
+    std::vector<Likeliest> h_picks = {{7, 0.5f}, {3, 0.4f}, {4, 1.0f}};
+    Likeliest* d_picks = dev(h_picks);
+    float* d_in_sp = dev(std::vector<float>(2 * rank, 0.f));
+    inkling_dspark_prep_rnn_step(d_st, d_w1, -1, d_picks, 0, 2, rank, w1_voc, d_in_sp, nullptr);
+    cudaDeviceSynchronize();
+    std::vector<float> want_sp0(2 * rank);
+    for (int i = 0; i < rank; ++i) {
+        want_sp0[i] = st_ref_f[i];
+        want_sp0[rank + i] = w1_deq[(size_t) 4 * rank + i];
+    }
+    bad += report("DSpark prep_rnn_step(step=0,slot)", host(d_in_sp, 2 * rank), want_sp0, 1e-6);
+    inkling_dspark_prep_rnn_step(d_st, d_w1, -1, d_picks, 1, 2, rank, w1_voc, d_in_sp, nullptr);
+    cudaDeviceSynchronize();
+    std::vector<float> want_sp1(2 * rank);
+    for (int i = 0; i < rank; ++i) {
+        want_sp1[i] = st_ref_f[i];
+        want_sp1[rank + i] = w1_deq[(size_t) 7 * rank + i];
+    }
+    bad += report("DSpark prep_rnn_step(step=1)", host(d_in_sp, 2 * rank), want_sp1, 1e-6);
+    cudaFree(d_w1); cudaFree(d_picks); cudaFree(d_in_sp);
+    cudaFree(d_g); cudaFree(d_gh); cudaFree(d_gf); cudaFree(d_rb); cudaFree(d_st); cudaFree(d_lat);
 
     // 3. add_softcap
     const int n_voc = 4099;
@@ -697,7 +730,225 @@ int test_dspark_kernels() {
     }
     std::printf("%-42s %8d vals  err=%.3g  %s\n", "DSpark pack_q8_0_block vs ggml_to_float",
                 pv * 64, max_q_err, bad == 0 ? "PASS" : "FAIL");
-    cudaFree(d_cols); cudaFree(d_q8);
+
+    // 5. pack_q4_0_block exact byte parity vs ggml_quantize_chunk(GGML_TYPE_Q4_0)
+    uint8_t* d_q4 = nullptr;
+    cudaMalloc(&d_q4, (size_t) pv * n_blocks * 18);
+    cudaMemset(d_q4, 0, (size_t) pv * n_blocks * 18);
+    cudaMemcpy(d_cols, col0.data(), col0.size() * sizeof(float), cudaMemcpyHostToDevice);
+    inkling_dspark_pack_q4_0_block(d_cols, d_q4, pv, 0, n_blocks, nullptr);
+    cudaMemcpy(d_cols, col1.data(), col1.size() * sizeof(float), cudaMemcpyHostToDevice);
+    inkling_dspark_pack_q4_0_block(d_cols, d_q4, pv, 1, n_blocks, nullptr);
+    cudaDeviceSynchronize();
+
+    std::vector<uint8_t> h_q4((size_t) pv * n_blocks * 18);
+    cudaMemcpy(h_q4.data(), d_q4, h_q4.size(), cudaMemcpyDeviceToHost);
+    std::vector<float> rows_f((size_t) pv * 64);
+    for (int v = 0; v < pv; ++v) {
+        for (int j = 0; j < 32; ++j) {
+            rows_f[(size_t) v * 64 + j] = col0[(size_t) j * pv + v];
+            rows_f[(size_t) v * 64 + 32 + j] = col1[(size_t) j * pv + v];
+        }
+    }
+    std::vector<uint8_t> ggml_q4((size_t) pv * n_blocks * 18);
+    ggml_quantize_chunk(GGML_TYPE_Q4_0, rows_f.data(), ggml_q4.data(), 0, pv, 64, nullptr);
+    const auto* tt4 = ggml_get_type_traits(GGML_TYPE_Q4_0);
+    std::vector<float> deq4((size_t) pv * 64), deq_ref((size_t) pv * 64);
+    tt4->to_float(h_q4.data(), deq4.data(), (int64_t) pv * 64);
+    tt4->to_float(ggml_q4.data(), deq_ref.data(), (int64_t) pv * 64);
+    int bad4 = 0;
+    double max_q4_err = 0.0;
+    for (size_t i = 0; i < deq4.size(); ++i) {
+        const double e = std::abs((double) deq4[i] - (double) deq_ref[i]);
+        max_q4_err = std::max(max_q4_err, e);
+    }
+    // Check dequantized diff against ggml_quantize_chunk (allows at most 1 Q4 step from fp16 rounding on boundary ties)
+    for (int b_i = 0; b_i < pv * n_blocks; ++b_i) {
+        uint16_t dh = (uint16_t) ggml_q4[(size_t) b_i * 18] | ((uint16_t) ggml_q4[(size_t) b_i * 18 + 1] << 8);
+        const double step = std::abs((double) __half2float(__ushort_as_half(dh)));
+        for (int j = 0; j < 32; ++j) {
+            const size_t idx = (size_t) b_i * 32 + j;
+            if (std::abs((double) deq4[idx] - (double) deq_ref[idx]) > step * 1.05 + 1e-4) ++bad4;
+        }
+    }
+    bad += bad4;
+    std::printf("%-42s %8d vals  err=%.3g  %s\n", "DSpark pack_q4_0_block vs ggml_quantize",
+                pv * 64, max_q4_err, bad4 == 0 ? "PASS" : "FAIL");
+    cudaFree(d_cols); cudaFree(d_q8); cudaFree(d_q4);
+
+    // 6. split_qkv
+    const int sq_rows = 8, sq_qd = 64, sq_kvd = 32;
+    auto qkv_h = random_vec((size_t) sq_rows * (sq_qd + 2 * sq_kvd), 1.f);
+    float *d_qkv = dev(qkv_h), *d_sq = dev(std::vector<float>((size_t) sq_rows * sq_qd, 0.f)),
+          *d_sk = dev(std::vector<float>((size_t) sq_rows * sq_kvd, 0.f)),
+          *d_sv = dev(std::vector<float>((size_t) sq_rows * sq_kvd, 0.f));
+    inkling_dspark_split_qkv(d_qkv, d_sq, d_sk, d_sv, sq_qd, sq_kvd, sq_rows, nullptr);
+    cudaDeviceSynchronize();
+    std::vector<float> want_sq((size_t) sq_rows * sq_qd), want_sk((size_t) sq_rows * sq_kvd), want_sv((size_t) sq_rows * sq_kvd);
+    for (int t = 0; t < sq_rows; ++t) {
+        const size_t base = (size_t) t * (sq_qd + 2 * sq_kvd);
+        std::copy(qkv_h.data() + base, qkv_h.data() + base + sq_qd, want_sq.data() + (size_t) t * sq_qd);
+        std::copy(qkv_h.data() + base + sq_qd, qkv_h.data() + base + sq_qd + sq_kvd, want_sk.data() + (size_t) t * sq_kvd);
+        std::copy(qkv_h.data() + base + sq_qd + sq_kvd, qkv_h.data() + base + sq_qd + 2 * sq_kvd, want_sv.data() + (size_t) t * sq_kvd);
+    }
+    bad += report("DSpark split_qkv (Q)", host(d_sq, want_sq.size()), want_sq, 0.0);
+    bad += report("DSpark split_qkv (K)", host(d_sk, want_sk.size()), want_sk, 0.0);
+    bad += report("DSpark split_qkv (V)", host(d_sv, want_sv.size()), want_sv, 0.0);
+    cudaFree(d_qkv); cudaFree(d_sq); cudaFree(d_sk); cudaFree(d_sv);
+
+    // 7. inkling_dspark_attend vs FP64 bidirectional block window reference (FP16, Q8_0, Q4_0)
+    auto run_dspark_attend = [&](const char* label, int nh, int nkv, int64_t pos, int blk_rows, int win, int ring, int kv_mode) {
+        const int dim = 128;
+        const int64_t total_kv = pos + blk_rows;
+        const int cache_rows = ring > 0 ? ring : (int) total_kv;
+        const int width = nkv * dim, nb = width / 32;
+        const float scale = 1.0f / std::sqrt((float) dim);
+
+        auto k_all = random_vec((size_t) total_kv * width, 0.6f);
+        auto v_all = random_vec((size_t) total_kv * width, 0.6f);
+        auto q_h = random_vec((size_t) blk_rows * nh * dim, 0.6f);
+
+        std::vector<uint16_t> k16((size_t) cache_rows * width, 0), v16((size_t) cache_rows * width, 0);
+        std::vector<int8_t> k8c((size_t) cache_rows * width, 0), v8c((size_t) cache_rows * width, 0);
+        std::vector<uint8_t> k4c((size_t) cache_rows * (width / 2), 0), v4c((size_t) cache_rows * (width / 2), 0);
+        std::vector<uint16_t> ks((size_t) cache_rows * nb, 0), vs((size_t) cache_rows * nb, 0);
+        std::vector<float> k_ref((size_t) total_kv * width), v_ref((size_t) total_kv * width);
+
+        for (int64_t p = 0; p < total_kv; ++p) {
+            const int64_t r = ring > 0 ? (p % ring) : p;
+            if (kv_mode == 0) {
+                for (int i = 0; i < width; ++i) {
+                    __half hk = __float2half(k_all[(size_t) p * width + i]);
+                    __half hv = __float2half(v_all[(size_t) p * width + i]);
+                    k16[(size_t) r * width + i] = __half_as_ushort(hk);
+                    v16[(size_t) r * width + i] = __half_as_ushort(hv);
+                    k_ref[(size_t) p * width + i] = __half2float(hk);
+                    v_ref[(size_t) p * width + i] = __half2float(hv);
+                }
+            } else if (kv_mode == 1) {
+                for (int b = 0; b < nb; ++b) {
+                    float ak = 0.f, av = 0.f;
+                    for (int j = 0; j < 32; ++j) {
+                        ak = std::max(ak, std::abs(k_all[(size_t) p * width + b * 32 + j]));
+                        av = std::max(av, std::abs(v_all[(size_t) p * width + b * 32 + j]));
+                    }
+                    __half dkh = __float2half(ak / 127.0f), dvh = __float2half(av / 127.0f);
+                    float dkf = __half2float(dkh), dvf = __half2float(dvh);
+                    ks[(size_t) r * nb + b] = __half_as_ushort(dkh);
+                    vs[(size_t) r * nb + b] = __half_as_ushort(dvh);
+                    for (int j = 0; j < 32; ++j) {
+                        int qk = dkf > 0 ? std::clamp((int) std::llrint(k_all[(size_t) p * width + b * 32 + j] / dkf), -127, 127) : 0;
+                        int qv = dvf > 0 ? std::clamp((int) std::llrint(v_all[(size_t) p * width + b * 32 + j] / dvf), -127, 127) : 0;
+                        k8c[(size_t) r * width + b * 32 + j] = (int8_t) qk;
+                        v8c[(size_t) r * width + b * 32 + j] = (int8_t) qv;
+                        k_ref[(size_t) p * width + b * 32 + j] = qk * dkf;
+                        v_ref[(size_t) p * width + b * 32 + j] = qv * dvf;
+                    }
+                }
+            } else if (kv_mode == 2) {
+                for (int b = 0; b < nb; ++b) {
+                    float ak = 0.f, av = 0.f;
+                    for (int j = 0; j < 32; ++j) {
+                        ak = std::max(ak, std::abs(k_all[(size_t) p * width + b * 32 + j]));
+                        av = std::max(av, std::abs(v_all[(size_t) p * width + b * 32 + j]));
+                    }
+                    __half dkh = __float2half(ak / 7.0f), dvh = __float2half(av / 7.0f);
+                    float dkf = __half2float(dkh), dvf = __half2float(dvh);
+                    ks[(size_t) r * nb + b] = __half_as_ushort(dkh);
+                    vs[(size_t) r * nb + b] = __half_as_ushort(dvh);
+                    for (int j = 0; j < 16; ++j) {
+                        int k0 = dkf > 0 ? std::clamp((int) std::llrint(k_all[(size_t) p * width + b * 32 + j] / dkf), -8, 7) + 8 : 8;
+                        int k1 = dkf > 0 ? std::clamp((int) std::llrint(k_all[(size_t) p * width + b * 32 + 16 + j] / dkf), -8, 7) + 8 : 8;
+                        int v0 = dvf > 0 ? std::clamp((int) std::llrint(v_all[(size_t) p * width + b * 32 + j] / dvf), -8, 7) + 8 : 8;
+                        int v1 = dvf > 0 ? std::clamp((int) std::llrint(v_all[(size_t) p * width + b * 32 + 16 + j] / dvf), -8, 7) + 8 : 8;
+                        k4c[(size_t) r * (width / 2) + b * 16 + j] = (uint8_t) (k0 | (k1 << 4));
+                        v4c[(size_t) r * (width / 2) + b * 16 + j] = (uint8_t) (v0 | (v1 << 4));
+                        k_ref[(size_t) p * width + b * 32 + j] = (k0 - 8) * dkf;
+                        k_ref[(size_t) p * width + b * 32 + 16 + j] = (k1 - 8) * dkf;
+                        v_ref[(size_t) p * width + b * 32 + j] = (v0 - 8) * dvf;
+                        v_ref[(size_t) p * width + b * 32 + 16 + j] = (v1 - 8) * dvf;
+                    }
+                }
+            } else {
+                for (int b = 0; b < nb; ++b) {
+                    float ak = 0.f, av = 0.f;
+                    for (int j = 0; j < 32; ++j) {
+                        ak = std::max(ak, std::abs(k_all[(size_t) p * width + b * 32 + j]));
+                        av = std::max(av, std::abs(v_all[(size_t) p * width + b * 32 + j]));
+                    }
+                    __half dkh = __float2half(ak / 127.0f), dvh = __float2half(av / 7.0f);
+                    float dkf = __half2float(dkh), dvf = __half2float(dvh);
+                    ks[(size_t) r * nb + b] = __half_as_ushort(dkh);
+                    vs[(size_t) r * nb + b] = __half_as_ushort(dvh);
+                    for (int j = 0; j < 32; ++j) {
+                        int qk = dkf > 0 ? std::clamp((int) std::llrint(k_all[(size_t) p * width + b * 32 + j] / dkf), -127, 127) : 0;
+                        k8c[(size_t) r * width + b * 32 + j] = (int8_t) qk;
+                        k_ref[(size_t) p * width + b * 32 + j] = qk * dkf;
+                    }
+                    for (int j = 0; j < 16; ++j) {
+                        int v0 = dvf > 0 ? std::clamp((int) std::llrint(v_all[(size_t) p * width + b * 32 + j] / dvf), -8, 7) + 8 : 8;
+                        int v1 = dvf > 0 ? std::clamp((int) std::llrint(v_all[(size_t) p * width + b * 32 + 16 + j] / dvf), -8, 7) + 8 : 8;
+                        v4c[(size_t) r * (width / 2) + b * 16 + j] = (uint8_t) (v0 | (v1 << 4));
+                        v_ref[(size_t) p * width + b * 32 + j] = (v0 - 8) * dvf;
+                        v_ref[(size_t) p * width + b * 32 + 16 + j] = (v1 - 8) * dvf;
+                    }
+                }
+            }
+        }
+
+        float *d_q = dev(q_h), *d_sc = dev(std::vector<float>((size_t) blk_rows * nh * 64 * (dim + 2), 0.f)),
+              *d_o = dev(std::vector<float>((size_t) blk_rows * nh * dim, 0.f));
+        uint16_t *d_k16 = kv_mode == 0 ? dev(k16) : nullptr, *d_v16 = kv_mode == 0 ? dev(v16) : nullptr;
+        int8_t *d_k8 = (kv_mode == 1 || kv_mode == 3) ? dev(k8c) : nullptr, *d_v8 = kv_mode == 1 ? dev(v8c) : nullptr;
+        uint8_t *d_k4 = kv_mode == 2 ? dev(k4c) : nullptr, *d_v4 = (kv_mode == 2 || kv_mode == 3) ? dev(v4c) : nullptr;
+        uint16_t *d_ks = kv_mode > 0 ? dev(ks) : nullptr, *d_vs = kv_mode > 0 ? dev(vs) : nullptr;
+        Kvq8 kq8{d_k8, d_ks}, vq8{d_v8, d_vs};
+        Kvq4 kq4{d_k4, d_ks}, vq4{d_v4, d_vs};
+
+        inkling_dspark_attend(d_q, d_k16, d_v16, pos, blk_rows, d_sc, d_o, dim, nh, nkv, scale, nullptr,
+                              win, ring, nullptr, 0, kq8, vq8, kq4, vq4);
+        cudaDeviceSynchronize();
+
+        std::vector<float> want_o((size_t) blk_rows * nh * dim);
+        const int per = nh / nkv;
+        for (int t = 0; t < blk_rows; ++t) {
+            const int64_t q_pos = pos + t;
+            const int64_t lo = (win > 0 && q_pos >= win) ? (q_pos - win + 1) : 0;
+            const int64_t end = pos + blk_rows - 1;
+            for (int h = 0; h < nh; ++h) {
+                const int kvh = h / per;
+                std::vector<double> scores((size_t) (end - lo + 1));
+                double mx = -INFINITY;
+                for (int64_t j = lo; j <= end; ++j) {
+                    double dot = 0.0;
+                    for (int d = 0; d < dim; ++d)
+                        dot += (double) q_h[((size_t) t * nh + h) * dim + d] * k_ref[(size_t) j * width + kvh * dim + d];
+                    const double s = dot * scale;
+                    scores[(size_t) (j - lo)] = s;
+                    mx = std::max(mx, s);
+                }
+                double sum = 0.0;
+                std::vector<double> acc(dim, 0.0);
+                for (size_t idx = 0; idx < scores.size(); ++idx) {
+                    const double w = std::exp(scores[idx] - mx);
+                    sum += w;
+                    for (int d = 0; d < dim; ++d)
+                        acc[d] += w * v_ref[(size_t) (lo + idx) * width + kvh * dim + d];
+                }
+                for (int d = 0; d < dim; ++d)
+                    want_o[((size_t) t * nh + h) * dim + d] = (float) (acc[d] / sum);
+            }
+        }
+        bad += report(label, host(d_o, want_o.size()), want_o, 1e-4);
+        cudaFree(d_q); cudaFree(d_sc); cudaFree(d_o);
+        cudaFree(d_k16); cudaFree(d_v16); cudaFree(d_k8); cudaFree(d_v8);
+        cudaFree(d_k4); cudaFree(d_v4); cudaFree(d_ks); cudaFree(d_vs);
+    };
+    run_dspark_attend("DSpark attend local SWA ring FP16", 24, 8, 28, 8, 17, 24, 0);
+    run_dspark_attend("DSpark attend global split-K FP16", 24, 8, 1100, 8, 0, 0, 0);
+    run_dspark_attend("DSpark attend global split-K Q8_0", 24, 8, 1100, 8, 0, 0, 1);
+    run_dspark_attend("DSpark attend global split-K Q4_0", 24, 8, 1100, 8, 0, 0, 2);
+    run_dspark_attend("DSpark attend global split-K K8V4", 24, 8, 1100, 8, 0, 0, 3);
     return bad;
 }
 

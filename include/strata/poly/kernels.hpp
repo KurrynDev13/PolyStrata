@@ -439,8 +439,9 @@ void inkling_control_prep(const float* cur, const float* msg, float* out_concat,
                           void* stream);
 
 /// Apply cross-pass control gates: out = cur * (1 - tanh(forget_raw)) + msg * tanh(gain_raw).
+/// When `gf_stride > 0`, row t of `gain_raw` and `forget_raw` starts t * gf_stride floats apart.
 void inkling_control_apply(const float* cur, const float* msg, const float* gain_raw, const float* forget_raw,
-                           float* out, int n_embd, int rows, void* stream);
+                           float* out, int n_embd, int rows, void* stream, int gf_stride = 0);
 
 /// Causal 4-tap short convolution + residual + 1/sqrt(5) (static) or 1/3 (dynamic) scaling.
 /// `state` holds 3 past inputs per channel, oldest first. When `dyn` is non-null ([rows, n_heads, 4]),
@@ -501,11 +502,22 @@ void inkling_dspark_extract_taps(const float* r, int n_streams, int first_tap_st
                                  int rows, void* stream);
 void inkling_dspark_mix_norm(const float* taps012, const float* tap3, float a0, float a1, float a2, float a3,
                              const float* w_norm, float* out, int n_embd, int rows, float eps, void* stream);
-void inkling_dspark_rnn_gate(const float* gates, const float* bias, float* state, float* latent, int rank,
-                             void* stream);
+void inkling_dspark_prep_rnn_step(const float* state, const uint16_t* w1_bf16, int32_t anchor_tok,
+                                  const Likeliest* picks, int step, int anchor_slot, int rank, int w1_vocab,
+                                  float* rnn_in_sp, void* stream);
+void inkling_dspark_rnn_gate(const float* gates_sp, const float* gates_h, const float* gates_f, const float* bias,
+                             float* state, float* latent, int rank, void* stream);
 void inkling_dspark_add_softcap(const float* base, const float* delta, const float* bias, float* out, int n, float cap,
                                 void* stream);
 void inkling_dspark_pack_q8_0_block(const float* cols32, uint8_t* dst_q8, int n_vocab, int block_idx, int n_blocks,
                                     void* stream);
+void inkling_dspark_pack_q4_0_block(const float* cols32, uint8_t* dst_q4, int n_vocab, int block_idx, int n_blocks,
+                                    void* stream);
+void inkling_dspark_split_qkv(const float* qkv, float* qraw, float* kraw, float* v, int q_dim, int kv_dim, int rows,
+                              void* stream);
+void inkling_dspark_attend(const float* q, const uint16_t* kcache, const uint16_t* vcache, int64_t pos, int rows,
+                           float* score, float* out, int dim, int n_head, int kv_heads, float scale, void* stream,
+                           int window = 0, int ring = 0, const long long* at = nullptr, int room = 0,
+                           Kvq8 kq8 = {}, Kvq8 vq8 = {}, Kvq4 kq4 = {}, Kvq4 vq4 = {});
 
 }  // namespace strata::poly

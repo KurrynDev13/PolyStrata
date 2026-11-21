@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
 #include <stdexcept>
 
 namespace strata::poly {
@@ -260,17 +261,111 @@ void Inkling2::load_layer(int il) {
     const int64_t n_extent = B.swa ? window_ : n_rel_extent_;
     const int64_t q_dim = (int64_t) n_head_ * head_dim_;
     const int64_t kv_dim = (int64_t) n_kv_ * head_dim_;
+    const int64_t rel_dim = (int64_t) n_rel_ * n_head_;
+
+    auto can_fuse_as_is = [&](const TensorInfo* t, int64_t a, int64_t b) {
+        return t && t->shape.size() == 2 && (int64_t) t->shape[0] == a && (int64_t) t->shape[1] == b &&
+               global_scale(*t) == 1.f &&
+               (t->type == kTypeF32 || t->type == kTypeBF16 || kernels::native_mmvq_supported((int) t->type));
+    };
+    auto concat_same_type = [&](std::initializer_list<std::pair<const char*, int64_t>> names, int64_t n_in,
+                                Dev& fused, std::initializer_list<Dev*> views) {
+        std::vector<const TensorInfo*> ts;
+        std::vector<size_t> bytes;
+        int64_t total_out = 0;
+        size_t total_bytes = 0;
+        uint32_t type = 0;
+        for (const auto& [name, n_out] : names) {
+            const TensorInfo* t = tensor(il, name);
+            if (!t) throw std::runtime_error("the GGUF has no tensor " + blk(il, name));
+            if (ts.empty()) type = t->type;
+            const size_t b = home(*t).payload(*t);
+            ts.push_back(t);
+            bytes.push_back(b);
+            total_out += n_out;
+            total_bytes += b;
+        }
+        if (type == kTypeBF16) bf16_max_ = std::max(bf16_max_, (size_t) n_in * (size_t) total_out);
+        fused = Dev{dense_ ? dense_ + dense_at_ : nullptr, type, (int) n_in, (int) total_out, 1.f};
+        dense_at_ += pad(total_bytes) + kTail;
+        if (dense_ && dense_at_ > dense_bytes_)
+            throw std::logic_error("the dense arena is too small for fused tensor " + ts[0]->name);
+        size_t off = 0;
+        size_t idx = 0;
+        auto v_it = views.begin();
+        auto n_it = names.begin();
+        for (; idx < ts.size(); ++idx, ++v_it, ++n_it) {
+            Dev* vp = *v_it;
+            *vp = Dev{dense_ ? (uint8_t*) fused.p + off : nullptr, type, (int) n_in, (int) n_it->second, 1.f};
+            if (dense_) {
+                h2d(vp->p, home(*ts[idx]).data(*ts[idx]), bytes[idx]);
+                uploaded_.emplace_back(home(*ts[idx]).data(*ts[idx]), bytes[idx]);
+            }
+            off += bytes[idx];
+        }
+    };
 
     L.fixed = true;
     L.ffn_norm = f32("ffn_norm.weight", n_embd_);
-    B.wq = mat("attn_q.weight", n_embd_, q_dim);
-    B.wk = mat("attn_k.weight", n_embd_, kv_dim);
-    B.wv = mat("attn_v.weight", n_embd_, kv_dim);
+    {
+        const TensorInfo* tq = tensor(il, "attn_q.weight");
+        const TensorInfo* tg = tensor(il, "attn_gate.weight");
+        const TensorInfo* tr = tensor(il, "attn_rel.weight");
+        const TensorInfo* ts = tensor(il, "attn_sink_proj.weight");
+        const bool fuse_qg = can_fuse_as_is(tq, n_embd_, q_dim) && can_fuse_as_is(tg, n_embd_, q_dim) &&
+                             tq->type == tg->type;
+        if (fuse_qg) {
+            const bool fuse_r = can_fuse_as_is(tr, n_embd_, rel_dim) && tr->type == tq->type;
+            const bool fuse_s = can_fuse_as_is(ts, n_embd_, n_head_) && ts->type == tq->type;
+            B.wq_fuse_flags = 1 | (fuse_r ? 2 : 0) | (fuse_s ? 4 : 0);
+            int off_rows = (int) (2 * q_dim);
+            if (fuse_r && fuse_s) {
+                B.wq_rel_off = off_rows;
+                B.wq_sink_off = off_rows + (int) rel_dim;
+                concat_same_type({{"attn_q.weight", q_dim}, {"attn_gate.weight", q_dim},
+                                  {"attn_rel.weight", rel_dim}, {"attn_sink_proj.weight", n_head_}},
+                                 n_embd_, B.wq_fused, {&B.wq, &B.wqkv_gate, &B.attn_rel, &B.attn_sink_proj});
+            } else if (fuse_r) {
+                B.wq_rel_off = off_rows;
+                concat_same_type({{"attn_q.weight", q_dim}, {"attn_gate.weight", q_dim},
+                                  {"attn_rel.weight", rel_dim}},
+                                 n_embd_, B.wq_fused, {&B.wq, &B.wqkv_gate, &B.attn_rel});
+                B.attn_sink_proj = mat("attn_sink_proj.weight", n_embd_, n_head_);
+            } else if (fuse_s) {
+                B.wq_sink_off = off_rows;
+                concat_same_type({{"attn_q.weight", q_dim}, {"attn_gate.weight", q_dim},
+                                  {"attn_sink_proj.weight", n_head_}},
+                                 n_embd_, B.wq_fused, {&B.wq, &B.wqkv_gate, &B.attn_sink_proj});
+                B.attn_rel = mat("attn_rel.weight", n_embd_, rel_dim);
+            } else {
+                concat_same_type({{"attn_q.weight", q_dim}, {"attn_gate.weight", q_dim}},
+                                 n_embd_, B.wq_fused, {&B.wq, &B.wqkv_gate});
+                B.attn_rel = mat("attn_rel.weight", n_embd_, rel_dim);
+                B.attn_sink_proj = mat("attn_sink_proj.weight", n_embd_, n_head_);
+            }
+        } else {
+            B.wq = mat("attn_q.weight", n_embd_, q_dim);
+            B.wqkv_gate = mat("attn_gate.weight", n_embd_, q_dim);
+            B.attn_sink_proj = mat("attn_sink_proj.weight", n_embd_, n_head_);
+            B.attn_rel = mat("attn_rel.weight", n_embd_, rel_dim);
+        }
+    }
+    if (B.swa) {
+        const TensorInfo* tk = tensor(il, "attn_k.weight");
+        const TensorInfo* tv = tensor(il, "attn_v.weight");
+        if (can_fuse_as_is(tk, n_embd_, kv_dim) && can_fuse_as_is(tv, n_embd_, kv_dim) && tk->type == tv->type) {
+            concat_same_type({{"attn_k.weight", kv_dim}, {"attn_v.weight", kv_dim}},
+                             n_embd_, B.wkv_fused, {&B.wk, &B.wv});
+        } else {
+            B.wk = mat("attn_k.weight", n_embd_, kv_dim);
+            B.wv = mat("attn_v.weight", n_embd_, kv_dim);
+        }
+    } else {
+        B.wk = mat("attn_k.weight", n_embd_, kv_dim);
+        B.wv = mat("attn_v.weight", n_embd_, kv_dim);
+    }
     B.wo = mat("attn_output.weight", q_dim, n_embd_);
-    B.wqkv_gate = mat("attn_gate.weight", n_embd_, q_dim);
     B.attn_q_clip = f32("attn_q_clip.weight", head_dim_, n_head_);
-    B.attn_sink_proj = mat("attn_sink_proj.weight", n_embd_, n_head_);
-    B.attn_rel = mat("attn_rel.weight", n_embd_, (int64_t) n_rel_ * n_head_);
     B.attn_rel_bias = f32("attn_rel_bias.weight", n_rel_, n_extent);
     B.attn_rel_clip = f32("attn_rel_clip.weight", n_rel_, n_head_);
     B.attn_k_conv = f32("attn_k_conv.weight", l_conv_, kv_dim);
@@ -330,8 +425,16 @@ void Inkling2::load_layer(int il) {
                                        "loop_v_ctrl_forget.weight", "loop_ffn_ctrl_forget.weight"};
         for (int c = 0; c < 4; ++c) {
             B.ctrl_down[c] = mat(down_names[c], 2 * n_embd_, gate_rank_);
-            B.ctrl_gain[c] = mat(gain_names[c], gate_rank_, n_embd_);
-            B.ctrl_forget[c] = mat(forget_names[c], gate_rank_, n_embd_);
+            const TensorInfo* tgn = tensor(il, gain_names[c]);
+            const TensorInfo* tfg = tensor(il, forget_names[c]);
+            if (can_fuse_as_is(tgn, gate_rank_, n_embd_) && can_fuse_as_is(tfg, gate_rank_, n_embd_) &&
+                tgn->type == tfg->type) {
+                concat_same_type({{gain_names[c], n_embd_}, {forget_names[c], n_embd_}},
+                                 gate_rank_, B.ctrl_gf[c], {&B.ctrl_gain[c], &B.ctrl_forget[c]});
+            } else {
+                B.ctrl_gain[c] = mat(gain_names[c], gate_rank_, n_embd_);
+                B.ctrl_forget[c] = mat(forget_names[c], gate_rank_, n_embd_);
+            }
         }
     }
 
@@ -358,44 +461,80 @@ size_t Inkling2::recurrent_floats() const {
     return schedule_.size() * slot_conv_floats_;
 }
 
-size_t Inkling2::kv_code_row_bytes() const {
+size_t Inkling2::kv_code_row_bytes(bool value) const {
     const size_t row = (size_t) n_kv_ * head_dim_;
-    if (opt_.kv_format == KvFmt::kQ4_0) return row / 2;
-    if (opt_.kv_format == KvFmt::kQ8_0) return row;
+    if (opt_.kv_format == KvFmt::kQ4_0 || (value && opt_.kv_format == KvFmt::kK8V4)) return row / 2;
+    if (opt_.kv_format == KvFmt::kQ8_0 || (!value && opt_.kv_format == KvFmt::kK8V4)) return row;
     return row * sizeof(uint16_t);
 }
 
 size_t Inkling2::kv_scale_row_bytes() const {
-    const bool quant = opt_.kv_format == KvFmt::kQ8_0 || opt_.kv_format == KvFmt::kQ4_0;
+    const bool quant =
+        opt_.kv_format == KvFmt::kQ8_0 || opt_.kv_format == KvFmt::kQ4_0 || opt_.kv_format == KvFmt::kK8V4;
     return quant ? (size_t) n_kv_ * (head_dim_ / 32) * sizeof(uint16_t) : 0;
+}
+
+size_t Inkling2::dspark_kv_code_row_bytes(bool value) const {
+    const size_t row = (size_t) dspark_kv_ * dspark_head_dim_;
+    if (opt_.kv_format == KvFmt::kQ4_0 || (value && opt_.kv_format == KvFmt::kK8V4)) return row / 2;
+    if (opt_.kv_format == KvFmt::kQ8_0 || (!value && opt_.kv_format == KvFmt::kK8V4)) return row;
+    return row * sizeof(uint16_t);
+}
+
+size_t Inkling2::dspark_kv_scale_row_bytes() const {
+    const bool quant =
+        opt_.kv_format == KvFmt::kQ8_0 || opt_.kv_format == KvFmt::kQ4_0 || opt_.kv_format == KvFmt::kK8V4;
+    return quant ? (size_t) dspark_kv_ * (dspark_head_dim_ / 32) * sizeof(uint16_t) : 0;
 }
 
 uint8_t* Inkling2::slot_k_codes(const SlotCache& sc) const {
     if (opt_.kv_format == KvFmt::kQ4_0) return sc.k_q4;
-    if (opt_.kv_format == KvFmt::kQ8_0) return (uint8_t*) sc.k_codes;
+    if (opt_.kv_format == KvFmt::kQ8_0 || opt_.kv_format == KvFmt::kK8V4) return (uint8_t*) sc.k_codes;
     return (uint8_t*) sc.keys;
 }
 
 uint8_t* Inkling2::slot_v_codes(const SlotCache& sc) const {
-    if (opt_.kv_format == KvFmt::kQ4_0) return sc.v_q4;
+    if (opt_.kv_format == KvFmt::kQ4_0 || opt_.kv_format == KvFmt::kK8V4) return sc.v_q4;
     if (opt_.kv_format == KvFmt::kQ8_0) return (uint8_t*) sc.v_codes;
     return (uint8_t*) sc.vals;
+}
+
+uint8_t* Inkling2::dspark_k_codes(const DsparkLayer& dl) const {
+    if (dl.local) return (uint8_t*) dl.dk;
+    if (opt_.kv_format == KvFmt::kQ4_0) return dl.dk_q4;
+    if (opt_.kv_format == KvFmt::kQ8_0 || opt_.kv_format == KvFmt::kK8V4) return (uint8_t*) dl.dk_codes;
+    return (uint8_t*) dl.dk;
+}
+
+uint8_t* Inkling2::dspark_v_codes(const DsparkLayer& dl) const {
+    if (dl.local) return (uint8_t*) dl.dv;
+    if (opt_.kv_format == KvFmt::kQ4_0 || opt_.kv_format == KvFmt::kK8V4) return dl.dv_q4;
+    if (opt_.kv_format == KvFmt::kQ8_0) return (uint8_t*) dl.dv_codes;
+    return (uint8_t*) dl.dv;
 }
 
 void Inkling2::alloc_caches() {
     ring_ = std::min(opt_.max_context, window_ + rows_);
     keep_ = std::min(window_, ring_);
-    const bool q8 = opt_.kv_format == KvFmt::kQ8_0;
-    const bool q4 = opt_.kv_format == KvFmt::kQ4_0;
-    const bool quant = q8 || q4;
+    const bool k_q8 = opt_.kv_format == KvFmt::kQ8_0 || opt_.kv_format == KvFmt::kK8V4;
+    const bool k_q4 = opt_.kv_format == KvFmt::kQ4_0;
+    const bool v_q8 = opt_.kv_format == KvFmt::kQ8_0;
+    const bool v_q4 = opt_.kv_format == KvFmt::kQ4_0 || opt_.kv_format == KvFmt::kK8V4;
+    const bool quant = k_q8 || k_q4 || v_q8 || v_q4;
     const size_t row = (size_t) n_kv_ * head_dim_;
-    const size_t code_row = kv_code_row_bytes();
+    const size_t k_code = kv_code_row_bytes(false);
+    const size_t v_code = kv_code_row_bytes(true);
     const size_t scale_row = kv_scale_row_bytes();
-    if (quant && again_ == SIZE_MAX)
-        std::fprintf(stderr, "strata-poly: inkling2 %s KV cache: %zu bytes/row (%d global, %d SWA)\n",
-                     q4 ? "q4_0" : "q8_0", code_row + scale_row, n_global_slots_, n_swa_slots_);
+    if (quant && again_ == SIZE_MAX) {
+        if (opt_.kv_format == KvFmt::kK8V4)
+            std::fprintf(stderr, "strata-poly: inkling2 k8v4 KV cache: %zu K + %zu V bytes/row (%d global, %d SWA)\n",
+                         k_code + scale_row, v_code + scale_row, n_global_slots_, n_swa_slots_);
+        else
+            std::fprintf(stderr, "strata-poly: inkling2 %s KV cache: %zu bytes/row (%d global, %d SWA)\n",
+                         k_q4 ? "q4_0" : "q8_0", k_code + scale_row, n_global_slots_, n_swa_slots_);
+    }
 
-    const size_t swa_codes = 2 * (size_t) n_swa_slots_ * (size_t) ring_ * code_row;
+    const size_t swa_codes = (size_t) n_swa_slots_ * (size_t) ring_ * (k_code + v_code);
     const size_t swa_scales = quant ? 2 * (size_t) n_swa_slots_ * (size_t) ring_ * scale_row : 0;
 
     uint8_t* rc = quant ? (uint8_t*) seq_alloc(swa_codes, "the attention cache") : nullptr;
@@ -413,22 +552,15 @@ void Inkling2::alloc_caches() {
         sc.state_off = s * slot_conv_floats_;
         if (B.swa) {
             sc.swa_idx = swa_idx++;
-            if (q4) {
-                sc.k_q4 = rc;
-                rc += (size_t) ring_ * code_row;
+            if (quant) {
+                if (k_q4) sc.k_q4 = rc;
+                else sc.k_codes = (int8_t*) rc;
+                rc += (size_t) ring_ * k_code;
                 sc.k_scales = (uint16_t*) rs;
                 rs += (size_t) ring_ * scale_row;
-                sc.v_q4 = rc;
-                rc += (size_t) ring_ * code_row;
-                sc.v_scales = (uint16_t*) rs;
-                rs += (size_t) ring_ * scale_row;
-            } else if (q8) {
-                sc.k_codes = (int8_t*) rc;
-                rc += (size_t) ring_ * code_row;
-                sc.k_scales = (uint16_t*) rs;
-                rs += (size_t) ring_ * scale_row;
-                sc.v_codes = (int8_t*) rc;
-                rc += (size_t) ring_ * code_row;
+                if (v_q4) sc.v_q4 = rc;
+                else sc.v_codes = (int8_t*) rc;
+                rc += (size_t) ring_ * v_code;
                 sc.v_scales = (uint16_t*) rs;
                 rs += (size_t) ring_ * scale_row;
             } else {
@@ -437,15 +569,12 @@ void Inkling2::alloc_caches() {
                 sc.vals = kv;
                 kv += (size_t) ring_ * row;
             }
-        } else if (q4) {
-            sc.k_q4 = (uint8_t*) kv_alloc(code_row, 1);
+        } else if (quant) {
+            if (k_q4) sc.k_q4 = (uint8_t*) kv_alloc(k_code, 1);
+            else sc.k_codes = (int8_t*) kv_alloc(k_code, 1);
             sc.k_scales = (uint16_t*) kv_alloc(scale_row, 1);
-            sc.v_q4 = (uint8_t*) kv_alloc(code_row, 1);
-            sc.v_scales = (uint16_t*) kv_alloc(scale_row, 1);
-        } else if (q8) {
-            sc.k_codes = (int8_t*) kv_alloc(code_row, 1);
-            sc.k_scales = (uint16_t*) kv_alloc(scale_row, 1);
-            sc.v_codes = (int8_t*) kv_alloc(code_row, 1);
+            if (v_q4) sc.v_q4 = (uint8_t*) kv_alloc(v_code, 1);
+            else sc.v_codes = (int8_t*) kv_alloc(v_code, 1);
             sc.v_scales = (uint16_t*) kv_alloc(scale_row, 1);
         } else {
             sc.keys = (uint16_t*) kv_alloc(row * sizeof(uint16_t), 1);
@@ -455,10 +584,20 @@ void Inkling2::alloc_caches() {
 
     if (dspark_) {
         const size_t d_row = (size_t) dspark_kv_ * dspark_head_dim_ * sizeof(uint16_t);
+        const size_t dk_code = dspark_kv_code_row_bytes(false);
+        const size_t dv_code = dspark_kv_code_row_bytes(true);
+        const size_t d_scale_row = dspark_kv_scale_row_bytes();
         for (DsparkLayer& dl : dspark_l_) {
             if (dl.local) {
                 dl.dk = (uint16_t*) seq_alloc((size_t) dspark_ring_ * d_row, "dspark swa k");
                 dl.dv = (uint16_t*) seq_alloc((size_t) dspark_ring_ * d_row, "dspark swa v");
+            } else if (quant) {
+                if (k_q4) dl.dk_q4 = (uint8_t*) kv_alloc(dk_code, 1);
+                else dl.dk_codes = (int8_t*) kv_alloc(dk_code, 1);
+                dl.dk_scales = (uint16_t*) kv_alloc(d_scale_row, 1);
+                if (v_q4) dl.dv_q4 = (uint8_t*) kv_alloc(dv_code, 1);
+                else dl.dv_codes = (int8_t*) kv_alloc(dv_code, 1);
+                dl.dv_scales = (uint16_t*) kv_alloc(d_scale_row, 1);
             } else {
                 dl.dk = (uint16_t*) kv_alloc(d_row, 1);
                 dl.dv = (uint16_t*) kv_alloc(d_row, 1);
@@ -481,15 +620,18 @@ int Inkling2::widest() const {
 
 void Inkling2::assign_scratch() {
     const size_t n = (size_t) rows_;
-    const size_t heads = n * n_head_ * head_dim_;
-    const size_t kv = n * n_kv_ * head_dim_;
+    const size_t n_d = dspark_ ? std::max(n, (size_t) dspark_block_) : n;
+    const size_t heads = n_d * n_head_ * head_dim_;
+    const size_t kv = n_d * n_kv_ * head_dim_;
     inputs_buf_ = fbuf(3 * n * n_embd_);
     msg_ = fbuf(4 * n * n_embd_);
     ctrl_cat_ = fbuf(n * 2 * n_embd_);
     ctrl_r_ = fbuf(n * gate_rank_);
-    ctrl_g_ = fbuf(n * n_embd_);
+    ctrl_g_ = fbuf(2 * n * n_embd_);
     ctrl_f_ = fbuf(n * n_embd_);
     inp_sa_ = fbuf(n * n_embd_);
+    q_fused_buf_ = fbuf(2 * (size_t) n_head_ * head_dim_ + (size_t) n_rel_ * n_head_ + (size_t) n_head_);
+    kv_fused_buf_ = fbuf(2 * (size_t) n_kv_ * head_dim_);
 
     qraw_ = fbuf(heads);
     q_ = fbuf(heads);
@@ -509,44 +651,64 @@ void Inkling2::assign_scratch() {
     const size_t n_splits_max = (size_t) std::clamp((opt_.max_context + 511) / 512, 1, 64);
     score_n_ = std::max((size_t) chunk_dec_ * n_head_ * n_splits_max * (head_dim_ + 2),
                         (size_t) chunk_batch_ * n_head_ * 1536);
-    if (dspark_) score_n_ = std::max(score_n_, (size_t) dspark_block_ * dspark_heads_ * 1536);
+    if (dspark_) {
+        score_n_ = std::max(score_n_, (size_t) dspark_block_ * dspark_heads_ *
+                                          std::max<size_t>(1536, n_splits_max * (dspark_head_dim_ + 2)));
+    }
     score_ = fbuf(score_n_);
 
     const size_t ch_base = rows_ >= kStageRows ? (size_t) chunk_batch_ * n_head_ : 0;
     const size_t ch = dspark_ ? std::max(ch_base, (size_t) dspark_block_ * dspark_heads_) : ch_base;
     if (ch > 0) awork_ = fbuf(ch * (head_dim_ + head_dim_ / 2 + 3) + 1);
-    if (rows_ >= kStageRows && (opt_.kv_format == KvFmt::kQ8_0 || opt_.kv_format == KvFmt::kQ4_0)) {
+    if (rows_ >= kStageRows &&
+        (opt_.kv_format == KvFmt::kQ8_0 || opt_.kv_format == KvFmt::kQ4_0 || opt_.kv_format == KvFmt::kK8V4)) {
         work_halves_ = kQ8WorkRows * (size_t) n_kv_ * head_dim_;
         q8w_ = fbuf((2 * work_halves_ + 1) / 2);
     }
     if (dspark_) {
+        const size_t blk = (size_t) dspark_block_;
+        const size_t q_dim = (size_t) dspark_heads_ * dspark_head_dim_;
+        const size_t kv_dim = (size_t) dspark_kv_ * dspark_head_dim_;
+        const int dv = draft_rows();
         d_taps_ = fbuf((size_t) std::max(rows_, opt_.window) * 3 * n_embd_);
         d_f_rnn_ = fbuf((size_t) n_embd_);
-        d_blk_x_ = fbuf((size_t) dspark_block_ * n_embd_);
-        d_blk_h_ = fbuf((size_t) (dspark_block_ - 1) * n_embd_);
-        d_blk_qraw_ = fbuf((size_t) dspark_block_ * dspark_heads_ * dspark_head_dim_);
-        d_blk_gate_ = fbuf((size_t) dspark_block_ * dspark_ff_);
-        d_blk_up_ = fbuf((size_t) dspark_block_ * dspark_ff_);
-        d_base_logits_ = fbuf((size_t) (dspark_block_ - 1) * n_vocab_);
-        d_markov_bias_ = fbuf((size_t) n_vocab_);
-        d_rnn_in_ = fbuf((size_t) (2 * dspark_rank_ + 2 * n_embd_));
+        d_blk_x_ = fbuf(blk * n_embd_);
+        d_blk_xn_ = fbuf(blk * n_embd_);
+        d_blk_h_ = fbuf((blk - 1) * n_embd_);
+        d_blk_qkv_ = fbuf(blk * (q_dim + 2 * kv_dim));
+        d_blk_qraw_ = fbuf(blk * q_dim);
+        d_blk_kraw_ = fbuf(blk * kv_dim);
+        d_blk_attn_ = fbuf(blk * n_embd_);
+        d_blk_gate_ = fbuf(blk * dspark_ff_);
+        d_blk_up_ = fbuf(blk * dspark_ff_);
+        d_base_logits_ = fbuf((blk - 1) * (size_t) dv);
+        d_markov_bias_ = fbuf((size_t) dv);
+        d_rnn_in_ = fbuf((size_t) (2 * dspark_rank_));
         d_rnn_gates_ = fbuf((size_t) (3 * dspark_rank_));
+        d_rnn_h_gates_ = fbuf((blk - 1) * (size_t) (3 * dspark_rank_));
+        d_rnn_f_gates_ = fbuf((size_t) (3 * dspark_rank_));
         d_rnn_state_ = fbuf((size_t) dspark_rank_);
         d_rnn_latent_ = fbuf((size_t) dspark_rank_);
+        d_blk_xq_ = (void*) fbuf((blk * kernels::native_q8_1_bytes(n_embd_) + 3) / 4);
+        d_blk_q8ff_ = (void*) fbuf((blk * kernels::native_q8_1_bytes(dspark_ff_) + 3) / 4);
+        d_block_picks_ = (Likeliest*) fbuf(2 * blk);
     }
 }
 
 size_t Inkling2::card_row_bytes() const {
-    const size_t code_row = kv_code_row_bytes();
+    const size_t k_code = kv_code_row_bytes(false);
+    const size_t v_code = kv_code_row_bytes(true);
     const size_t scale_row = kv_scale_row_bytes();
     size_t layers = 0;
     for (const SlotCache& sc : slots_)
         if (!sc.swa && slot_k_codes(sc) != nullptr) ++layers;
-    size_t bytes = layers * 2 * (code_row + scale_row);
+    size_t bytes = layers * (k_code + v_code + 2 * scale_row);
     if (dspark_) {
-        const size_t d_row = (size_t) dspark_kv_ * dspark_head_dim_ * sizeof(uint16_t);
+        const size_t dk_code = dspark_kv_code_row_bytes(false);
+        const size_t dv_code = dspark_kv_code_row_bytes(true);
+        const size_t d_scale = dspark_kv_scale_row_bytes();
         for (const DsparkLayer& dl : dspark_l_)
-            if (!dl.local && dl.dk != nullptr) bytes += 2 * d_row;
+            if (!dl.local && dspark_k_codes(dl) != nullptr) bytes += dk_code + dv_code + 2 * d_scale;
     }
     return bytes;
 }
@@ -555,40 +717,58 @@ void Inkling2::save_card_rows(int64_t first, int64_t n, uint8_t* dst) {
     if (first < 0 || n < 0 || first + n > opt_.max_context)
         throw std::logic_error("save_rows: the rows are outside the context");
     ck(cudaStreamSynchronize(cs(st_)), "save rows");
-    const bool quant = opt_.kv_format == KvFmt::kQ8_0 || opt_.kv_format == KvFmt::kQ4_0;
-    const size_t code_row = kv_code_row_bytes();
+    const bool quant =
+        opt_.kv_format == KvFmt::kQ8_0 || opt_.kv_format == KvFmt::kQ4_0 || opt_.kv_format == KvFmt::kK8V4;
+    const size_t k_code = kv_code_row_bytes(false);
+    const size_t v_code = kv_code_row_bytes(true);
     const size_t scale_row = kv_scale_row_bytes();
-    const size_t at_c = (size_t) first * code_row, at_s = (size_t) first * scale_row;
-    const size_t n_c = (size_t) n * code_row, n_s = (size_t) n * scale_row;
+    const size_t at_kc = (size_t) first * k_code, at_vc = (size_t) first * v_code, at_s = (size_t) first * scale_row;
+    const size_t n_kc = (size_t) n * k_code, n_vc = (size_t) n * v_code, n_s = (size_t) n * scale_row;
     for (const SlotCache& sc : slots_) {
         const uint8_t* kptr = slot_k_codes(sc);
         const uint8_t* vptr = slot_v_codes(sc);
         if (sc.swa || n == 0 || kptr == nullptr) continue;
         if (quant) {
-            ck(cudaMemcpy(dst, kptr + at_c, n_c, cudaMemcpyDeviceToHost), "save rows");
-            dst += n_c;
+            ck(cudaMemcpy(dst, kptr + at_kc, n_kc, cudaMemcpyDeviceToHost), "save rows");
+            dst += n_kc;
             ck(cudaMemcpy(dst, (const uint8_t*) sc.k_scales + at_s, n_s, cudaMemcpyDeviceToHost), "save rows");
             dst += n_s;
-            ck(cudaMemcpy(dst, vptr + at_c, n_c, cudaMemcpyDeviceToHost), "save rows");
-            dst += n_c;
+            ck(cudaMemcpy(dst, vptr + at_vc, n_vc, cudaMemcpyDeviceToHost), "save rows");
+            dst += n_vc;
             ck(cudaMemcpy(dst, (const uint8_t*) sc.v_scales + at_s, n_s, cudaMemcpyDeviceToHost), "save rows");
             dst += n_s;
             continue;
         }
-        for (const uint8_t* cache : {kptr, vptr}) {
-            ck(cudaMemcpy(dst, cache + at_c, n_c, cudaMemcpyDeviceToHost), "save rows");
-            dst += n_c;
-        }
+        ck(cudaMemcpy(dst, kptr + at_kc, n_kc, cudaMemcpyDeviceToHost), "save rows");
+        dst += n_kc;
+        ck(cudaMemcpy(dst, vptr + at_vc, n_vc, cudaMemcpyDeviceToHost), "save rows");
+        dst += n_vc;
     }
     if (dspark_ && n > 0) {
-        const size_t d_row = (size_t) dspark_kv_ * dspark_head_dim_ * sizeof(uint16_t);
-        const size_t dat = (size_t) first * d_row, dn = (size_t) n * d_row;
+        const size_t dk_code = dspark_kv_code_row_bytes(false);
+        const size_t dv_code = dspark_kv_code_row_bytes(true);
+        const size_t d_scale = dspark_kv_scale_row_bytes();
+        const size_t dat_kc = (size_t) first * dk_code, dat_vc = (size_t) first * dv_code, dat_s = (size_t) first * d_scale;
+        const size_t dn_kc = (size_t) n * dk_code, dn_vc = (size_t) n * dv_code, dn_s = (size_t) n * d_scale;
         for (const DsparkLayer& dl : dspark_l_) {
-            if (dl.local || dl.dk == nullptr) continue;
-            ck(cudaMemcpy(dst, (const uint8_t*) dl.dk + dat, dn, cudaMemcpyDeviceToHost), "save dspark rows");
-            dst += dn;
-            ck(cudaMemcpy(dst, (const uint8_t*) dl.dv + dat, dn, cudaMemcpyDeviceToHost), "save dspark rows");
-            dst += dn;
+            const uint8_t* dkptr = dspark_k_codes(dl);
+            const uint8_t* dvptr = dspark_v_codes(dl);
+            if (dl.local || dkptr == nullptr) continue;
+            if (quant) {
+                ck(cudaMemcpy(dst, dkptr + dat_kc, dn_kc, cudaMemcpyDeviceToHost), "save dspark rows");
+                dst += dn_kc;
+                ck(cudaMemcpy(dst, (const uint8_t*) dl.dk_scales + dat_s, dn_s, cudaMemcpyDeviceToHost), "save dspark rows");
+                dst += dn_s;
+                ck(cudaMemcpy(dst, dvptr + dat_vc, dn_vc, cudaMemcpyDeviceToHost), "save dspark rows");
+                dst += dn_vc;
+                ck(cudaMemcpy(dst, (const uint8_t*) dl.dv_scales + dat_s, dn_s, cudaMemcpyDeviceToHost), "save dspark rows");
+                dst += dn_s;
+            } else {
+                ck(cudaMemcpy(dst, dkptr + dat_kc, dn_kc, cudaMemcpyDeviceToHost), "save dspark rows");
+                dst += dn_kc;
+                ck(cudaMemcpy(dst, dvptr + dat_vc, dn_vc, cudaMemcpyDeviceToHost), "save dspark rows");
+                dst += dn_vc;
+            }
         }
     }
 }
@@ -598,43 +778,65 @@ void Inkling2::load_card_rows(const uint8_t* src, int64_t from, int64_t count, i
         throw std::logic_error("load_rows: the rows are outside what was saved");
     cover(first + n);
     ck(cudaStreamSynchronize(cs(st_)), "load rows");
-    const bool quant = opt_.kv_format == KvFmt::kQ8_0 || opt_.kv_format == KvFmt::kQ4_0;
-    const size_t code_row = kv_code_row_bytes();
+    const bool quant =
+        opt_.kv_format == KvFmt::kQ8_0 || opt_.kv_format == KvFmt::kQ4_0 || opt_.kv_format == KvFmt::kK8V4;
+    const size_t k_code = kv_code_row_bytes(false);
+    const size_t v_code = kv_code_row_bytes(true);
     const size_t scale_row = kv_scale_row_bytes();
-    const size_t at_c = (size_t) first * code_row, at_s = (size_t) first * scale_row;
-    const size_t n_c = (size_t) n * code_row, n_s = (size_t) n * scale_row;
-    const size_t sk_c = (size_t) (first - from) * code_row, sk_s = (size_t) (first - from) * scale_row;
-    const size_t all_c = (size_t) count * code_row, all_s = (size_t) count * scale_row;
+    const size_t at_kc = (size_t) first * k_code, at_vc = (size_t) first * v_code, at_s = (size_t) first * scale_row;
+    const size_t n_kc = (size_t) n * k_code, n_vc = (size_t) n * v_code, n_s = (size_t) n * scale_row;
+    const size_t sk_kc = (size_t) (first - from) * k_code, sk_vc = (size_t) (first - from) * v_code,
+                 sk_s = (size_t) (first - from) * scale_row;
+    const size_t all_kc = (size_t) count * k_code, all_vc = (size_t) count * v_code, all_s = (size_t) count * scale_row;
     for (const SlotCache& sc : slots_) {
         uint8_t* kptr = slot_k_codes(sc);
         uint8_t* vptr = slot_v_codes(sc);
         if (sc.swa || n == 0 || kptr == nullptr) continue;
         if (quant) {
-            ck(cudaMemcpy(kptr + at_c, src + sk_c, n_c, cudaMemcpyHostToDevice), "load rows");
-            src += all_c;
+            ck(cudaMemcpy(kptr + at_kc, src + sk_kc, n_kc, cudaMemcpyHostToDevice), "load rows");
+            src += all_kc;
             ck(cudaMemcpy((uint8_t*) sc.k_scales + at_s, src + sk_s, n_s, cudaMemcpyHostToDevice), "load rows");
             src += all_s;
-            ck(cudaMemcpy(vptr + at_c, src + sk_c, n_c, cudaMemcpyHostToDevice), "load rows");
-            src += all_c;
+            ck(cudaMemcpy(vptr + at_vc, src + sk_vc, n_vc, cudaMemcpyHostToDevice), "load rows");
+            src += all_vc;
             ck(cudaMemcpy((uint8_t*) sc.v_scales + at_s, src + sk_s, n_s, cudaMemcpyHostToDevice), "load rows");
             src += all_s;
             continue;
         }
-        for (uint8_t* cache : {kptr, vptr}) {
-            ck(cudaMemcpy(cache + at_c, src + sk_c, n_c, cudaMemcpyHostToDevice), "load rows");
-            src += all_c;
-        }
+        ck(cudaMemcpy(kptr + at_kc, src + sk_kc, n_kc, cudaMemcpyHostToDevice), "load rows");
+        src += all_kc;
+        ck(cudaMemcpy(vptr + at_vc, src + sk_vc, n_vc, cudaMemcpyHostToDevice), "load rows");
+        src += all_vc;
     }
     if (dspark_ && n > 0) {
-        const size_t d_row = (size_t) dspark_kv_ * dspark_head_dim_ * sizeof(uint16_t);
-        const size_t dat = (size_t) first * d_row, dn = (size_t) n * d_row;
-        const size_t dsk = (size_t) (first - from) * d_row, dall = (size_t) count * d_row;
+        const size_t dk_code = dspark_kv_code_row_bytes(false);
+        const size_t dv_code = dspark_kv_code_row_bytes(true);
+        const size_t d_scale = dspark_kv_scale_row_bytes();
+        const size_t dat_kc = (size_t) first * dk_code, dat_vc = (size_t) first * dv_code, dat_s = (size_t) first * d_scale;
+        const size_t dn_kc = (size_t) n * dk_code, dn_vc = (size_t) n * dv_code, dn_s = (size_t) n * d_scale;
+        const size_t dsk_kc = (size_t) (first - from) * dk_code, dsk_vc = (size_t) (first - from) * dv_code,
+                     dsk_s = (size_t) (first - from) * d_scale;
+        const size_t dall_kc = (size_t) count * dk_code, dall_vc = (size_t) count * dv_code,
+                     dall_s = (size_t) count * d_scale;
         for (DsparkLayer& dl : dspark_l_) {
-            if (dl.local || dl.dk == nullptr) continue;
-            ck(cudaMemcpy((uint8_t*) dl.dk + dat, src + dsk, dn, cudaMemcpyHostToDevice), "load dspark rows");
-            src += dall;
-            ck(cudaMemcpy((uint8_t*) dl.dv + dat, src + dsk, dn, cudaMemcpyHostToDevice), "load dspark rows");
-            src += dall;
+            uint8_t* dkptr = dspark_k_codes(dl);
+            uint8_t* dvptr = dspark_v_codes(dl);
+            if (dl.local || dkptr == nullptr) continue;
+            if (quant) {
+                ck(cudaMemcpy(dkptr + dat_kc, src + dsk_kc, dn_kc, cudaMemcpyHostToDevice), "load dspark rows");
+                src += dall_kc;
+                ck(cudaMemcpy((uint8_t*) dl.dk_scales + dat_s, src + dsk_s, dn_s, cudaMemcpyHostToDevice), "load dspark rows");
+                src += dall_s;
+                ck(cudaMemcpy(dvptr + dat_vc, src + dsk_vc, dn_vc, cudaMemcpyHostToDevice), "load dspark rows");
+                src += dall_vc;
+                ck(cudaMemcpy((uint8_t*) dl.dv_scales + dat_s, src + dsk_s, dn_s, cudaMemcpyHostToDevice), "load dspark rows");
+                src += dall_s;
+            } else {
+                ck(cudaMemcpy(dkptr + dat_kc, src + dsk_kc, dn_kc, cudaMemcpyHostToDevice), "load dspark rows");
+                src += dall_kc;
+                ck(cudaMemcpy(dvptr + dat_vc, src + dsk_vc, dn_vc, cudaMemcpyHostToDevice), "load dspark rows");
+                src += dall_vc;
+            }
         }
     }
 }
@@ -649,7 +851,8 @@ void Inkling2::window_runs(int64_t pos, F&& f) const {
 }
 
 size_t Inkling2::extra_bytes() const {
-    size_t bytes = (size_t) n_swa_slots_ * 2 * (size_t) keep_ * (kv_code_row_bytes() + kv_scale_row_bytes());
+    size_t bytes = (size_t) n_swa_slots_ * (size_t) keep_ *
+                   (kv_code_row_bytes(false) + kv_code_row_bytes(true) + 2 * kv_scale_row_bytes());
     if (dspark_) {
         const size_t kv_row = (size_t) dspark_kv_ * dspark_head_dim_ * sizeof(uint16_t);
         size_t n_local = 0;
@@ -666,10 +869,12 @@ void Inkling2::save_layer(int slot, int64_t pos, uint8_t* dst) {
                   slot_conv_floats_ * sizeof(float), cudaMemcpyDeviceToHost),
        "save state");
     if (!sc.swa) return;
-    const bool quant = opt_.kv_format == KvFmt::kQ8_0 || opt_.kv_format == KvFmt::kQ4_0;
-    const size_t code_row = kv_code_row_bytes();
+    const bool quant =
+        opt_.kv_format == KvFmt::kQ8_0 || opt_.kv_format == KvFmt::kQ4_0 || opt_.kv_format == KvFmt::kK8V4;
+    const size_t k_code = kv_code_row_bytes(false);
+    const size_t v_code = kv_code_row_bytes(true);
     const size_t scale_row = kv_scale_row_bytes();
-    const size_t whole = 2 * (size_t) keep_ * (code_row + scale_row);
+    const size_t whole = (size_t) keep_ * (k_code + v_code + 2 * scale_row);
     dst += state_n_ * sizeof(float) + (size_t) sc.swa_idx * whole;
     auto save_ring = [&](const uint8_t* cache, size_t one_row) {
         std::memset(dst, 0, (size_t) keep_ * one_row);
@@ -682,19 +887,21 @@ void Inkling2::save_layer(int slot, int64_t pos, uint8_t* dst) {
     const uint8_t* kptr = slot_k_codes(sc);
     const uint8_t* vptr = slot_v_codes(sc);
     if (quant) {
-        save_ring(kptr, code_row);
+        save_ring(kptr, k_code);
         save_ring((const uint8_t*) sc.k_scales, scale_row);
-        save_ring(vptr, code_row);
+        save_ring(vptr, v_code);
         save_ring((const uint8_t*) sc.v_scales, scale_row);
         return;
     }
-    save_ring(kptr, code_row);
-    save_ring(vptr, code_row);
+    save_ring(kptr, k_code);
+    save_ring(vptr, v_code);
 }
 
 void Inkling2::load_extra(const uint8_t* src, int64_t pos) {
-    const bool quant = opt_.kv_format == KvFmt::kQ8_0 || opt_.kv_format == KvFmt::kQ4_0;
-    const size_t code_row = kv_code_row_bytes();
+    const bool quant =
+        opt_.kv_format == KvFmt::kQ8_0 || opt_.kv_format == KvFmt::kQ4_0 || opt_.kv_format == KvFmt::kK8V4;
+    const size_t k_code = kv_code_row_bytes(false);
+    const size_t v_code = kv_code_row_bytes(true);
     const size_t scale_row = kv_scale_row_bytes();
     for (const SlotCache& sc : slots_) {
         if (!sc.swa) continue;
@@ -708,19 +915,20 @@ void Inkling2::load_extra(const uint8_t* src, int64_t pos) {
         uint8_t* kptr = slot_k_codes(sc);
         uint8_t* vptr = slot_v_codes(sc);
         if (quant) {
-            load_ring(kptr, code_row);
+            load_ring(kptr, k_code);
             load_ring((uint8_t*) sc.k_scales, scale_row);
-            load_ring(vptr, code_row);
+            load_ring(vptr, v_code);
             load_ring((uint8_t*) sc.v_scales, scale_row);
             continue;
         }
-        load_ring(kptr, code_row);
-        load_ring(vptr, code_row);
+        load_ring(kptr, k_code);
+        load_ring(vptr, v_code);
     }
     if (!dspark_) return;
     const size_t f_bytes = (size_t) n_embd_ * sizeof(float);
     ck(cudaMemcpyAsync(d_f_rnn_, src, f_bytes, cudaMemcpyHostToDevice, cs(st_)), "load dspark f_rnn");
     src += f_bytes;
+    lin(dspark_rnn_f_, d_f_rnn_, d_rnn_f_gates_, 1);
     const size_t kv_row = (size_t) dspark_kv_ * dspark_head_dim_ * sizeof(uint16_t);
     const size_t keep_d = (size_t) dspark_window_;
     const int64_t lo = std::max<int64_t>(0, pos - dspark_window_);
@@ -750,6 +958,11 @@ int Inkling2::head_key(int slot, int n) const {
 void Inkling2::apply_ctrl(const float* cur, const float* msg, const Block& B, int ctrl, float* out, int n) {
     inkling_control_prep(cur, msg, ctrl_cat_, n_embd_, n, 1e-6f, st_);
     lin(B.ctrl_down[ctrl], ctrl_cat_, ctrl_r_, n);
+    if (B.ctrl_gf[ctrl].p) {
+        lin(B.ctrl_gf[ctrl], ctrl_r_, ctrl_g_, n);
+        inkling_control_apply(cur, msg, ctrl_g_, ctrl_g_ + n_embd_, out, n_embd_, n, st_, 2 * n_embd_);
+        return;
+    }
     lin(B.ctrl_gain[ctrl], ctrl_r_, ctrl_g_, n);
     lin(B.ctrl_forget[ctrl], ctrl_r_, ctrl_f_, n);
     inkling_control_apply(cur, msg, ctrl_g_, ctrl_f_, out, n_embd_, n, st_);
@@ -757,7 +970,9 @@ void Inkling2::apply_ctrl(const float* cur, const float* msg, const Block& B, in
 
 void Inkling2::store(const float* x, const SlotCache& sc, int64_t pos, int n, bool value) {
     const int width = n_kv_ * head_dim_;
-    if (opt_.kv_format == KvFmt::kQ4_0) {
+    const bool use_q4 = opt_.kv_format == KvFmt::kQ4_0 || (value && opt_.kv_format == KvFmt::kK8V4);
+    const bool use_q8 = opt_.kv_format == KvFmt::kQ8_0 || (!value && opt_.kv_format == KvFmt::kK8V4);
+    if (use_q4) {
         uint8_t* codes = value ? sc.v_q4 : sc.k_q4;
         uint16_t* scales = value ? sc.v_scales : sc.k_scales;
         if (recording_) return store_q4_at(x, codes, scales, width, at_, n, sc.swa ? ring_ : 0, st_);
@@ -767,7 +982,7 @@ void Inkling2::store(const float* x, const SlotCache& sc, int64_t pos, int n, bo
         if (head < n) store_q4(x + (size_t) head * width, codes, scales, width, 0, n - head, st_);
         return;
     }
-    if (opt_.kv_format == KvFmt::kQ8_0) {
+    if (use_q8) {
         int8_t* codes = value ? sc.v_codes : sc.k_codes;
         uint16_t* scales = value ? sc.v_scales : sc.k_scales;
         if (recording_) return store_q8_at(x, codes, scales, width, at_, n, sc.swa ? ring_ : 0, st_);
@@ -841,36 +1056,57 @@ void Inkling2::attn(const Step& st, Block& B, SlotCache& sc, int64_t pos, int n)
     const Dev& nv = B.swa ? L.attn_norm : B.v_inp_norm;
 
     kernels::native_add_rms_norm_q8_1(in0, nullptr, fp(nq), xn_, xq_, n_embd_, n, rms_eps_, threads, st_);
-    lin(B.wq, xn_, qraw_, n, xq_);
-    lin(B.attn_rel, xn_, r_raw_, n, xq_);
-    lin(B.attn_sink_proj, xn_, sinks_, n, xq_);
-    lin(B.wqkv_gate, xn_, gate_, n, xq_);
-
-    if (!share_swa) {
-        kernels::native_add_rms_norm_q8_1(in1, nullptr, fp(nk), xn_, xq_, n_embd_, n, rms_eps_, threads, st_);
+    const float *qraw_p = qraw_, *gate_p = gate_, *r_raw_p = r_raw_, *sinks_p = sinks_;
+    if (n == 1 && B.wq_fused.p) {
+        lin(B.wq_fused, xn_, q_fused_buf_, 1, xq_);
+        qraw_p = q_fused_buf_;
+        gate_p = q_fused_buf_ + (size_t) n_head_ * head_dim_;
+        if (B.wq_fuse_flags & 2) r_raw_p = q_fused_buf_ + B.wq_rel_off;
+        else lin(B.attn_rel, xn_, r_raw_, 1, xq_);
+        if (B.wq_fuse_flags & 4) sinks_p = q_fused_buf_ + B.wq_sink_off;
+        else lin(B.attn_sink_proj, xn_, sinks_, 1, xq_);
+    } else {
+        lin(B.wq, xn_, qraw_, n, xq_);
+        lin(B.attn_rel, xn_, r_raw_, n, xq_);
+        lin(B.attn_sink_proj, xn_, sinks_, n, xq_);
+        lin(B.wqkv_gate, xn_, gate_, n, xq_);
     }
-    lin(B.wk, xn_, kraw_, n, xq_);
-    if (!B.swa) lin(B.k_conv_proj, xn_, dyn_, n, xq_);
-    inkling_conv4(kraw_, state_ + sc.state_off + off_k_conv_, fp(B.attn_k_conv), B.swa ? nullptr : dyn_, head_dim_,
-                  k_, n_kv_ * head_dim_, n, st_, snap_bits_ ? snap_at_ + sc.state_off + off_k_conv_ : nullptr, rec_n_,
-                  snap_bits_);
 
-    if (!share_swa) {
-        kernels::native_add_rms_norm_q8_1(in2, nullptr, fp(nv), xn_, xq_, n_embd_, n, rms_eps_, threads, st_);
+    if (share_swa && n == 1 && B.wkv_fused.p) {
+        lin(B.wkv_fused, xn_, kv_fused_buf_, 1, xq_);
+        inkling_conv4(kv_fused_buf_, state_ + sc.state_off + off_k_conv_, fp(B.attn_k_conv), nullptr, head_dim_,
+                      k_, n_kv_ * head_dim_, 1, st_, snap_bits_ ? snap_at_ + sc.state_off + off_k_conv_ : nullptr,
+                      rec_n_, snap_bits_);
+        inkling_conv4(kv_fused_buf_ + (size_t) n_kv_ * head_dim_, state_ + sc.state_off + off_v_conv_,
+                      fp(B.attn_v_conv), nullptr, head_dim_, v_, n_kv_ * head_dim_, 1, st_,
+                      snap_bits_ ? snap_at_ + sc.state_off + off_v_conv_ : nullptr, rec_n_, snap_bits_);
+    } else {
+        if (!share_swa) {
+            kernels::native_add_rms_norm_q8_1(in1, nullptr, fp(nk), xn_, xq_, n_embd_, n, rms_eps_, threads, st_);
+        }
+        lin(B.wk, xn_, kraw_, n, xq_);
+        if (!B.swa) lin(B.k_conv_proj, xn_, dyn_, n, xq_);
+        inkling_conv4(kraw_, state_ + sc.state_off + off_k_conv_, fp(B.attn_k_conv), B.swa ? nullptr : dyn_, head_dim_,
+                      k_, n_kv_ * head_dim_, n, st_, snap_bits_ ? snap_at_ + sc.state_off + off_k_conv_ : nullptr,
+                      rec_n_, snap_bits_);
+
+        if (!share_swa) {
+            kernels::native_add_rms_norm_q8_1(in2, nullptr, fp(nv), xn_, xq_, n_embd_, n, rms_eps_, threads, st_);
+        }
+        lin(B.wv, xn_, kraw_, n, xq_);
+        if (!B.swa) lin(B.v_conv_proj, xn_, dyn_, n, xq_);
+        inkling_conv4(kraw_, state_ + sc.state_off + off_v_conv_, fp(B.attn_v_conv), B.swa ? nullptr : dyn_, head_dim_,
+                      v_, n_kv_ * head_dim_, n, st_, snap_bits_ ? snap_at_ + sc.state_off + off_v_conv_ : nullptr,
+                      rec_n_, snap_bits_);
     }
-    lin(B.wv, xn_, kraw_, n, xq_);
-    if (!B.swa) lin(B.v_conv_proj, xn_, dyn_, n, xq_);
-    inkling_conv4(kraw_, state_ + sc.state_off + off_v_conv_, fp(B.attn_v_conv), B.swa ? nullptr : dyn_, head_dim_,
-                  v_, n_kv_ * head_dim_, n, st_, snap_bits_ ? snap_at_ + sc.state_off + off_v_conv_ : nullptr, rec_n_,
-                  snap_bits_);
 
     // 4. L2 clip + global tau(pos) on Q & R, L2 clip on K, parameterless RMSNorm on V
-    inkling_l2_clip(qraw_, fp(B.attn_q_clip), q_, head_dim_, n_head_, qk_clip_, pos, !B.swa, (float) log_floor_,
+    inkling_l2_clip(qraw_p, fp(B.attn_q_clip), q_, head_dim_, n_head_, qk_clip_, pos, !B.swa, (float) log_floor_,
                     log_alpha_, n, at, st_);
     inkling_l2_clip(k_, nullptr, k_, head_dim_, n_kv_, qk_clip_, pos, false, (float) log_floor_, 0.f, n, nullptr,
                     st_);
     rms_norm(v_, nullptr, v_, head_dim_, n * n_kv_, rms_eps_, st_);
-    inkling_l2_clip(r_raw_, fp(B.attn_rel_clip), r_cur_, n_rel_, n_head_, rel_clip_, pos, !B.swa, (float) log_floor_,
+    inkling_l2_clip(r_raw_p, fp(B.attn_rel_clip), r_cur_, n_rel_, n_head_, rel_clip_, pos, !B.swa, (float) log_floor_,
                     log_alpha_, n, at, st_);
 
     // 5. Store K and V into slot cache
@@ -881,18 +1117,20 @@ void Inkling2::attn(const Step& st, Block& B, SlotCache& sc, int64_t pos, int n)
     const float scale = 1.f / std::sqrt((float) head_dim_);
     const int window = B.swa ? window_ : 0, ring = B.swa ? ring_ : 0;
     const int n_extent = B.swa ? window_ : n_rel_extent_;
-    const bool q8 = opt_.kv_format == KvFmt::kQ8_0;
-    const bool q4 = opt_.kv_format == KvFmt::kQ4_0;
-    const bool quant = q8 || q4;
-    const Kvq8 kq = q8 ? Kvq8{sc.k_codes, sc.k_scales} : Kvq8{};
-    const Kvq8 vq = q8 ? Kvq8{sc.v_codes, sc.v_scales} : Kvq8{};
-    const Kvq4 kq4 = q4 ? Kvq4{sc.k_q4, sc.k_scales} : Kvq4{};
-    const Kvq4 vq4 = q4 ? Kvq4{sc.v_q4, sc.v_scales} : Kvq4{};
+    const bool k_q8 = opt_.kv_format == KvFmt::kQ8_0 || opt_.kv_format == KvFmt::kK8V4;
+    const bool k_q4 = opt_.kv_format == KvFmt::kQ4_0;
+    const bool v_q8 = opt_.kv_format == KvFmt::kQ8_0;
+    const bool v_q4 = opt_.kv_format == KvFmt::kQ4_0 || opt_.kv_format == KvFmt::kK8V4;
+    const bool quant = k_q8 || k_q4 || v_q8 || v_q4;
+    const Kvq8 kq = k_q8 ? Kvq8{sc.k_codes, sc.k_scales} : Kvq8{};
+    const Kvq8 vq = v_q8 ? Kvq8{sc.v_codes, sc.v_scales} : Kvq8{};
+    const Kvq4 kq4 = k_q4 ? Kvq4{sc.k_q4, sc.k_scales} : Kvq4{};
+    const Kvq4 vq4 = v_q4 ? Kvq4{sc.v_q4, sc.v_scales} : Kvq4{};
     const int c_step = n >= kStageRows ? chunk_batch_ : chunk_dec_;
     for (int first = 0; first < n; first += c_step) {
         const int c = std::min(c_step, n - first);
         const float* r_sub = r_cur_ + (size_t) first * n_head_ * n_rel_;
-        const float* s_sub = sinks_ + (size_t) first * n_head_;
+        const float* s_sub = sinks_p + (size_t) first * n_head_;
         const float* q_sub = q_ + (size_t) first * n_head_ * head_dim_;
         float* att_sub = att_ + (size_t) first * n_head_ * head_dim_;
         inkling_rel_table(r_sub, fp(B.attn_rel_bias), s_sub, table_, n_rel_, n_extent, n_head_, c, st_);
@@ -913,7 +1151,7 @@ void Inkling2::attn(const Step& st, Block& B, SlotCache& sc, int64_t pos, int n)
     }
 
     // 7. Sigmoid gate -> wo -> post-conv4
-    mul_sigmoid(att_, gate_, n_head_ * head_dim_, n, n_head_ * head_dim_, false, st_);
+    mul_sigmoid(att_, gate_p, n_head_ * head_dim_, n, n_head_ * head_dim_, false, st_);
     lin(B.wo, att_, cur_, n);
     inkling_conv4(cur_, state_ + sc.state_off + off_attn_post_, fp(B.attn_post_conv), nullptr, 0, ao_, n_embd_, n, st_,
                   snap_bits_ ? snap_at_ + sc.state_off + off_attn_post_ : nullptr, rec_n_, snap_bits_);
@@ -1024,6 +1262,19 @@ void Inkling2::route(int il, const float* logits, int32_t, int* ids, float* w, f
     }
 }
 
+void Inkling2::route_weights(int, const float* logits, const int* ids, float* w) const {
+    float sum = 0.f;
+    for (int k = 0; k < n_used_; ++k) {
+        w[k] = 1.f / (1.f + std::exp(-logits[ids[k]]));
+        sum += w[k];
+    }
+    const float denom = std::max(sum, kMinWeightSum);
+    for (int k = 0; k < n_used_; ++k) {
+        w[k] /= denom;
+        if (w_scale_ != 0.f) w[k] *= w_scale_;
+    }
+}
+
 bool Inkling2::route_card(int il, int n, int32_t* ids, float* w) {
     const Block& B = blocks_[(size_t) il];
     route_rows(rl_, n_expert_, n_used_, n, 1, 1.f, fp(B.probs_b_dev), nullptr, true, w_scale_, ids, w, st_);
@@ -1047,13 +1298,95 @@ void Inkling2::load_drafter() {
     auto dvec = [&](const std::string& name, int64_t a) -> Dev {
         return upload(dtensor(name), name, a, 1, kF32);
     };
+    auto reserve_dense = [&](size_t bytes, uint32_t type, int n_in, int n_out) -> Dev {
+        const size_t aligned = pad(bytes);
+        const Dev d{dense_ ? dense_ + dense_at_ : nullptr, type, n_in, n_out, 1.f};
+        dense_at_ += aligned + kTail;
+        if (dense_ && dense_at_ > dense_bytes_)
+            throw std::logic_error("the dense arena is too small for dspark weights");
+        return d;
+    };
+    auto dmat_cat = [&](std::initializer_list<std::pair<std::string, int64_t>> parts, int64_t n_in, Dev& fused,
+                        std::initializer_list<Dev*> views) {
+        int64_t total_out = 0;
+        for (const auto& kv : parts) total_out += kv.second;
+        const size_t q_row = ggml_row_size(GGML_TYPE_Q4_0, n_in);
+        const size_t total_bytes = q_row * (size_t) total_out;
+        fused = reserve_dense(total_bytes, (uint32_t) GGML_TYPE_Q4_0, (int) n_in, (int) total_out);
+
+        std::vector<uint8_t> q(dense_ ? total_bytes : 0);
+        size_t off_rows = 0;
+        auto p_it = parts.begin();
+        auto v_it = views.begin();
+        for (; p_it != parts.end(); ++p_it, ++v_it) {
+            const TensorInfo* t = dtensor(p_it->first);
+            const int64_t n_out = p_it->second;
+            const uint64_t rest = t->elements() / std::max<uint64_t>(t->shape[0], 1);
+            if ((int64_t) t->shape[0] != n_in || (int64_t) rest != n_out)
+                throw std::runtime_error(t->name + " has unexpected shape");
+            *(*v_it) = Dev{dense_ ? (uint8_t*) fused.p + off_rows * q_row : nullptr, (uint32_t) GGML_TYPE_Q4_0,
+                           (int) n_in, (int) n_out, 1.f};
+            if (dense_) {
+                const size_t t_bytes = dg_->payload(*t);
+                uploaded_.emplace_back(dg_->data(*t), t_bytes);
+                const ggml_to_float_t to_float = ggml_get_type_traits((ggml_type) t->type)->to_float;
+                if (!to_float) throw std::runtime_error(t->name + " unsupported type");
+                std::vector<float> f((size_t) n_in * (size_t) n_out);
+                to_float(dg_->data(*t), f.data(), (int64_t) f.size());
+                ggml_quantize_chunk(GGML_TYPE_Q4_0, f.data(), q.data() + off_rows * q_row, 0, n_out, n_in, nullptr);
+            }
+            off_rows += (size_t) n_out;
+        }
+        if (dense_) h2d(fused.p, q.data(), total_bytes);
+    };
+    auto dmat_cols_q4 = [&](const TensorInfo* t, int64_t col_off, int64_t slice_in, int64_t n_out) -> Dev {
+        const size_t q_row = ggml_row_size(GGML_TYPE_Q4_0, slice_in);
+        const size_t out_bytes = q_row * (size_t) n_out;
+        Dev d = reserve_dense(out_bytes, (uint32_t) GGML_TYPE_Q4_0, (int) slice_in, (int) n_out);
+        if (!dense_) return d;
+        const size_t in_row = dg_->payload(*t) / (size_t) n_out;
+        const size_t elem_bytes = ggml_type_size((ggml_type) t->type);
+        const ggml_to_float_t to_float = ggml_get_type_traits((ggml_type) t->type)->to_float;
+        if (!to_float || ggml_blck_size((ggml_type) t->type) != 1)
+            throw std::runtime_error(t->name + " must have unblocked type for column slicing");
+        const uint8_t* src = (const uint8_t*) dg_->data(*t);
+        std::vector<float> f((size_t) n_out * (size_t) slice_in);
+        for (int64_t r = 0; r < n_out; ++r)
+            to_float(src + (size_t) r * in_row + (size_t) col_off * elem_bytes, f.data() + (size_t) r * slice_in,
+                     slice_in);
+        std::vector<uint8_t> q(out_bytes);
+        ggml_quantize_chunk(GGML_TYPE_Q4_0, f.data(), q.data(), 0, n_out, slice_in, nullptr);
+        h2d(d.p, q.data(), out_bytes);
+        return d;
+    };
 
     dspark_mask_ = dvec("mask_embed", n_embd_);
     dspark_norm_ = dvec("norm.weight", n_embd_);
     dspark_rnn_norm_ = dvec("markov_head.dflare_norm.weight", n_embd_);
-    dspark_rnn_proj_ = dmat("markov_head.rnn_proj.weight", 2 * (int64_t) dspark_rank_ + 2 * n_embd_,
-                            3 * (int64_t) dspark_rank_);
+    {
+        const TensorInfo* rw = dtensor("markov_head.rnn_proj.weight");
+        const int64_t rnn_in = 2 * (int64_t) dspark_rank_ + 2 * n_embd_;
+        const int64_t rnn_out = 3 * (int64_t) dspark_rank_;
+        if (rw->shape.size() != 2 || (int64_t) rw->shape[0] != rnn_in || (int64_t) rw->shape[1] != rnn_out)
+            throw std::runtime_error("dspark markov_head.rnn_proj.weight has wrong shape");
+        if (dense_) uploaded_.emplace_back(dg_->data(*rw), dg_->payload(*rw));
+        dspark_rnn_sp_ = dmat_cols_q4(rw, 0, 2 * (int64_t) dspark_rank_, rnn_out);
+        dspark_rnn_h_ = dmat_cols_q4(rw, 2 * (int64_t) dspark_rank_, n_embd_, rnn_out);
+        dspark_rnn_f_ = dmat_cols_q4(rw, 2 * (int64_t) dspark_rank_ + n_embd_, n_embd_, rnn_out);
+    }
     dspark_rnn_bias_ = dvec("markov_head.rnn_proj.bias", 3 * (int64_t) dspark_rank_);
+    {
+        const TensorInfo* w1 = dtensor("markov_head.markov_w1.weight");
+        if (w1->type != kTypeBF16 || w1->shape.size() != 2 || (int64_t) w1->shape[0] != dspark_rank_ ||
+            (int64_t) w1->shape[1] != dspark_w1_vocab_)
+            throw std::runtime_error("dspark markov_w1.weight has wrong shape or type");
+        const size_t w1_bytes = dg_->payload(*w1);
+        dspark_w1_ = reserve_dense(w1_bytes, kTypeBF16, dspark_rank_, dspark_w1_vocab_);
+        if (dense_) {
+            h2d(dspark_w1_.p, dg_->data(*w1), w1_bytes);
+            uploaded_.emplace_back(dg_->data(*w1), w1_bytes);
+        }
+    }
 
     for (int i = 0; i < dspark_layers_; ++i) {
         DsparkLayer& dl = dspark_l_[(size_t) i];
@@ -1067,25 +1400,16 @@ void Inkling2::load_drafter() {
         dl.q_norm = dvec(a + "q_norm.weight", dspark_head_dim_);
         dl.k_norm = dvec(a + "k_norm.weight", dspark_head_dim_);
         dl.k_norm_ctx = dvec(a + "k_norm_ctx.weight", dspark_head_dim_);
-        dl.q_proj = dmat(a + "q_proj.weight", n_embd_, q_dim);
-        dl.k_proj = dmat(a + "k_proj.weight", n_embd_, kv_dim);
-        dl.v_proj = dmat(a + "v_proj.weight", n_embd_, kv_dim);
-        dl.k_proj_ctx = dmat(a + "k_proj_ctx.weight", n_embd_, kv_dim);
-        dl.v_proj_ctx = dmat(a + "v_proj_ctx.weight", n_embd_, kv_dim);
+        dmat_cat({{a + "q_proj.weight", q_dim}, {a + "k_proj.weight", kv_dim}, {a + "v_proj.weight", kv_dim}}, n_embd_,
+                 dl.qkv_proj, {&dl.q_proj, &dl.k_proj, &dl.v_proj});
+        dmat_cat({{a + "k_proj_ctx.weight", kv_dim}, {a + "v_proj_ctx.weight", kv_dim}}, n_embd_, dl.kv_proj_ctx,
+                 {&dl.k_proj_ctx, &dl.v_proj_ctx});
         dl.o_proj = dmat(a + "o_proj.weight", q_dim, n_embd_);
-        dl.gate_proj = dmat(p + "mlp.gate_proj.weight", n_embd_, dspark_ff_);
-        dl.up_proj = dmat(p + "mlp.up_proj.weight", n_embd_, dspark_ff_);
+        dmat_cat({{p + "mlp.gate_proj.weight", dspark_ff_}, {p + "mlp.up_proj.weight", dspark_ff_}}, n_embd_,
+                 dl.gate_up_proj, {&dl.gate_proj, &dl.up_proj});
         dl.down_proj = dmat(p + "mlp.down_proj.weight", dspark_ff_, n_embd_);
     }
 
-    auto reserve_dense = [&](size_t bytes, uint32_t type, int n_in, int n_out) -> Dev {
-        const size_t aligned = (bytes + 255) & ~size_t(255);
-        const Dev d{dense_ ? dense_ + dense_at_ : nullptr, type, n_in, n_out};
-        dense_at_ += aligned + kTail;
-        if (dense_ && dense_at_ > dense_bytes_)
-            throw std::logic_error("the dense arena is too small for dspark fold weights");
-        return d;
-    };
     const size_t fold_w_bytes = ggml_row_size(GGML_TYPE_Q8_0, dspark_rank_) * (size_t) n_vocab_;
     const size_t fold_b_bytes = (size_t) n_vocab_ * sizeof(float);
     dspark_fold_w_ = reserve_dense(fold_w_bytes, (uint32_t) GGML_TYPE_Q8_0, dspark_rank_, n_vocab_);
@@ -1113,13 +1437,6 @@ void Inkling2::load_drafter() {
         for (int c = 0; c < 4; ++c) dspark_fuse_[r][c] = (float) (dspark_fuse_[r][c] / sum);
     }
 
-    const TensorInfo* w1 = dtensor("markov_head.markov_w1.weight");
-    if (w1->type != kTypeBF16 || w1->shape.size() != 2 || (int64_t) w1->shape[0] != dspark_rank_ ||
-        (int64_t) w1->shape[1] != dspark_w1_vocab_)
-        throw std::runtime_error("dspark markov_w1.weight has wrong shape or type");
-    dspark_w1_data_ = (const uint8_t*) dg_->data(*w1);
-    dspark_w1_row_bytes_ = (size_t) dspark_rank_ * 2;
-
     const TensorInfo* hw = dtensor("markov_head.hidden_out.weight");
     const TensorInfo* hb = dtensor("markov_head.hidden_out.bias");
     if (hw->type != kTypeBF16 || hw->shape.size() != 2 || (int64_t) hw->shape[0] != dspark_rank_ ||
@@ -1139,7 +1456,6 @@ void Inkling2::load_drafter() {
     bf16->to_float(dg_->data(*hb), h_hidden_out_b_.data(), n_embd_);
 
     h_dspark_anchor_.resize((size_t) n_embd_);
-    h_dspark_prev_.resize((size_t) dspark_rank_);
 }
 
 void Inkling2::init_drafter() {
@@ -1175,6 +1491,8 @@ void Inkling2::init_drafter() {
 void Inkling2::reset_drafter() {
     if (!dspark_) return;
     if (d_f_rnn_) ck(cudaMemsetAsync(d_f_rnn_, 0, (size_t) n_embd_ * sizeof(float), cs(st_)), "reset dspark");
+    if (d_rnn_f_gates_)
+        ck(cudaMemsetAsync(d_rnn_f_gates_, 0, (size_t) (3 * dspark_rank_) * sizeof(float), cs(st_)), "reset dspark");
     block_n_ = 0;
 }
 
@@ -1184,31 +1502,56 @@ void Inkling2::draft_commit(int64_t pos, int n) {
     inkling_dspark_mix_norm(d_taps_ + (size_t) (n - 1) * 3 * n_embd_, hn_ + (size_t) n * n_embd_, dspark_fuse_[3][0],
                             dspark_fuse_[3][1], dspark_fuse_[3][2], dspark_fuse_[3][3], fp(dspark_rnn_norm_), d_f_rnn_,
                             n_embd_, 1, dspark_eps_, st_);
+    lin(dspark_rnn_f_, d_f_rnn_, d_rnn_f_gates_, 1);
 
     const int kv_width = dspark_kv_ * dspark_head_dim_;
-    auto store_d_kv = [&](const float* x, uint16_t* cache, int ring) {
-        if (ring <= 0) {
-            store_f16(x, cache, kv_width, pos, n, st_);
+    auto store_d_kv = [&](const float* x, DsparkLayer& dl, bool is_v) {
+        if (dl.local) {
+            uint16_t* cache = is_v ? dl.dv : dl.dk;
+            for (int done = 0; done < n;) {
+                const int64_t at = (pos + done) % dspark_ring_;
+                const int m = (int) std::min<int64_t>(n - done, dspark_ring_ - at);
+                store_f16(x + (size_t) done * kv_width, cache, kv_width, at, m, st_);
+                done += m;
+            }
             return;
         }
-        for (int done = 0; done < n;) {
-            const int64_t at = (pos + done) % ring;
-            const int m = (int) std::min<int64_t>(n - done, ring - at);
-            store_f16(x + (size_t) done * kv_width, cache, kv_width, at, m, st_);
-            done += m;
+        const bool use_q4 = opt_.kv_format == KvFmt::kQ4_0 || (is_v && opt_.kv_format == KvFmt::kK8V4);
+        const bool use_q8 = opt_.kv_format == KvFmt::kQ8_0 || (!is_v && opt_.kv_format == KvFmt::kK8V4);
+        if (use_q4) {
+            store_q4(x, is_v ? dl.dv_q4 : dl.dk_q4, is_v ? dl.dv_scales : dl.dk_scales, kv_width, pos, n, st_);
+            return;
         }
+        if (use_q8) {
+            store_q8(x, is_v ? dl.dv_codes : dl.dk_codes, is_v ? dl.dv_scales : dl.dk_scales, kv_width, pos, n, st_);
+            return;
+        }
+        store_f16(x, is_v ? dl.dv : dl.dk, kv_width, pos, n, st_);
     };
 
     for (int l = 0; l < dspark_layers_; ++l) {
         DsparkLayer& dl = dspark_l_[(size_t) l];
         inkling_dspark_mix_norm(d_taps_, hn_ + n_embd_, dspark_fuse_[l][0], dspark_fuse_[l][1], dspark_fuse_[l][2],
                                 dspark_fuse_[l][3], fp(dl.dflare_norm), cur_, n_embd_, n, dspark_eps_, st_);
-        lin(dl.k_proj_ctx, cur_, q_, n);
-        head_norm_rope(q_, dspark_head_dim_, fp(dl.k_norm_ctx), k_, dspark_head_dim_, dspark_kv_, dspark_head_dim_,
-                       dspark_theta_scale_, pos, n, dspark_eps_, st_);
-        store_d_kv(k_, dl.dk, dl.local ? dspark_ring_ : 0);
-        lin(dl.v_proj_ctx, cur_, v_, n);
-        store_d_kv(v_, dl.dv, dl.local ? dspark_ring_ : 0);
+        const void* xq_ctx = nullptr;
+        if (n < kStageRows) {
+            kernels::native_quantize_q8_1(cur_, xq_, n_embd_ * n, 1, st_);
+            xq_ctx = xq_;
+        }
+        if (n == 1) {
+            lin(dl.kv_proj_ctx, cur_, qraw_, 1, xq_ctx);
+            head_norm_rope(qraw_, dspark_head_dim_, fp(dl.k_norm_ctx), k_, dspark_head_dim_, dspark_kv_,
+                           dspark_head_dim_, dspark_theta_scale_, pos, 1, dspark_eps_, st_);
+            store_d_kv(k_, dl, false);
+            store_d_kv(qraw_ + kv_width, dl, true);
+        } else {
+            lin(dl.k_proj_ctx, cur_, q_, n, xq_ctx);
+            head_norm_rope(q_, dspark_head_dim_, fp(dl.k_norm_ctx), k_, dspark_head_dim_, dspark_kv_, dspark_head_dim_,
+                           dspark_theta_scale_, pos, n, dspark_eps_, st_);
+            store_d_kv(k_, dl, false);
+            lin(dl.v_proj_ctx, cur_, v_, n, xq_ctx);
+            store_d_kv(v_, dl, true);
+        }
     }
 }
 
@@ -1229,51 +1572,80 @@ void Inkling2::draft_block(int32_t token) {
                            cudaMemcpyDeviceToDevice, cs(st_)),
            "dspark mask");
 
+    const int B = dspark_block_;
+    const int q_dim = dspark_heads_ * dspark_head_dim_;
     const int kv_width = dspark_kv_ * dspark_head_dim_;
-    auto store_d_blk = [&](const float* x, uint16_t* cache, int ring) {
-        if (ring <= 0) {
-            store_f16(x, cache, kv_width, pos_, dspark_block_, st_);
+    const int threads = sum_threads(n_embd_);
+    const bool k_q8 = opt_.kv_format == KvFmt::kQ8_0 || opt_.kv_format == KvFmt::kK8V4;
+    const bool k_q4 = opt_.kv_format == KvFmt::kQ4_0;
+    const bool v_q8 = opt_.kv_format == KvFmt::kQ8_0;
+    const bool v_q4 = opt_.kv_format == KvFmt::kQ4_0 || opt_.kv_format == KvFmt::kK8V4;
+    const bool quant = k_q8 || k_q4 || v_q8 || v_q4;
+    auto store_d_blk = [&](const float* x, DsparkLayer& dl, bool is_v) {
+        if (dl.local) {
+            uint16_t* cache = is_v ? dl.dv : dl.dk;
+            for (int done = 0; done < B;) {
+                const int64_t at = (pos_ + done) % dspark_ring_;
+                const int m = (int) std::min<int64_t>(B - done, dspark_ring_ - at);
+                store_f16(x + (size_t) done * kv_width, cache, kv_width, at, m, st_);
+                done += m;
+            }
             return;
         }
-        for (int done = 0; done < dspark_block_;) {
-            const int64_t at = (pos_ + done) % ring;
-            const int m = (int) std::min<int64_t>(dspark_block_ - done, ring - at);
-            store_f16(x + (size_t) done * kv_width, cache, kv_width, at, m, st_);
-            done += m;
+        const bool use_q4 = is_v ? v_q4 : k_q4;
+        const bool use_q8 = is_v ? v_q8 : k_q8;
+        if (use_q4) {
+            store_q4(x, is_v ? dl.dv_q4 : dl.dk_q4, is_v ? dl.dv_scales : dl.dk_scales, kv_width, pos_, B, st_);
+            return;
         }
+        if (use_q8) {
+            store_q8(x, is_v ? dl.dv_codes : dl.dk_codes, is_v ? dl.dv_scales : dl.dk_scales, kv_width, pos_, B, st_);
+            return;
+        }
+        store_f16(x, is_v ? dl.dv : dl.dk, kv_width, pos_, B, st_);
     };
 
     const float scale = 1.0f / std::sqrt((float) dspark_head_dim_);
     for (int l = 0; l < dspark_layers_; ++l) {
         DsparkLayer& dl = dspark_l_[(size_t) l];
-        rms_norm(d_blk_x_, fp(dl.input_norm), cur_, n_embd_, dspark_block_, dspark_eps_, st_);
-        lin(dl.q_proj, cur_, d_blk_qraw_, dspark_block_);
+        kernels::native_add_rms_norm_q8_1(d_blk_x_, l == 0 ? nullptr : d_blk_attn_, fp(dl.input_norm), d_blk_xn_,
+                                          d_blk_xq_, n_embd_, B, dspark_eps_, threads, st_);
+        lin(dl.qkv_proj, d_blk_xn_, d_blk_qkv_, B, d_blk_xq_);
+        inkling_dspark_split_qkv(d_blk_qkv_, d_blk_qraw_, d_blk_kraw_, v_, q_dim, kv_width, B, st_);
         head_norm_rope(d_blk_qraw_, dspark_head_dim_, fp(dl.q_norm), q_, dspark_head_dim_, dspark_heads_,
-                       dspark_head_dim_, dspark_theta_scale_, pos_, dspark_block_, dspark_eps_, st_);
-        lin(dl.k_proj, cur_, d_blk_qraw_, dspark_block_);
-        head_norm_rope(d_blk_qraw_, dspark_head_dim_, fp(dl.k_norm), k_, dspark_head_dim_, dspark_kv_, dspark_head_dim_,
-                       dspark_theta_scale_, pos_, dspark_block_, dspark_eps_, st_);
-        store_d_blk(k_, dl.dk, dl.local ? dspark_ring_ : 0);
-        lin(dl.v_proj, cur_, v_, dspark_block_);
-        store_d_blk(v_, dl.dv, dl.local ? dspark_ring_ : 0);
+                       dspark_head_dim_, dspark_theta_scale_, pos_, B, dspark_eps_, st_);
+        head_norm_rope(d_blk_kraw_, dspark_head_dim_, fp(dl.k_norm), k_, dspark_head_dim_, dspark_kv_, dspark_head_dim_,
+                       dspark_theta_scale_, pos_, B, dspark_eps_, st_);
+        store_d_blk(k_, dl, false);
+        store_d_blk(v_, dl, true);
 
-        attend_batch(blas_, q_, dl.dk, dl.dv, pos_, dspark_block_, score_, score_n_, awork_, att_, dspark_head_dim_,
-                     dspark_heads_, dspark_kv_, scale, st_, dl.local ? (dspark_window_ + 1) : 0,
-                     dl.local ? dspark_ring_ : 0, true);
-        lin(dl.o_proj, att_, cur_, dspark_block_);
-        axpy(cur_, 1.0f, d_blk_x_, dspark_block_ * n_embd_, true, st_);
+        const bool quant_g = !dl.local && quant;
+        const Kvq8 kq = (!dl.local && k_q8) ? Kvq8{dl.dk_codes, dl.dk_scales} : Kvq8{};
+        const Kvq8 vq = (!dl.local && v_q8) ? Kvq8{dl.dv_codes, dl.dv_scales} : Kvq8{};
+        const Kvq4 kq4 = (!dl.local && k_q4) ? Kvq4{dl.dk_q4, dl.dk_scales} : Kvq4{};
+        const Kvq4 vq4 = (!dl.local && v_q4) ? Kvq4{dl.dv_q4, dl.dv_scales} : Kvq4{};
+        inkling_dspark_attend(q_, quant_g ? nullptr : dl.dk, quant_g ? nullptr : dl.dv, pos_, B, score_, att_,
+                              dspark_head_dim_, dspark_heads_, dspark_kv_, scale, st_,
+                              dl.local ? (dspark_window_ + 1) : 0, dl.local ? dspark_ring_ : 0, nullptr, 0, kq, vq,
+                              kq4, vq4);
+        lin(dl.o_proj, att_, d_blk_attn_, B);
 
-        rms_norm(d_blk_x_, fp(dl.ff_norm), cur_, n_embd_, dspark_block_, dspark_eps_, st_);
-        lin(dl.gate_proj, cur_, d_blk_gate_, dspark_block_);
-        lin(dl.up_proj, cur_, d_blk_up_, dspark_block_);
-        swiglu_clamp(d_blk_gate_, d_blk_up_, d_blk_gate_, dspark_block_ * dspark_ff_, FLT_MAX, st_);
-        lin(dl.down_proj, d_blk_gate_, cur_, dspark_block_);
-        axpy(cur_, 1.0f, d_blk_x_, dspark_block_ * n_embd_, true, st_);
+        kernels::native_add_rms_norm_q8_1(d_blk_x_, d_blk_attn_, fp(dl.ff_norm), d_blk_xn_, d_blk_xq_, n_embd_, B,
+                                          dspark_eps_, threads, st_);
+        lin(dl.gate_proj, d_blk_xn_, d_blk_gate_, B, d_blk_xq_);
+        lin(dl.up_proj, d_blk_xn_, d_blk_up_, B, d_blk_xq_);
+        kernels::native_swiglu_quantize_q8_1(d_blk_gate_, d_blk_up_, d_blk_q8ff_, dspark_ff_, B, st_);
+        lin(dl.down_proj, d_blk_gate_, d_blk_attn_, B, d_blk_q8ff_);
     }
 
-    const int n_cand = dspark_block_ - 1;
-    rms_norm(d_blk_x_ + n_embd_, fp(dspark_norm_), d_blk_h_, n_embd_, n_cand, dspark_eps_, st_);
-    lin(output_, d_blk_h_, d_base_logits_, n_cand);
+    const int n_cand = B - 1;
+    const int dv = draft_rows();
+    kernels::native_add_rms_norm_q8_1(d_blk_x_ + n_embd_, d_blk_attn_ + n_embd_, fp(dspark_norm_), d_blk_h_,
+                                      d_blk_xq_, n_embd_, n_cand, dspark_eps_, threads, st_);
+    Dev head = output_;
+    head.n_out = dv;
+    lin(head, d_blk_h_, d_base_logits_, n_cand, d_blk_xq_);
+    lin(dspark_rnn_h_, d_blk_h_, d_rnn_h_gates_, n_cand, d_blk_xq_);
 
     const int n_steps = std::min({n_cand, opt_.window - 1, (int) std::max<int64_t>(0, opt_.max_context - pos_ - 1)});
     if (n_steps <= 0) {
@@ -1281,41 +1653,47 @@ void Inkling2::draft_block(int32_t token) {
         return;
     }
 
-    ck(cudaMemsetAsync(d_rnn_state_, 0, (size_t) dspark_rank_ * sizeof(float), cs(st_)), "dspark state");
-    ck(cudaMemcpyAsync(d_rnn_in_ + 2 * (size_t) dspark_rank_ + n_embd_, d_f_rnn_, (size_t) n_embd_ * sizeof(float),
-                       cudaMemcpyDeviceToDevice, cs(st_)),
-       "dspark f_rnn");
+    h_dspark_anchor_pick_ = {token, 1.0f};
+    ck(cudaMemcpyAsync(d_block_picks_ + (B - 1), &h_dspark_anchor_pick_, sizeof(Likeliest), cudaMemcpyHostToDevice,
+                       cs(st_)),
+       "dspark anchor pick");
 
-    const ggml_type_traits* bf16 = ggml_get_type_traits((ggml_type) kTypeBF16);
-    int32_t prev = token;
-    for (int i = 0; i < n_steps; ++i) {
-        ck(cudaMemcpyAsync(d_rnn_in_, d_rnn_state_, (size_t) dspark_rank_ * sizeof(float), cudaMemcpyDeviceToDevice,
-                           cs(st_)),
-           "dspark in st");
-        bf16->to_float(dspark_w1_data_ + (size_t) prev * dspark_w1_row_bytes_, h_dspark_prev_.data(), dspark_rank_);
-        ck(cudaMemcpyAsync(d_rnn_in_ + dspark_rank_, h_dspark_prev_.data(), (size_t) dspark_rank_ * sizeof(float),
-                           cudaMemcpyHostToDevice, cs(st_)),
-           "dspark prev");
-        ck(cudaMemcpyAsync(d_rnn_in_ + 2 * (size_t) dspark_rank_, d_blk_h_ + (size_t) i * n_embd_,
-                           (size_t) n_embd_ * sizeof(float), cudaMemcpyDeviceToDevice, cs(st_)),
-           "dspark h");
+    auto run_markov = [&](int steps) {
+        ck(cudaMemsetAsync(d_rnn_state_, 0, (size_t) dspark_rank_ * sizeof(float), cs(st_)), "dspark state");
+        for (int i = 0; i < steps; ++i) {
+            inkling_dspark_prep_rnn_step(d_rnn_state_, (const uint16_t*) dspark_w1_.p, -1, d_block_picks_, i, B - 1,
+                                         dspark_rank_, dspark_w1_vocab_, d_rnn_in_, st_);
+            lin(dspark_rnn_sp_, d_rnn_in_, d_rnn_gates_, 1);
+            inkling_dspark_rnn_gate(d_rnn_gates_, d_rnn_h_gates_ + (size_t) i * 3 * dspark_rank_, d_rnn_f_gates_,
+                                    fp(dspark_rnn_bias_), d_rnn_state_, d_rnn_latent_, dspark_rank_, st_);
+            Dev fhead = dspark_fold_w_;
+            fhead.n_out = dv;
+            lin(fhead, d_rnn_latent_, d_markov_bias_, 1);
+            inkling_dspark_add_softcap(d_base_logits_ + (size_t) i * dv, d_markov_bias_,
+                                       (const float*) dspark_fold_b_.p, logits_, dv, final_logit_softcapping_, st_);
+            likeliest(logits_, dv, d_block_picks_ + i, st_);
+        }
+    };
 
-        lin(dspark_rnn_proj_, d_rnn_in_, d_rnn_gates_, 1);
-        inkling_dspark_rnn_gate(d_rnn_gates_, fp(dspark_rnn_bias_), d_rnn_state_, d_rnn_latent_, dspark_rank_, st_);
-        lin(dspark_fold_w_, d_rnn_latent_, d_markov_bias_, 1);
-        inkling_dspark_add_softcap(d_base_logits_ + (size_t) i * n_vocab_, d_markov_bias_, fp(dspark_fold_b_), logits_,
-                                   n_vocab_, final_logit_softcapping_, st_);
-        likeliest(logits_, n_vocab_, h_block_ + i, st_);
-        ck(cudaStreamSynchronize(cs(st_)), "dspark step");
-        prev = h_block_[i].token;
+    if (opt_.graphs && !opt_.dump && n_steps == n_cand) {
+        if (!dspark_markov_graph_) dspark_markov_graph_ = record_fn([&] { run_markov(n_cand); });
+        ck(cudaGraphLaunch((cudaGraphExec_t) dspark_markov_graph_, cs(st_)), "dspark markov graph");
+    } else {
+        run_markov(n_steps);
     }
+
+    ck(cudaMemcpyAsync(h_block_, d_block_picks_, (size_t) n_steps * sizeof(Likeliest), cudaMemcpyDeviceToHost,
+                       cs(st_)),
+       "dspark picks");
+    ck(cudaStreamSynchronize(cs(st_)), "dspark block");
     block_n_ = n_steps;
 }
 
 void Inkling2::save_draft_extra(int64_t pos, uint8_t* dst) {
     if (!dspark_) return;
     ck(cudaStreamSynchronize(cs(st_)), "save dspark extra");
-    const size_t base_swa = (size_t) n_swa_slots_ * 2 * (size_t) keep_ * (kv_code_row_bytes() + kv_scale_row_bytes());
+    const size_t base_swa = (size_t) n_swa_slots_ * (size_t) keep_ *
+                            (kv_code_row_bytes(false) + kv_code_row_bytes(true) + 2 * kv_scale_row_bytes());
     dst += state_n_ * sizeof(float) + base_swa;
     const size_t f_bytes = (size_t) n_embd_ * sizeof(float);
     ck(cudaMemcpy(dst, d_f_rnn_, f_bytes, cudaMemcpyDeviceToHost), "save dspark f_rnn");

@@ -40,6 +40,7 @@ protected:
     int widest() const override;
     int streams() const override { return dspark_ ? 9 : 6; }
     bool draft_at_once() const override { return dspark_; }
+    bool exps_scale_any_type() const override { return true; }
     void load_drafter() override;
     void init_drafter() override;
     void reset_drafter() override;
@@ -51,6 +52,7 @@ protected:
     void output_rows(int first, int rows, float* h) override;
     void finish_logits(float* logits, int rows) override;
     void route(int il, const float* logits, int32_t token, int* ids, float* w, float* tmp) const override;
+    void route_weights(int il, const float* logits, const int* ids, float* w) const override;
     bool route_card(int il, int n, int32_t* ids, float* w) override;
     void moe_shared(const Layer& L, int il, int n) override;
     int head_key(int slot, int n) const override;
@@ -67,13 +69,16 @@ private:
     struct Block {
         bool swa = false;
         Dev wq, wk, wv, wo, wqkv_gate;
+        Dev wq_fused, wkv_fused;
+        int wq_fuse_flags = 0;   ///< bit 0: wq+wqkv_gate, bit 1: +attn_rel, bit 2: +attn_sink_proj
+        int wq_rel_off = 0, wq_sink_off = 0;
         Dev attn_q_clip, attn_sink_proj, attn_rel, attn_rel_bias, attn_rel_clip;
         Dev attn_k_conv, attn_v_conv, attn_post_conv, ffn_post_conv;
         Dev q_inp_norm, k_inp_norm, v_inp_norm, k_conv_proj, v_conv_proj;
         Dev attn_res_query, ffn_res_query;
         // Loop controller weights (only for phys in [core_start_, core_end_))
         Dev loop_msg_query;
-        Dev ctrl_down[4], ctrl_gain[4], ctrl_forget[4];
+        Dev ctrl_down[4], ctrl_gain[4], ctrl_forget[4], ctrl_gf[4];
         std::vector<float> probs_b;
         Dev probs_b_dev;
     };
@@ -95,14 +100,23 @@ private:
     struct DsparkLayer {
         bool local = false;
         Dev input_norm, ff_norm, dflare_norm, q_norm, k_norm, k_norm_ctx;
-        Dev q_proj, k_proj, v_proj, k_proj_ctx, v_proj_ctx, o_proj, gate_proj, up_proj, down_proj;
+        Dev q_proj, k_proj, v_proj, qkv_proj;
+        Dev k_proj_ctx, v_proj_ctx, kv_proj_ctx;
+        Dev o_proj, gate_proj, up_proj, gate_up_proj, down_proj;
         uint16_t *dk = nullptr, *dv = nullptr;
+        int8_t *dk_codes = nullptr, *dv_codes = nullptr;
+        uint8_t *dk_q4 = nullptr, *dv_q4 = nullptr;
+        uint16_t *dk_scales = nullptr, *dv_scales = nullptr;
     };
 
-    size_t kv_code_row_bytes() const;
+    size_t kv_code_row_bytes(bool value = false) const;
     size_t kv_scale_row_bytes() const;
+    size_t dspark_kv_code_row_bytes(bool value = false) const;
+    size_t dspark_kv_scale_row_bytes() const;
     uint8_t* slot_k_codes(const SlotCache& sc) const;
     uint8_t* slot_v_codes(const SlotCache& sc) const;
+    uint8_t* dspark_k_codes(const DsparkLayer& dl) const;
+    uint8_t* dspark_v_codes(const DsparkLayer& dl) const;
     void apply_ctrl(const float* cur, const float* msg, const Block& B, int ctrl, float* out, int n);
     void store(const float* x, const SlotCache& sc, int64_t pos, int n, bool value);
     void attn(const Step& st, Block& B, SlotCache& sc, int64_t pos, int n);
@@ -133,6 +147,7 @@ private:
     // Device scratch
     float *inputs_buf_ = nullptr, *msg_ = nullptr, *ctrl_cat_ = nullptr, *ctrl_r_ = nullptr, *ctrl_g_ = nullptr,
           *ctrl_f_ = nullptr, *inp_sa_ = nullptr;
+    float *q_fused_buf_ = nullptr, *kv_fused_buf_ = nullptr;
     float *qraw_ = nullptr, *q_ = nullptr, *kraw_ = nullptr, *k_ = nullptr, *v_ = nullptr;
     float *r_raw_ = nullptr, *r_cur_ = nullptr, *dyn_ = nullptr, *sinks_ = nullptr, *gate_ = nullptr;
     float *att_ = nullptr, *table_ = nullptr, *score_ = nullptr;
@@ -148,16 +163,20 @@ private:
     int dspark_taps_[3] = {5, 23, 41};
     float dspark_fuse_[4][4] = {};
     std::vector<DsparkLayer> dspark_l_;
-    Dev dspark_mask_, dspark_norm_, dspark_rnn_norm_, dspark_rnn_proj_, dspark_rnn_bias_;
-    Dev dspark_fold_w_, dspark_fold_b_;
-    const uint8_t* dspark_w1_data_ = nullptr;
-    size_t dspark_w1_row_bytes_ = 0;
+    Dev dspark_mask_, dspark_norm_, dspark_rnn_norm_, dspark_rnn_sp_, dspark_rnn_h_, dspark_rnn_f_, dspark_rnn_bias_;
+    Dev dspark_w1_, dspark_fold_w_, dspark_fold_b_;
     std::vector<float> h_hidden_out_wt_, h_hidden_out_b_;
-    mutable std::vector<float> h_dspark_anchor_, h_dspark_prev_;
-    float *d_taps_ = nullptr, *d_f_rnn_ = nullptr, *d_blk_x_ = nullptr, *d_blk_h_ = nullptr;
-    float *d_blk_qraw_ = nullptr, *d_blk_gate_ = nullptr, *d_blk_up_ = nullptr;
+    mutable std::vector<float> h_dspark_anchor_;
+    mutable Likeliest h_dspark_anchor_pick_{};
+    float *d_taps_ = nullptr, *d_f_rnn_ = nullptr, *d_blk_x_ = nullptr, *d_blk_xn_ = nullptr, *d_blk_h_ = nullptr;
+    float *d_blk_qkv_ = nullptr, *d_blk_qraw_ = nullptr, *d_blk_kraw_ = nullptr, *d_blk_attn_ = nullptr;
+    float *d_blk_gate_ = nullptr, *d_blk_up_ = nullptr;
     float *d_base_logits_ = nullptr, *d_markov_bias_ = nullptr;
-    float *d_rnn_in_ = nullptr, *d_rnn_gates_ = nullptr, *d_rnn_state_ = nullptr, *d_rnn_latent_ = nullptr;
+    float *d_rnn_in_ = nullptr, *d_rnn_gates_ = nullptr, *d_rnn_h_gates_ = nullptr, *d_rnn_f_gates_ = nullptr;
+    float *d_rnn_state_ = nullptr, *d_rnn_latent_ = nullptr;
+    void *d_blk_xq_ = nullptr, *d_blk_q8ff_ = nullptr;
+    Likeliest* d_block_picks_ = nullptr;
+    void* dspark_markov_graph_ = nullptr;
 };
 
 }  // namespace strata::poly

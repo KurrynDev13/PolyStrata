@@ -179,12 +179,13 @@ __global__ void inkling_control_prep_kernel(const float* __restrict__ cur, const
 
 __global__ void inkling_control_apply_kernel(const float* __restrict__ cur, const float* __restrict__ msg,
                                              const float* __restrict__ gain_raw, const float* __restrict__ forget_raw,
-                                             float* __restrict__ out, int n_embd) {
+                                             float* __restrict__ out, int n_embd, int gf_stride) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n_embd) return;
     const size_t idx = size_t(blockIdx.y) * n_embd + i;
+    const size_t gidx = size_t(blockIdx.y) * gf_stride + i;
     const float c = cur[idx], m = msg[idx];
-    out[idx] = c * (1.0f - tanhf(forget_raw[idx])) + m * tanhf(gain_raw[idx]);
+    out[idx] = c * (1.0f - tanhf(forget_raw[gidx])) + m * tanhf(gain_raw[gidx]);
 }
 
 // ---- 4. Causal 4-tap short convolution (static + optional dynamic per-head reversed-lag taps) ----
@@ -367,6 +368,7 @@ __global__ void store_q4_at_kernel(const float* __restrict__ x, uint8_t* __restr
                    scales + (size_t) row * nb + blk);
 }
 
+template <bool WHOLE = false>
 __global__ void inkling_attend_split_kernel(const float* __restrict__ q, const uint16_t* __restrict__ kcache,
                                             const uint16_t* __restrict__ vcache, const float* __restrict__ table,
                                             const float* __restrict__ sinks, int n_extent, long long pos,
@@ -378,9 +380,13 @@ __global__ void inkling_attend_split_kernel(const float* __restrict__ q, const u
     const int h = blockIdx.y;
     const int t = blockIdx.z;
     const long long q_pos = at ? at[2 * t] : pos + t;
+    const long long p0 = at ? at[0] : pos;
 
     long long lo;
-    const int total = attn_rows_span(q_pos, window, &lo);
+    const int total = WHOLE ? [&]() {
+        lo = window > 0 && q_pos >= window ? q_pos - window + 1 : 0;
+        return int((p0 + gridDim.z - 1) - lo) + 1;
+    }() : attn_rows_span(q_pos, window, &lo);
     const int per_split = max(SPLIT_KEYS, (total + n_splits - 1) / n_splits);
     const int k_begin = s * per_split;
     const int pstride = dim + 2;
@@ -399,8 +405,8 @@ __global__ void inkling_attend_split_kernel(const float* __restrict__ q, const u
     const int kv_width = kv_heads * dim;
     const int kv_swidth = kv_heads * (dim >> 5);
     const float* q_ptr = q + (size_t(t) * n_head + h) * dim;
-    const float* tbl = table + (size_t(t) * n_head + h) * n_extent;
-    const float neg_sink = -sinks[size_t(t) * n_head + h];
+    const float* tbl = WHOLE ? nullptr : table + (size_t(t) * n_head + h) * n_extent;
+    const float neg_sink = WHOLE ? 0.0f : -sinks[size_t(t) * n_head + h];
 
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
@@ -431,7 +437,7 @@ __global__ void inkling_attend_split_kernel(const float* __restrict__ q, const u
         }
         dot = warp_sum(dot);
         const long long dist = q_pos - j;
-        const float bias = dist < n_extent ? tbl[dist] : neg_sink;
+        const float bias = WHOLE ? 0.0f : (dist < n_extent ? tbl[dist] : neg_sink);
         const float score = dot + bias;
 
         const float m_new = fmaxf(m_w, score);
@@ -484,7 +490,7 @@ __global__ void inkling_attend_split_kernel(const float* __restrict__ q, const u
     }
 }
 
-template <int PER>
+template <int PER, bool WHOLE = false>
 __global__ void inkling_attend_split_gqa_kernel(const float* __restrict__ q, const uint16_t* __restrict__ kcache,
                                                 const uint16_t* __restrict__ vcache, const float* __restrict__ table,
                                                 const float* __restrict__ sinks, int n_extent, long long pos,
@@ -497,9 +503,13 @@ __global__ void inkling_attend_split_gqa_kernel(const float* __restrict__ q, con
     const int t = blockIdx.z;
     const int h_base = kv_h * PER;
     const long long q_pos = at ? at[2 * t] : pos + t;
+    const long long p0 = at ? at[0] : pos;
 
     long long lo;
-    const int total = attn_rows_span(q_pos, window, &lo);
+    const int total = WHOLE ? [&]() {
+        lo = window > 0 && q_pos >= window ? q_pos - window + 1 : 0;
+        return int((p0 + gridDim.z - 1) - lo) + 1;
+    }() : attn_rows_span(q_pos, window, &lo);
     const int per_split = max(SPLIT_KEYS, (total + n_splits - 1) / n_splits);
     const int k_begin = s * per_split;
     const int pstride = dim + 2;
@@ -562,9 +572,9 @@ __global__ void inkling_attend_split_gqa_kernel(const float* __restrict__ q, con
         for (int p = 0; p < PER; ++p) {
             const int h = h_base + p;
             const float dp = warp_sum(dot[p]);
-            const float bias = dist < n_extent
-                ? table[(size_t(t) * n_head + h) * n_extent + dist]
-                : -sinks[size_t(t) * n_head + h];
+            const float bias = WHOLE ? 0.0f
+                                     : (dist < n_extent ? table[(size_t(t) * n_head + h) * n_extent + dist]
+                                                        : -sinks[size_t(t) * n_head + h]);
             const float score = dp + bias;
             const float m_new = fmaxf(m_w[p], score);
             const float alpha = l_w[p] > 0.0f ? expf(m_w[p] - m_new) : 0.0f;
@@ -623,6 +633,7 @@ __global__ void inkling_attend_split_gqa_kernel(const float* __restrict__ q, con
     }
 }
 
+template <bool ZERO_SINK = true, bool WHOLE = false>
 __global__ void inkling_attend_join_kernel(const float* __restrict__ partials, float* __restrict__ out, int n_splits,
                                            int dim, int n_head, long long pos, int window,
                                            const long long* __restrict__ at) {
@@ -632,16 +643,20 @@ __global__ void inkling_attend_join_kernel(const float* __restrict__ partials, f
     if (d >= dim) return;
 
     const long long q_pos = at ? at[2 * t] : pos + t;
+    const long long p0 = at ? at[0] : pos;
     long long lo;
-    const int total = attn_rows_span(q_pos, window, &lo);
+    const int total = WHOLE ? [&]() {
+        lo = window > 0 && q_pos >= window ? q_pos - window + 1 : 0;
+        return int((p0 + gridDim.y - 1) - lo) + 1;
+    }() : attn_rows_span(q_pos, window, &lo);
     const int per_split = max(SPLIT_KEYS, (total + n_splits - 1) / n_splits);
     const int active = min(n_splits, (total + per_split - 1) / per_split);
     const int pstride = dim + 2;
     const float* base = partials + (size_t(t) * n_head + h) * n_splits * pstride;
 
-    // Virtual zero sink: (m = 0.0f, l = 1.0f, o = 0.0f)
-    float m = 0.0f;
-    float l = 1.0f;
+    // ZERO_SINK=true: virtual zero sink (m = 0.0f, l = 1.0f, o = 0.0f). ZERO_SINK=false: standard softmax.
+    float m = ZERO_SINK ? 0.0f : -INFINITY;
+    float l = ZERO_SINK ? 1.0f : 0.0f;
     float acc = 0.0f;
     for (int s = 0; s < active; ++s) {
         const float* p = base + size_t(s) * pstride;
@@ -649,13 +664,13 @@ __global__ void inkling_attend_join_kernel(const float* __restrict__ partials, f
         if (ls <= 0.0f) continue;
         const float ms = p[dim];
         const float m_new = fmaxf(m, ms);
-        const float alpha = expf(m - m_new);
+        const float alpha = l > 0.0f ? expf(m - m_new) : 0.0f;
         const float beta = expf(ms - m_new);
         l = l * alpha + ls * beta;
         acc = acc * alpha + p[d] * beta;
         m = m_new;
     }
-    out[(size_t(t) * n_head + h) * dim + d] = acc / l;
+    out[(size_t(t) * n_head + h) * dim + d] = l > 0.0f ? acc / l : 0.0f;
 }
 
 __global__ void dequant_q8_kernel(const int8_t* __restrict__ codes, const uint16_t* __restrict__ scales,
@@ -830,13 +845,36 @@ __global__ void inkling_dspark_mix_norm_kernel(const float* __restrict__ taps012
     }
 }
 
-__global__ void inkling_dspark_rnn_gate_kernel(const float* __restrict__ gates, const float* __restrict__ bias,
+__global__ void inkling_dspark_prep_rnn_step_kernel(const float* __restrict__ state,
+                                                  const uint16_t* __restrict__ w1_bf16, int32_t anchor_tok,
+                                                  const Likeliest* __restrict__ picks, int step, int anchor_slot,
+                                                  int rank, int w1_vocab, float* __restrict__ rnn_in_sp) {
+    const int i = threadIdx.x;
+    if (i >= rank) return;
+    rnn_in_sp[i] = state[i];
+    const int32_t tok = (step == 0) ? (anchor_tok >= 0 ? anchor_tok : picks[anchor_slot].token) : picks[step - 1].token;
+    if (tok >= 0 && tok < w1_vocab) {
+        const uint32_t bits = (uint32_t) w1_bf16[size_t(tok) * rank + i] << 16;
+        rnn_in_sp[rank + i] = __uint_as_float(bits);
+    } else {
+        rnn_in_sp[rank + i] = 0.0f;
+    }
+}
+
+__global__ void inkling_dspark_rnn_gate_kernel(const float* __restrict__ gates_sp, const float* __restrict__ gates_h,
+                                               const float* __restrict__ gates_f, const float* __restrict__ bias,
                                                float* __restrict__ state, float* __restrict__ latent, int rank) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= rank) return;
-    const float g0 = gates[i] + (bias ? bias[i] : 0.0f);
-    const float g1 = gates[rank + i] + (bias ? bias[rank + i] : 0.0f);
-    const float g2 = gates[2 * rank + i] + (bias ? bias[2 * rank + i] : 0.0f);
+    const float h0 = gates_h ? gates_h[i] : 0.0f;
+    const float h1 = gates_h ? gates_h[rank + i] : 0.0f;
+    const float h2 = gates_h ? gates_h[2 * rank + i] : 0.0f;
+    const float f0 = gates_f ? gates_f[i] : 0.0f;
+    const float f1 = gates_f ? gates_f[rank + i] : 0.0f;
+    const float f2 = gates_f ? gates_f[2 * rank + i] : 0.0f;
+    const float g0 = gates_sp[i] + h0 + f0 + (bias ? bias[i] : 0.0f);
+    const float g1 = gates_sp[rank + i] + h1 + f1 + (bias ? bias[rank + i] : 0.0f);
+    const float g2 = gates_sp[2 * rank + i] + h2 + f2 + (bias ? bias[2 * rank + i] : 0.0f);
     const float keep = 1.0f / (1.0f + expf(-g0));
     const float upd = tanhf(g1);
     const float lat = tanhf(g2);
@@ -879,6 +917,52 @@ __global__ void inkling_dspark_pack_q8_0_block_kernel(const float* __restrict__ 
     }
 }
 
+__global__ void inkling_dspark_pack_q4_0_block_kernel(const float* __restrict__ cols32, uint8_t* __restrict__ dst_q4,
+                                                      int n_vocab, int block_idx, int n_blocks) {
+    const int v = blockIdx.x * blockDim.x + threadIdx.x;
+    if (v >= n_vocab) return;
+    float vals[32];
+    float amax = 0.0f, vmax = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 32; ++j) {
+        const float x = cols32[size_t(j) * n_vocab + v];
+        vals[j] = x;
+        const float ax = fabsf(x);
+        if (ax > amax || (ax == amax && x > vmax)) {
+            amax = ax;
+            vmax = x;
+        }
+    }
+    const float d = vmax / -8.0f;
+    const float id = d != 0.0f ? 1.0f / d : 0.0f;
+    uint8_t* blk = dst_q4 + (size_t(v) * n_blocks + block_idx) * 18;
+    const uint16_t dh = __half_as_ushort(__float2half(d));
+    blk[0] = uint8_t(dh & 0xff);
+    blk[1] = uint8_t((dh >> 8) & 0xff);
+    uint8_t* qs = blk + 2;
+#pragma unroll
+    for (int j = 0; j < 16; ++j) {
+        int q0 = __float2int_rz(vals[j] * id + 8.5f);
+        int q1 = __float2int_rz(vals[j + 16] * id + 8.5f);
+        q0 = q0 < 0 ? 0 : (q0 > 15 ? 15 : q0);
+        q1 = q1 < 0 ? 0 : (q1 > 15 ? 15 : q1);
+        qs[j] = uint8_t(q0 | (q1 << 4));
+    }
+}
+
+__global__ void inkling_dspark_split_qkv_kernel(const float* __restrict__ qkv, float* __restrict__ qraw,
+                                                float* __restrict__ kraw, float* __restrict__ v,
+                                                int q_dim, int kv_dim) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int stride = q_dim + 2 * kv_dim;
+    if (i >= stride) return;
+    const size_t t = blockIdx.y;
+    const float x = qkv[t * stride + i];
+    if (i < q_dim) qraw[t * q_dim + i] = x;
+    else if (i < q_dim + kv_dim) kraw[t * kv_dim + (i - q_dim)] = x;
+    else v[t * kv_dim + (i - q_dim - kv_dim)] = x;
+}
+
 }  // namespace
 
 void situ_rows(const float* gate_up, float* out, int n, int rows, float beta, float linear_beta, void* stream,
@@ -906,10 +990,12 @@ void inkling_control_prep(const float* cur, const float* msg, float* out_concat,
 }
 
 void inkling_control_apply(const float* cur, const float* msg, const float* gain_raw, const float* forget_raw,
-                           float* out, int n_embd, int rows, void* stream) {
+                           float* out, int n_embd, int rows, void* stream, int gf_stride) {
     if (rows <= 0) return;
+    const int stride = gf_stride > 0 ? gf_stride : n_embd;
     inkling_control_apply_kernel<<<dim3(grid(n_embd, 256), rows), 256, 0, cs(stream)>>>(cur, msg, gain_raw,
-                                                                                        forget_raw, out, n_embd);
+                                                                                        forget_raw, out, n_embd,
+                                                                                        stride);
     ck("inkling_control_apply");
 }
 
@@ -986,6 +1072,29 @@ void inkling_attend(const float* q, const uint16_t* kcache, const uint16_t* vcac
     inkling_attend_join_kernel<<<dim3(n_head, rows), dim, 0, cs(stream)>>>(score, out, n_splits, dim, n_head,
                                                                             (long long) pos, window, at);
     ck("inkling_attend");
+}
+
+void inkling_dspark_attend(const float* q, const uint16_t* kcache, const uint16_t* vcache, int64_t pos, int rows,
+                           float* score, float* out, int dim, int n_head, int kv_heads, float scale, void* stream,
+                           int window, int ring, const long long* at, int room, Kvq8 kq8, Kvq8 vq8,
+                           Kvq4 kq4, Kvq4 vq4) {
+    if (rows <= 0) return;
+    if (dim > 128) throw std::invalid_argument("inkling_dspark_attend: head dim must be <= 128");
+    const long long max_pos = at ? (long long) room : (long long) pos + rows - 1;
+    const int span = window > 0 ? std::min<int>((int) (max_pos + 1), window + rows - 1) : (int) (max_pos + 1);
+    const int n_splits = std::clamp((span + SPLIT_KEYS - 1) / SPLIT_KEYS, 1, MAX_SPLITS);
+    if (dim == 128 && n_head == kv_heads * 3) {
+        inkling_attend_split_gqa_kernel<3, true><<<dim3(n_splits, kv_heads, rows), 128, 0, cs(stream)>>>(
+            q, kcache, vcache, nullptr, nullptr, 0, (long long) pos, score, n_splits, dim, n_head, kv_heads, scale,
+            window, ring, at, kq8, vq8, kq4, vq4);
+    } else {
+        inkling_attend_split_kernel<true><<<dim3(n_splits, n_head, rows), 128, 0, cs(stream)>>>(
+            q, kcache, vcache, nullptr, nullptr, 0, (long long) pos, score, n_splits, dim, n_head, kv_heads, scale,
+            window, ring, at, kq8, vq8, kq4, vq4);
+    }
+    inkling_attend_join_kernel<false, true><<<dim3(n_head, rows), dim, 0, cs(stream)>>>(
+        score, out, n_splits, dim, n_head, (long long) pos, window, at);
+    ck("inkling_dspark_attend");
 }
 
 void inkling_attend_batch(void* blas, const float* q, const uint16_t* kcache, const uint16_t* vcache,
@@ -1108,10 +1217,22 @@ void inkling_dspark_mix_norm(const float* taps012, const float* tap3, float a0, 
     ck("inkling_dspark_mix_norm");
 }
 
-void inkling_dspark_rnn_gate(const float* gates, const float* bias, float* state, float* latent, int rank,
-                             void* stream) {
+void inkling_dspark_prep_rnn_step(const float* state, const uint16_t* w1_bf16, int32_t anchor_tok,
+                                  const Likeliest* picks, int step, int anchor_slot, int rank, int w1_vocab,
+                                  float* rnn_in_sp, void* stream) {
     if (rank <= 0) return;
-    inkling_dspark_rnn_gate_kernel<<<grid(rank, 256), 256, 0, cs(stream)>>>(gates, bias, state, latent, rank);
+    if (rank > 1024 || rank % 32 != 0)
+        throw std::invalid_argument("inkling_dspark_prep_rnn_step: rank must be a multiple of 32 <= 1024");
+    inkling_dspark_prep_rnn_step_kernel<<<1, rank, 0, cs(stream)>>>(
+        state, w1_bf16, anchor_tok, picks, step, anchor_slot, rank, w1_vocab, rnn_in_sp);
+    ck("inkling_dspark_prep_rnn_step");
+}
+
+void inkling_dspark_rnn_gate(const float* gates_sp, const float* gates_h, const float* gates_f, const float* bias,
+                             float* state, float* latent, int rank, void* stream) {
+    if (rank <= 0) return;
+    inkling_dspark_rnn_gate_kernel<<<grid(rank, 256), 256, 0, cs(stream)>>>(
+        gates_sp, gates_h, gates_f, bias, state, latent, rank);
     ck("inkling_dspark_rnn_gate");
 }
 
@@ -1128,6 +1249,23 @@ void inkling_dspark_pack_q8_0_block(const float* cols32, uint8_t* dst_q8, int n_
     inkling_dspark_pack_q8_0_block_kernel<<<grid(n_vocab, 256), 256, 0, cs(stream)>>>(
         cols32, dst_q8, n_vocab, block_idx, n_blocks);
     ck("inkling_dspark_pack_q8_0_block");
+}
+
+void inkling_dspark_pack_q4_0_block(const float* cols32, uint8_t* dst_q4, int n_vocab, int block_idx, int n_blocks,
+                                    void* stream) {
+    if (n_vocab <= 0) return;
+    inkling_dspark_pack_q4_0_block_kernel<<<grid(n_vocab, 256), 256, 0, cs(stream)>>>(
+        cols32, dst_q4, n_vocab, block_idx, n_blocks);
+    ck("inkling_dspark_pack_q4_0_block");
+}
+
+void inkling_dspark_split_qkv(const float* qkv, float* qraw, float* kraw, float* v, int q_dim, int kv_dim, int rows,
+                              void* stream) {
+    if (rows <= 0) return;
+    const int stride = q_dim + 2 * kv_dim;
+    inkling_dspark_split_qkv_kernel<<<dim3(grid(stride, 256), rows), 256, 0, cs(stream)>>>(
+        qkv, qraw, kraw, v, q_dim, kv_dim);
+    ck("inkling_dspark_split_qkv");
 }
 
 }  // namespace strata::poly
