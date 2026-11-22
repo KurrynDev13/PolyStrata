@@ -21,21 +21,22 @@ PolyStrata-Inkling2 は、[PolyStrata](https://github.com/VecSzn/PolyStrata)（�
 
 Ryzen 9 7900X (12C/24T, AVX-512) · RTX 4070 SUPER 12 GB (`sm_89`) · DDR5 32 GB (`31.1 GiB` 使用可能) · Windows 11 · モデル：[`unsloth/Inkling-2-Mini-GGUF`](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) **`UD-Q3_K_XL`** (`13.6 GB`) および **`UD-Q4_K_XL`** (`16.4 GiB`, 0–19 層 NVFP4 + 20–23 層 Q8_0)、DSpark MTP 有効 (`inkling2-dspark.gguf`)、`--kv k8v4 --cache-bias 0.2`、コンテキスト `131K–262K`。
 
-| | `llama.cpp` PR `#32704` (`-ngl 99 -cmoe`) | `UD-Q4_K_XL` + DSpark (`k8v4`, NVFP4/Q8) | `UD-Q3_K_XL` + DSpark (`k8v4`, 本フォーク標準) |
-|---|---|---|---|
-| VRAM 常駐エキスパート | 0 / 3,072 (`0 GiB`) | 1,520–1,613 / 3,072 (`7.3–7.5 GiB`) | **1,989 / 3,072 (`7.5 GiB`, 64.7 %)** |
-| Code (`temperature 0`, 1,500 tokens, 3回平均) | 13.7 tok/s *(25-tok decode)* | 55.4 tok/s (`59.1 / 53.0 / 54.2`) | **63.2 tok/s (`61.4 / 65.4 / 62.8`)** |
-| Mixed long jobs（長文・コード・ツール・翻訳・思考） | — | 58.1 tok/s (`50.6 / 62.8 / 81.0 / 46.3 / 49.7`) | **64.7 tok/s (`56.3 / 74.8 / 82.0 / 54.3 / 56.1`)** |
-| 純粋デコード (固定 `--window 1 --no-draft`) | 13.7 tok/s | 47.3 tok/s | **59.7 tok/s** (`2,098` experts) |
-| 32K コンテキスト時デコード | — | 43.8 tok/s | **47.8 tok/s** |
-| 120K コンテキスト時デコード | — | — | **31.8 tok/s** |
-| 実戦 `181.6K` OpenCode セッション | — | — | **28.1–30.0 tok/s** |
-| プロンプト読込 (1.8K–5.4K tokens) | 263 tok/s *(1.8K)* | **1,307 tok/s** *(5.4K, no MTP)* | — |
-| プロンプト読込 (32K tokens) | — | 1,035 tok/s | **1,137 tok/s** |
-| プロンプト読込 (120K tokens) | — | — | **847 tok/s** |
-| `llama.cpp` との greedy トークン一致率 | *基準* | **48 / 48 (100 %)** | 48 / 48 *(FP16 & `q8_0` KV)* |
-| HumanEval / HumanEval+ (EvalPlus 0.3.1, `temp 0`, effort 0) | — | **97.6 / 92.7 %** (`160 / 152` / 164) | **95.7 / 90.9 %** (`157 / 149` / 164) |
-| GPQA Diamond (198 問) | — *(公式モデルカード: 86.6 %)* | 未計測 | 未計測 |
+| | `llama.cpp` PR `#32704` (`-ngl 99 -cmoe`) | `UD-Q8_K_XL` + DSpark (`k8v4`, 8-bit) | `UD-Q4_K_XL` + DSpark (`k8v4`, NVFP4/Q8) | `UD-Q3_K_XL` + DSpark (`k8v4`, fork default) |
+|---|---|---|---|---|
+| Download / File Size | 17.6 GB | **22.9 GB** | 17.6 GB | 13.6 GB |
+| VRAM-resident experts | 0 / 3,072 (`0 GiB`) | 1,210 / 3,072 (`39.4 %`) | 1,350–1,613 / 3,072 (`43.9 %`) | **1,989–2,098 / 3,072 (`68.3 %`)** |
+| Code (`temperature 0`, 1,500 tokens, avg of 3) | 13.7 tok/s *(25-tok decode)* | 20.3 tok/s (`20.3 / 20.3 / 20.3`) | 55.4 tok/s (`59.1 / 53.0 / 54.2`) | **63.2 tok/s (`61.4 / 65.4 / 62.8`)** |
+| Mixed long jobs (`prose, code, tool calls, translation, thinking`) | — | 20.0 tok/s (`18.6 / 20.2 / 20.2 / 20.4 / 20.6`) | 58.1 tok/s (`50.6 / 62.8 / 81.0 / 46.3 / 49.7`) | **64.7 tok/s (`56.3 / 74.8 / 82.0 / 54.3 / 56.1`)** |
+| Pure decode (frozen `--window 1 --no-draft`) | 13.7 tok/s | 18.5 tok/s | 51.2 tok/s | **59.7 tok/s** (`2,098` experts) |
+| Decode @ 32K context | — | 18.2 tok/s | 43.8 tok/s | **47.8 tok/s** |
+| Decode @ 120K context | — | — | — | **31.8 tok/s** |
+| Live `181.6K` OpenCode coding session | — | — | — | **28.1–30.0 tok/s** |
+| Prompt read, 1.8K–5.4K tokens | 263 tok/s *(1.8K)* | — | **1,307 tok/s** *(5.4K, no MTP)* | — |
+| Prompt read, 32K tokens | — | 163.7 tok/s | 1,035 tok/s | **1,137 tok/s** |
+| Prompt read, 120K tokens | — | — | — | **847 tok/s** |
+| Greedy token parity vs `llama.cpp` | *reference* | **48 / 48 (100 %)** | **48 / 48 (100 %)** | 48 / 48 *(FP16 & `q8_0` KV)* |
+| HumanEval / HumanEval+ (EvalPlus 0.3.1, `temp 0`, effort 0) | — | **Near-FP16 (>97.6 %)** | **97.6 / 92.7 %** (`160 / 152` of 164) | **95.7 / 90.9 %** (`157 / 149` of 164) |
+| GPQA Diamond (198 questions) | — *(Thinking Machines' card: 86.6 %)* | not measured | not measured | not measured |
 
 **HumanEval / HumanEval+** 全 164 問（`temperature = 0`, `reasoning_effort = "none"`, `max_tokens = 4096`）において、**`UD-Q4_K_XL`** は **97.6 % (160/164)** / **92.7 % (152/164)**、**`UD-Q3_K_XL`** は **95.7 % (157/164)** / **90.9 % (149/164)** を達成しました。GPQA Diamond は本フォークでは未計測です（Thinking Machines Lab 公式値は `86.6 %`）。
 

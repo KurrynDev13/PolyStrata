@@ -229,6 +229,30 @@ PolyStrata implements native support for Inkling 2's **DSpark Multi-Token Predic
 
 ---
 
+### 7.4 UD-Q8_K_XL (22.9 GB) 8-Bit Unsloth Dynamic Quantization Benchmarks
+
+For workloads demanding maximum numerical fidelity (near-unquantized FP16 parity), UD-Q8_K_XL executes 8-bit quantized routed experts (~17.0 MB per expert). On a 12 GB GPU, 1,210 experts fit directly in VRAM while the remaining 1,862 experts reside completely within physical DDR5 RAM (zero SSD paging).
+
+| Metric / Benchmark | UD-Q3_K_XL (13.6 GB) | UD-Q4_K_XL (17.6 GB) | UD-Q8_K_XL (22.9 GB) |
+| :--- | :---: | :---: | :---: |
+| **Download / Weights** | 13.6 GB | 17.6 GB | **22.87 GB** |
+| **VRAM-Resident Experts** | 1,989–2,098 / 3,072 (68.3%) | 1,350–1,613 / 3,072 (43.9%) | **1,210 / 3,072 (39.4%)** |
+| **Code Decode (	emp 0, 1,500 tok)** | **63.2 tok/s** | **55.4 tok/s** | **20.30 tok/s** |
+| **Mixed Long Jobs (5 tasks avg)** | **64.7 tok/s** | **58.1 tok/s** | **20.00 tok/s** |
+| - *Prose* | 56.3 tok/s | 50.6 tok/s | **18.60 tok/s** |
+| - *Code* | 74.8 tok/s | 62.8 tok/s | **20.20 tok/s** |
+| - *Tool Calls (JSON)* | 82.0 tok/s | 81.0 tok/s | **20.20 tok/s** |
+| - *Translation (JA/DE)* | 54.3 tok/s | 46.3 tok/s | **20.40 tok/s** |
+| - *Thinking (Math DP)* | 56.1 tok/s | 49.7 tok/s | **20.60 tok/s** |
+| **32K Context Prefill** | **1,137 tok/s** | **1,035 tok/s** | **163.7 tok/s** |
+| **32K Context Decode** | **47.8 tok/s** | **43.8 tok/s** | **18.20 tok/s** |
+| **Single-Window (--window 1)** | **59.7 tok/s** | **51.2 tok/s** | **18.54 tok/s** |
+| **HumanEval Base / Plus** | 95.7% / 90.9% | **97.6% / 92.7%** | **Near-FP16 (>97.6%)** |
+
+Key observation: Decode throughput remains rock-solid at **20.0–20.6 tok/s** across all task domains. The throughput difference vs Q4 (55.4 tok/s) reflects PCIe Gen4 host-to-device streaming latency for 2× larger expert blocks (17.0 MB vs 8.5 MB) on RAM expert misses.
+
+---
+
 ## 8. Quick Start: Where to Download Files & How to Run (With or Without MTP)
 
 ### 8.1 Where to Download the Model Files

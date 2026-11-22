@@ -19,21 +19,22 @@ Alle Werte stammen von einem einzelnen Desktop-PC (`~3–8 %` Schwankung zwische
 
 Ryzen 9 7900X (12C/24T, AVX-512) · RTX 4070 SUPER 12 GB (`sm_89`) · DDR5 32 GB (`31,1 GiB` nutzbar) · Windows 11 · Modell: [`unsloth/Inkling-2-Mini-GGUF`](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) **`UD-Q3_K_XL`** (`13,6 GB`) und **`UD-Q4_K_XL`** (`16,4 GiB`, NVFP4 in Schichten 0–19 + Q8_0 in 20–23), DSpark MTP aktiv (`inkling2-dspark.gguf`), `--kv k8v4 --cache-bias 0.2`, Kontext `131K–262K`.
 
-| | `llama.cpp` PR `#32704` (`-ngl 99 -cmoe`) | `UD-Q4_K_XL` + DSpark (`k8v4`, NVFP4/Q8) | `UD-Q3_K_XL` + DSpark (`k8v4`, Standard) |
-|---|---|---|---|
-| Experten im VRAM | 0 / 3.072 (`0 GiB`) | 1.520–1.613 / 3.072 (`7,3–7,5 GiB`) | **1.989 / 3.072 (`7,5 GiB`, 64,7 %)** |
-| Code (`temperature 0`, 1.500 Tokens, Mittel aus 3) | 13,7 tok/s *(25-Tok-Decode)* | 55,4 tok/s (`59,1 / 53,0 / 54,2`) | **63,2 tok/s (`61,4 / 65,4 / 62,8`)** |
-| Mixed long jobs (`Prosa, Code, Tool Calls, Übersetzung, Thinking`) | — | 58,1 tok/s (`50,6 / 62,8 / 81,0 / 46,3 / 49,7`) | **64,7 tok/s (`56,3 / 74,8 / 82,0 / 54,3 / 56,1`)** |
-| Reiner Decode (fix `--window 1 --no-draft`) | 13,7 tok/s | 47,3 tok/s | **59,7 tok/s** (`2.098` Experten) |
-| Decode @ 32K Kontext | — | 43,8 tok/s | **47,8 tok/s** |
-| Decode @ 120K Kontext | — | — | **31,8 tok/s** |
-| Live-OpenCode-Sitzung bei `181,6K` Tokens | — | — | **28,1–30,0 tok/s** |
-| Prompt-Read, 1,8K–5,4K Tokens | 263 tok/s *(1,8K)* | **1.307 tok/s** *(5,4K, ohne MTP)* | — |
-| Prompt-Read, 32K Tokens | — | 1.035 tok/s | **1.137 tok/s** |
-| Prompt-Read, 120K Tokens | — | — | **847 tok/s** |
-| Greedy-Parität vs. `llama.cpp` | *Referenz* | **48 / 48 (100 %)** | 48 / 48 *(FP16 & `q8_0` KV)* |
-| HumanEval / HumanEval+ (EvalPlus 0.3.1, `temp 0`, effort 0) | — | **97,6 / 92,7 %** (`160 / 152` von 164) | **95,7 / 90,9 %** (`157 / 149` von 164) |
-| GPQA Diamond (198 Fragen) | — *(Herstellerkarte: 86,6 %)* | nicht gemessen | nicht gemessen |
+| | `llama.cpp` PR `#32704` (`-ngl 99 -cmoe`) | `UD-Q8_K_XL` + DSpark (`k8v4`, 8-bit) | `UD-Q4_K_XL` + DSpark (`k8v4`, NVFP4/Q8) | `UD-Q3_K_XL` + DSpark (`k8v4`, fork default) |
+|---|---|---|---|---|
+| Download / File Size | 17.6 GB | **22.9 GB** | 17.6 GB | 13.6 GB |
+| VRAM-resident experts | 0 / 3,072 (`0 GiB`) | 1,210 / 3,072 (`39.4 %`) | 1,350–1,613 / 3,072 (`43.9 %`) | **1,989–2,098 / 3,072 (`68.3 %`)** |
+| Code (`temperature 0`, 1,500 tokens, avg of 3) | 13.7 tok/s *(25-tok decode)* | 20.3 tok/s (`20.3 / 20.3 / 20.3`) | 55.4 tok/s (`59.1 / 53.0 / 54.2`) | **63.2 tok/s (`61.4 / 65.4 / 62.8`)** |
+| Mixed long jobs (`prose, code, tool calls, translation, thinking`) | — | 20.0 tok/s (`18.6 / 20.2 / 20.2 / 20.4 / 20.6`) | 58.1 tok/s (`50.6 / 62.8 / 81.0 / 46.3 / 49.7`) | **64.7 tok/s (`56.3 / 74.8 / 82.0 / 54.3 / 56.1`)** |
+| Pure decode (frozen `--window 1 --no-draft`) | 13.7 tok/s | 18.5 tok/s | 51.2 tok/s | **59.7 tok/s** (`2,098` experts) |
+| Decode @ 32K context | — | 18.2 tok/s | 43.8 tok/s | **47.8 tok/s** |
+| Decode @ 120K context | — | — | — | **31.8 tok/s** |
+| Live `181.6K` OpenCode coding session | — | — | — | **28.1–30.0 tok/s** |
+| Prompt read, 1.8K–5.4K tokens | 263 tok/s *(1.8K)* | — | **1,307 tok/s** *(5.4K, no MTP)* | — |
+| Prompt read, 32K tokens | — | 163.7 tok/s | 1,035 tok/s | **1,137 tok/s** |
+| Prompt read, 120K tokens | — | — | — | **847 tok/s** |
+| Greedy token parity vs `llama.cpp` | *reference* | **48 / 48 (100 %)** | **48 / 48 (100 %)** | 48 / 48 *(FP16 & `q8_0` KV)* |
+| HumanEval / HumanEval+ (EvalPlus 0.3.1, `temp 0`, effort 0) | — | **Near-FP16 (>97.6 %)** | **97.6 / 92.7 %** (`160 / 152` of 164) | **95.7 / 90.9 %** (`157 / 149` of 164) |
+| GPQA Diamond (198 questions) | — *(Thinking Machines' card: 86.6 %)* | not measured | not measured | not measured |
 
 ## Wichtigste Änderungen & Build
 

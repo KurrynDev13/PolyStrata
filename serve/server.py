@@ -2637,6 +2637,8 @@ class Vision:
             if key in self.cache:
                 self.cache[key] = self.cache.pop(key)                  # most recently used last
                 return self.cache[key]
+            if not self.alive():
+                self.restart()
             img, out = self.dir / f"{key}.img", self.dir / f"{key}.sve"
             img.write_bytes(data)
             try:
@@ -3924,9 +3926,42 @@ class Service:
     def reasoning_budget(self, req) -> int | None:
         """#123: the most tokens this request may think, or None: the request's `reasoning_budget_tokens`, else the
         config's.  0 (or less) means no budget, so a request can turn a configured one off.  ValueError (a 400) for
-        anything that is not a whole number."""
+        anything that is not a whole number. Supports a dictionary mapping effort levels to token budgets."""
+        if isinstance(req, dict):
+            ctk = req.get("chat_template_kwargs") if isinstance(req.get("chat_template_kwargs"), dict) else {}
+            if req.get("enable_thinking") is False or ctk.get("enable_thinking") is False:
+                return None
+            if req.get("reasoning_effort") in ("off", "none", "false", "disabled") or ctk.get("reasoning_effort") in ("off", "none", "false", "disabled"):
+                return None
         value = (req or {}).get("reasoning_budget_tokens") if isinstance(req, dict) else None
-        return budget_tokens(self.reasoning_budget_tokens if value is None else value)
+        if value is None:
+            if isinstance(self.reasoning_budget_tokens, dict):
+                effort = None
+                if isinstance(req, dict):
+                    effort = req.get("reasoning_effort")
+                    if not effort and isinstance(req.get("chat_template_kwargs"), dict):
+                        effort = req["chat_template_kwargs"].get("reasoning_effort")
+                    if not effort and isinstance(req.get("output_config"), dict):
+                        effort = req["output_config"].get("effort")
+                    if not effort and isinstance(req.get("thinking"), dict):
+                        effort = req["thinking"].get("effort")
+                if effort in ("off", "none", "false", "disabled"):
+                    return None
+                if not effort:
+                    effort = self.effort_default() or "low"
+                effort = str(effort).lower()
+                if effort in ("off", "none", "false", "disabled"):
+                    return None
+                if effort == "med":
+                    effort = "medium"
+                value = self.reasoning_budget_tokens.get(effort)
+                if value is None and effort == "medium":
+                    value = self.reasoning_budget_tokens.get("med")
+                if value is None:
+                    value = self.reasoning_budget_tokens.get("default", 0)
+            else:
+                value = self.reasoning_budget_tokens
+        return budget_tokens(value)
 
     def _vision_down(self) -> bool:
         """The encoder should run and does not (the engine's load starts it again).  An elastic encoder is down
@@ -4593,8 +4628,9 @@ class Service:
                         if src.startswith(("http://", "https://")):
                             src = fetched[item["source"]] = Vision.download(src)   # outside the FIFO, as in prepare()
                         with self._turn(cancel):  # the encoder takes its turn with the requests (see below)
+                            self._vision_up()
                             self.vision.encode(src)
-                    except (ValueError, OSError) as e:
+                    except (ValueError, OSError, RuntimeError, AttributeError) as e:
                         why = str(e)
                 if why is not None:
                     print(f"[strata] a picture a tool returned was left out of the prompt: {why}", flush=True)
@@ -7567,7 +7603,13 @@ def model_settings(cfg: dict, overrides: dict | None = None) -> dict:
         raise ValueError(f"\"repeat_stop_tokens\" must be a whole number >= 0 (0 = off), not {rs!r}")
     budget = cfg.get("reasoning_budget_tokens")        # #123: a default thinking budget for every request
     if budget is not None:
-        budget_tokens(budget)
+        if isinstance(budget, dict):
+            for k, v in budget.items():
+                if k not in ("low", "med", "medium", "high", "default"):
+                    raise ValueError(f'"reasoning_budget_tokens" dict key must be low, med/medium, high, or default, not {k!r}')
+                budget_tokens(v)
+        else:
+            budget_tokens(budget)
     loops = cfg.get("reasoning_loop_recovery", False)  # #728: false (default) | "stop" | "recover" (true)
     if loops is True:
         loops = "recover"
@@ -7985,7 +8027,10 @@ def main() -> int:
     _frontend.ENV_TO_USER = etu
     svc.effort_end = bool(effort_end)                   # #458: "effort_position": "end" with an engine that has it
     budget = svc.reasoning_budget({})                   # #123: a default thinking budget for every request
-    if budget:
+    if isinstance(svc.reasoning_budget_tokens, dict):
+        levels = ", ".join(f"{k}: {v}" for k, v in svc.reasoning_budget_tokens.items())
+        print(f"[strata] thinking budgets by effort: {levels} tokens (active default: {budget})", flush=True)
+    elif budget:
         print(f"[strata] thinking budget: {budget} tokens (reasoning_budget_tokens; a request can set its own)",
               flush=True)
     svc.gpu_index = (gpu_list(cfg) or [0])[0]           # the Monitor reads the card the engine runs on (issue #51)
