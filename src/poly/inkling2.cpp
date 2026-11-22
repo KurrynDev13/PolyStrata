@@ -627,14 +627,14 @@ void Inkling2::assign_scratch() {
     msg_ = fbuf(4 * n * n_embd_);
     const size_t qf_cols = 2 * (size_t) n_head_ * head_dim_ + (size_t) n_rel_ * n_head_ + (size_t) n_head_;
     const size_t qf_stride = (qf_cols + 63) & ~size_t(63);
-    const size_t ctrl_n = std::max(4 * n * n_embd_, n * (qf_stride + 2 * (size_t) n_kv_ * head_dim_));
+    const size_t ctrl_n = std::max(4 * n * n_embd_, qf_stride + 2 * (size_t) n_kv_ * head_dim_);
     float* ctrl_arena = fbuf(ctrl_n);
     ctrl_cat_ = ctrl_arena;
     ctrl_g_ = ctrl_arena + n * 2 * n_embd_;
     ctrl_r_ = fbuf(n * gate_rank_);
     ctrl_f_ = fbuf(n * n_embd_);
     q_fused_buf_ = ctrl_arena;
-    kv_fused_buf_ = ctrl_arena + n * qf_stride;
+    kv_fused_buf_ = ctrl_arena + qf_stride;
 
     qraw_ = fbuf(heads);
     q_ = fbuf(heads);
@@ -1054,21 +1054,14 @@ void Inkling2::attn(const Step& st, Block& B, SlotCache& sc, int64_t pos, int n)
 
     kernels::native_add_rms_norm_q8_1(in0, nullptr, fp(nq), xn_, xq_, n_embd_, n, rms_eps_, threads, st_);
     const float *qraw_p = qraw_, *gate_p = gate_, *r_raw_p = r_raw_, *sinks_p = sinks_;
-    if (B.wq_fused.p) {
-        lin(B.wq_fused, xn_, q_fused_buf_, n, xq_);
-        if (n == 1) {
-            qraw_p = q_fused_buf_;
-            gate_p = q_fused_buf_ + (size_t) n_head_ * head_dim_;
-            if (B.wq_fuse_flags & 2) r_raw_p = q_fused_buf_ + B.wq_rel_off;
-            else lin(B.attn_rel, xn_, r_raw_, 1, xq_);
-            if (B.wq_fuse_flags & 4) sinks_p = q_fused_buf_ + B.wq_sink_off;
-            else lin(B.attn_sink_proj, xn_, sinks_, 1, xq_);
-        } else {
-            inkling_split_q_fused(q_fused_buf_, qraw_, gate_, r_raw_, sinks_, n_head_ * head_dim_,
-                                  n_rel_ * n_head_, n_head_, B.wq_fuse_flags, n, st_);
-            if (!(B.wq_fuse_flags & 2)) lin(B.attn_rel, xn_, r_raw_, n, xq_);
-            if (!(B.wq_fuse_flags & 4)) lin(B.attn_sink_proj, xn_, sinks_, n, xq_);
-        }
+    if (n == 1 && B.wq_fused.p) {
+        lin(B.wq_fused, xn_, q_fused_buf_, 1, xq_);
+        qraw_p = q_fused_buf_;
+        gate_p = q_fused_buf_ + (size_t) n_head_ * head_dim_;
+        if (B.wq_fuse_flags & 2) r_raw_p = q_fused_buf_ + B.wq_rel_off;
+        else lin(B.attn_rel, xn_, r_raw_, 1, xq_);
+        if (B.wq_fuse_flags & 4) sinks_p = q_fused_buf_ + B.wq_sink_off;
+        else lin(B.attn_sink_proj, xn_, sinks_, 1, xq_);
     } else {
         lin(B.wq, xn_, qraw_, n, xq_);
         lin(B.attn_rel, xn_, r_raw_, n, xq_);
@@ -1076,22 +1069,14 @@ void Inkling2::attn(const Step& st, Block& B, SlotCache& sc, int64_t pos, int n)
         lin(B.wqkv_gate, xn_, gate_, n, xq_);
     }
 
-    if (share_swa && B.wkv_fused.p) {
-        const int kv_w = n_kv_ * head_dim_;
-        lin(B.wkv_fused, xn_, kv_fused_buf_, n, xq_);
-        const float* k_src = kv_fused_buf_;
-        const float* v_src = kv_fused_buf_ + kv_w;
-        if (n > 1) {
-            inkling_split_kv(kv_fused_buf_, kraw_, att_, kv_w, n, st_);
-            k_src = kraw_;
-            v_src = att_;
-        }
-        inkling_conv4(k_src, state_ + sc.state_off + off_k_conv_, fp(B.attn_k_conv), nullptr, head_dim_,
-                      k_, kv_w, n, st_, snap_bits_ ? snap_at_ + sc.state_off + off_k_conv_ : nullptr,
+    if (share_swa && n == 1 && B.wkv_fused.p) {
+        lin(B.wkv_fused, xn_, kv_fused_buf_, 1, xq_);
+        inkling_conv4(kv_fused_buf_, state_ + sc.state_off + off_k_conv_, fp(B.attn_k_conv), nullptr, head_dim_,
+                      k_, n_kv_ * head_dim_, 1, st_, snap_bits_ ? snap_at_ + sc.state_off + off_k_conv_ : nullptr,
                       rec_n_, snap_bits_);
-        inkling_conv4(v_src, state_ + sc.state_off + off_v_conv_, fp(B.attn_v_conv), nullptr, head_dim_,
-                      v_, kv_w, n, st_, snap_bits_ ? snap_at_ + sc.state_off + off_v_conv_ : nullptr,
-                      rec_n_, snap_bits_);
+        inkling_conv4(kv_fused_buf_ + (size_t) n_kv_ * head_dim_, state_ + sc.state_off + off_v_conv_,
+                      fp(B.attn_v_conv), nullptr, head_dim_, v_, n_kv_ * head_dim_, 1, st_,
+                      snap_bits_ ? snap_at_ + sc.state_off + off_v_conv_ : nullptr, rec_n_, snap_bits_);
     } else {
         if (!share_swa) {
             kernels::native_add_rms_norm_q8_1(in1, nullptr, fp(nk), xn_, xq_, n_embd_, n, rms_eps_, threads, st_);
@@ -1566,17 +1551,18 @@ void Inkling2::draft_commit(int64_t pos, int n) {
             kernels::native_quantize_q8_1(cur_, xq_, n_embd_ * n, 1, st_);
             xq_ctx = xq_;
         }
-        lin(dl.kv_proj_ctx, cur_, qraw_, n, xq_ctx);
         if (n == 1) {
+            lin(dl.kv_proj_ctx, cur_, qraw_, 1, xq_ctx);
             head_norm_rope(qraw_, dspark_head_dim_, fp(dl.k_norm_ctx), k_, dspark_head_dim_, dspark_kv_,
                            dspark_head_dim_, dspark_theta_scale_, pos, 1, dspark_eps_, st_);
             store_d_kv(k_, dl, false);
             store_d_kv(qraw_ + kv_width, dl, true);
         } else {
-            inkling_split_kv(qraw_, q_, v_, kv_width, n, st_);
+            lin(dl.k_proj_ctx, cur_, q_, n, xq_ctx);
             head_norm_rope(q_, dspark_head_dim_, fp(dl.k_norm_ctx), k_, dspark_head_dim_, dspark_kv_, dspark_head_dim_,
                            dspark_theta_scale_, pos, n, dspark_eps_, st_);
             store_d_kv(k_, dl, false);
+            lin(dl.v_proj_ctx, cur_, v_, n, xq_ctx);
             store_d_kv(v_, dl, true);
         }
     }

@@ -971,49 +971,7 @@ int test_fused_and_predequant() {
         cudaFree(d_r); cudaFree(d_b);
     }
 
-    // 2. inkling_split_q_fused & inkling_split_kv
-    {
-        const int rows = 7, q_dim = 64, rel_dim = 32, n_head = 8, flags = 7;
-        const int stride = 2 * q_dim + rel_dim + n_head;
-        auto src = random_vec((size_t) rows * stride);
-        std::vector<float> w_q((size_t) rows * q_dim), w_g((size_t) rows * q_dim), w_r((size_t) rows * rel_dim),
-                           w_s((size_t) rows * n_head);
-        for (int t = 0; t < rows; ++t) {
-            const float* row = src.data() + (size_t) t * stride;
-            std::copy(row, row + q_dim, w_q.data() + (size_t) t * q_dim);
-            std::copy(row + q_dim, row + 2 * q_dim, w_g.data() + (size_t) t * q_dim);
-            std::copy(row + 2 * q_dim, row + 2 * q_dim + rel_dim, w_r.data() + (size_t) t * rel_dim);
-            std::copy(row + 2 * q_dim + rel_dim, row + stride, w_s.data() + (size_t) t * n_head);
-        }
-        float *d_src = dev(src), *d_q = dev(std::vector<float>(w_q.size(), 0.f)),
-              *d_g = dev(std::vector<float>(w_g.size(), 0.f)), *d_r = dev(std::vector<float>(w_r.size(), 0.f)),
-              *d_s = dev(std::vector<float>(w_s.size(), 0.f));
-        inkling_split_q_fused(d_src, d_q, d_g, d_r, d_s, q_dim, rel_dim, n_head, flags, rows, nullptr);
-        cudaDeviceSynchronize();
-        bad += report("inkling_split_q_fused (Q)", host(d_q, w_q.size()), w_q, 0.0);
-        bad += report("inkling_split_q_fused (gate)", host(d_g, w_g.size()), w_g, 0.0);
-        bad += report("inkling_split_q_fused (rel)", host(d_r, w_r.size()), w_r, 0.0);
-        bad += report("inkling_split_q_fused (sinks)", host(d_s, w_s.size()), w_s, 0.0);
-        cudaFree(d_src); cudaFree(d_q); cudaFree(d_g); cudaFree(d_r); cudaFree(d_s);
-
-        const int kv_dim = 48;
-        auto kv_src = random_vec((size_t) rows * 2 * kv_dim);
-        std::vector<float> w_k((size_t) rows * kv_dim), w_v((size_t) rows * kv_dim);
-        for (int t = 0; t < rows; ++t) {
-            const float* row = kv_src.data() + (size_t) t * 2 * kv_dim;
-            std::copy(row, row + kv_dim, w_k.data() + (size_t) t * kv_dim);
-            std::copy(row + kv_dim, row + 2 * kv_dim, w_v.data() + (size_t) t * kv_dim);
-        }
-        float *d_kv = dev(kv_src), *d_k = dev(std::vector<float>(w_k.size(), 0.f)),
-              *d_v = dev(std::vector<float>(w_v.size(), 0.f));
-        inkling_split_kv(d_kv, d_k, d_v, kv_dim, rows, nullptr);
-        cudaDeviceSynchronize();
-        bad += report("inkling_split_kv (K)", host(d_k, w_k.size()), w_k, 0.0);
-        bad += report("inkling_split_kv (V)", host(d_v, w_v.size()), w_v, 0.0);
-        cudaFree(d_kv); cudaFree(d_k); cudaFree(d_v);
-    }
-
-    // 3. inkling_swiglu_gate_up_q8_1 vs FP64 Q8_1 reference
+    // 2. inkling_swiglu_gate_up_q8_1 vs FP64 Q8_1 reference
     {
         const int rows = 4, ff_dim = 128, nb = ff_dim / 32;
         auto gu = random_vec((size_t) rows * 2 * ff_dim, 2.0f);

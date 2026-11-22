@@ -559,33 +559,12 @@ __global__ void inkling_attend_split_gqa_kernel(const float* __restrict__ q, con
 #pragma unroll
         for (int p = 0; p < PER; ++p) dot[p] = 0.0f;
 
-        if (kq8.codes || kq4.codes) {
-            const uint2 ku = *reinterpret_cast<const uint2*>((kq8.codes ? kq8.scales : kq4.scales) + s_off);
-            const half2 kh0 = *reinterpret_cast<const half2*>(&ku.x);
-            const half2 kh1 = *reinterpret_cast<const half2*>(&ku.y);
-            const float k_sc[4] = {__low2float(kh0), __high2float(kh0), __low2float(kh1), __high2float(kh1)};
 #pragma unroll
-            for (int u = 0; u < 4; ++u) {
-                const int d = u * 32 + lane;
-                float kv;
-                if (kq8.codes) {
-                    kv = float(kq8.codes[k_off + d]) * k_sc[u];
-                } else {
-                    const uint8_t packed = kq4.codes[((s_off + u) << 4) + (lane & 15)];
-                    const int qv = (lane & 16) ? (packed >> 4) : (packed & 0x0f);
-                    kv = float(qv - 8) * k_sc[u];
-                }
+        for (int u = 0; u < 4; ++u) {
+            const int d = u * 32 + lane;
+            const float kv = read_kv_val(kcache, kq8, kq4, k_off + d, s_off + u);
 #pragma unroll
-                for (int p = 0; p < PER; ++p) dot[p] += q_reg[p][u] * kv;
-            }
-        } else {
-#pragma unroll
-            for (int u = 0; u < 4; ++u) {
-                const int d = u * 32 + lane;
-                const float kv = __half2float(__ushort_as_half(kcache[k_off + d]));
-#pragma unroll
-                for (int p = 0; p < PER; ++p) dot[p] += q_reg[p][u] * kv;
-            }
+            for (int p = 0; p < PER; ++p) dot[p] += q_reg[p][u] * kv;
         }
 
         const long long dist = q_pos - j;
@@ -608,33 +587,12 @@ __global__ void inkling_attend_split_gqa_kernel(const float* __restrict__ q, con
             m_w[p] = m_new;
         }
 
-        if (vq8.codes || vq4.codes) {
-            const uint2 vu = *reinterpret_cast<const uint2*>((vq8.codes ? vq8.scales : vq4.scales) + s_off);
-            const half2 vh0 = *reinterpret_cast<const half2*>(&vu.x);
-            const half2 vh1 = *reinterpret_cast<const half2*>(&vu.y);
-            const float v_sc[4] = {__low2float(vh0), __high2float(vh0), __low2float(vh1), __high2float(vh1)};
 #pragma unroll
-            for (int u = 0; u < 4; ++u) {
-                const int d = u * 32 + lane;
-                float vv;
-                if (vq8.codes) {
-                    vv = float(vq8.codes[k_off + d]) * v_sc[u];
-                } else {
-                    const uint8_t packed = vq4.codes[((s_off + u) << 4) + (lane & 15)];
-                    const int qv = (lane & 16) ? (packed >> 4) : (packed & 0x0f);
-                    vv = float(qv - 8) * v_sc[u];
-                }
+        for (int u = 0; u < 4; ++u) {
+            const int d = u * 32 + lane;
+            const float vv = read_kv_val(vcache, vq8, vq4, k_off + d, s_off + u);
 #pragma unroll
-                for (int p = 0; p < PER; ++p) o_reg[p][u] += w_j[p] * vv;
-            }
-        } else {
-#pragma unroll
-            for (int u = 0; u < 4; ++u) {
-                const int d = u * 32 + lane;
-                const float vv = __half2float(__ushort_as_half(vcache[k_off + d]));
-#pragma unroll
-                for (int p = 0; p < PER; ++p) o_reg[p][u] += w_j[p] * vv;
-            }
+            for (int p = 0; p < PER; ++p) o_reg[p][u] += w_j[p] * vv;
         }
     }
 
@@ -858,34 +816,6 @@ __global__ void inkling_add_to_stream_kernel(const float* __restrict__ a, const 
     const size_t src_i = size_t(blockIdx.y) * n_embd + i;
     const size_t dst_i = (size_t(blockIdx.y) * streams + dst_stream) * n_embd + i;
     r[dst_i] = a ? (a[src_i] + b[src_i]) : (r[dst_i] + b[src_i]);
-}
-
-__global__ void inkling_split_q_fused_kernel(const float* __restrict__ src, float* __restrict__ qraw,
-                                             float* __restrict__ gate, float* __restrict__ r_raw,
-                                             float* __restrict__ sinks, int q_dim, int rel_dim, int n_head,
-                                             int flags) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    const int off_r = 2 * q_dim;
-    const int off_s = off_r + ((flags & 2) ? rel_dim : 0);
-    const int stride = off_s + ((flags & 4) ? n_head : 0);
-    if (i >= stride) return;
-    const size_t t = blockIdx.y;
-    const float x = src[t * stride + i];
-    if (i < q_dim) qraw[t * q_dim + i] = x;
-    else if (i < off_r) gate[t * q_dim + (i - q_dim)] = x;
-    else if (i < off_s) r_raw[t * rel_dim + (i - off_r)] = x;
-    else sinks[t * n_head + (i - off_s)] = x;
-}
-
-__global__ void inkling_split_kv_kernel(const float* __restrict__ src, float* __restrict__ k, float* __restrict__ v,
-                                        int kv_dim) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    const int stride = 2 * kv_dim;
-    if (i >= stride) return;
-    const size_t t = blockIdx.y;
-    const float x = src[t * stride + i];
-    if (i < kv_dim) k[t * kv_dim + i] = x;
-    else v[t * kv_dim + (i - kv_dim)] = x;
 }
 
 struct Q81Block {
@@ -1307,21 +1237,6 @@ void inkling_add_to_stream(const float* a, const float* b, float* r, int streams
     inkling_add_to_stream_kernel<<<dim3(grid(n_embd, 256), rows), 256, 0, cs(stream)>>>(a, b, r, streams, dst_stream,
                                                                                         n_embd);
     ck("inkling_add_to_stream");
-}
-
-void inkling_split_q_fused(const float* src, float* qraw, float* gate, float* r_raw, float* sinks, int q_dim,
-                           int rel_dim, int n_head, int flags, int rows, void* stream) {
-    if (rows <= 0) return;
-    const int stride = 2 * q_dim + ((flags & 2) ? rel_dim : 0) + ((flags & 4) ? n_head : 0);
-    inkling_split_q_fused_kernel<<<dim3(grid(stride, 256), rows), 256, 0, cs(stream)>>>(
-        src, qraw, gate, r_raw, sinks, q_dim, rel_dim, n_head, flags);
-    ck("inkling_split_q_fused");
-}
-
-void inkling_split_kv(const float* src, float* k, float* v, int kv_dim, int rows, void* stream) {
-    if (rows <= 0) return;
-    inkling_split_kv_kernel<<<dim3(grid(2 * kv_dim, 256), rows), 256, 0, cs(stream)>>>(src, k, v, kv_dim);
-    ck("inkling_split_kv");
 }
 
 void inkling_dequant_kv_span(int64_t lo, int count, int width, int ring, Kvq8 kq8, Kvq8 vq8, Kvq4 kq4, Kvq4 vq4,

@@ -498,11 +498,6 @@ void inkling_read_stream(const float* r, int streams, int src_stream, float* out
 void inkling_add_to_stream(const float* a, const float* b, float* r, int streams, int dst_stream, int n_embd, int rows,
                            void* stream);
 
-/// Split row-interleaved fused attention projections into contiguous per-component buffers (for rows > 1).
-void inkling_split_q_fused(const float* src, float* qraw, float* gate, float* r_raw, float* sinks, int q_dim,
-                           int rel_dim, int n_head, int flags, int rows, void* stream);
-void inkling_split_kv(const float* src, float* k, float* v, int kv_dim, int rows, void* stream);
-
 /// Pre-dequantize a contiguous or ring-wrapped span `[lo, lo + count)` of quantized KV rows into FP16 `kwork`/`vwork`.
 void inkling_dequant_kv_span(int64_t lo, int count, int width, int ring, Kvq8 kq8, Kvq8 vq8, Kvq4 kq4, Kvq4 vq4,
                              uint16_t* kwork, uint16_t* vwork, void* stream);
