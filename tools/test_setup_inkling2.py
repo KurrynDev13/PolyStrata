@@ -39,7 +39,7 @@ class Pins(unittest.TestCase):
             self.assertLess(d["arena_gb"], d["download_gb"])
             self.assertEqual(d["ram_gb"], round(setup.poly_ram_need(d, 8.0)), size)
         self.assertEqual(setup.POLY_GGUF_ARCHS["inkling2"], ("inkling2_loop", "inkling2"))
-        self.assertIn("KurrynDev13/PolyStrata", setup.POLY_PREBUILT_URL)
+        self.assertIn("KurrynDev13/PolyStrata-Inkling2", setup.POLY_PREBUILT_URL)
 
     def test_the_about_line_says_the_first_size(self):
         n = setup.poly_ram_need(FAM["models"]["UD-Q3_K_XL"], 8.0)

@@ -71,7 +71,7 @@ Ryzen 9 7900X (12 核 24 线程, AVX-512) · RTX 4070 SUPER 12 GB (`sm_89`) · D
 python setup.py --family inkling2 --model UD-Q3_K_XL --kv k8v4 --context 131072 --yes
 ```
 
-支持从 [`unsloth/Inkling-2-Mini-GGUF`](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) 下载并校验 `UD-Q3_K_XL`（`13.6 GB`，推荐 12 GB 显存 + 32 GB 内存）、`UD-IQ3_XXS`（`11.7 GB`）、`UD-Q4_K_XL`（`16.4 GiB`）和 `UD-Q8_K_XL`（`22.9 GB`）。预编译发布包地址指向本仓库：`https://github.com/KurrynDev13/PolyStrata/releases/latest/download/`。
+支持从 [`unsloth/Inkling-2-Mini-GGUF`](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) 下载并校验 `UD-Q3_K_XL`（`13.6 GB`，推荐 12 GB 显存 + 32 GB 内存）、`UD-IQ3_XXS`（`11.7 GB`）、`UD-Q4_K_XL`（`16.4 GiB`）和 `UD-Q8_K_XL`（`22.9 GB`）。预编译发布包地址指向本仓库：`https://github.com/KurrynDev13/PolyStrata-Inkling2/releases/latest/download/`。
 
 ### 2. 可选：转换 DSpark MTP 草稿权重
 

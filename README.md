@@ -71,7 +71,7 @@ Run **`START-HERE.bat`** and select **`inkling2`**, or install non-interactively
 python setup.py --family inkling2 --model UD-Q3_K_XL --kv k8v4 --context 131072 --yes
 ```
 
-Pinned models from [`unsloth/Inkling-2-Mini-GGUF`](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF): `UD-Q3_K_XL` (`13.6 GB`, recommended for 12 GB VRAM + 32 GB RAM), `UD-IQ3_XXS` (`11.7 GB`), `UD-Q4_K_XL` (`16.4 GiB`, native NVFP4 + Q8_0), and `UD-Q8_K_XL` (`22.9 GB`). Prebuilt Windows releases resolve from `https://github.com/KurrynDev13/PolyStrata/releases/latest/download/`.
+Pinned models from [`unsloth/Inkling-2-Mini-GGUF`](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF): `UD-Q3_K_XL` (`13.6 GB`, recommended for 12 GB VRAM + 32 GB RAM), `UD-IQ3_XXS` (`11.7 GB`), `UD-Q4_K_XL` (`16.4 GiB`, native NVFP4 + Q8_0), and `UD-Q8_K_XL` (`22.9 GB`). Prebuilt Windows releases resolve from `https://github.com/KurrynDev13/PolyStrata-Inkling2/releases/latest/download/`.
 
 ### 2. Optional DSpark MTP drafter conversion
 
