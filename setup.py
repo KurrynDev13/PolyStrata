@@ -95,6 +95,7 @@ HF_REVISIONS = {
     "Diffuspace/Clover-35B-A3B-Preview": "4b0402b65e523d0183a14c431955438714cb16ff",                     # 2026-10-28
     "unsloth/Ornith-1.5-122B-GGUF": "3842d003341507c216295c6f28dfcd30349925c6",                          # 2026-10-20
     "ornith-ai/Ornith-1.5-122B": "dfa07bab90e90746ffbfc0b0cba3126eb9265de2",                              # 2026-10-20
+    "unsloth/Inkling-2-Mini-GGUF": "45fd08764f2b0bf16b03a5483a80e5c7aaec8772",                            # 2026-11-22
 }
 
 
@@ -863,6 +864,34 @@ FAMILIES = {
                              (32785752352, "43bdc1b0cb764b5531d320816fb6004245256a414bfd55f1fdb69e3db42eaa57"),
                              "mmproj-F16.gguf":
                              (908724544, "39db176176a904b101f5173a4f03e785990f9279f94ab373c4fd629ae7011817")}},
+    # Inkling-2-Mini (llama.cpp's "inkling2_loop" / "inkling2") on strata-poly: Thinking Machines Lab's 26B-A3B
+    # looped mixture of experts (48 execution steps: 8 global attention layers + 40 SWA ring layers), quantized by
+    # Unsloth.  Measured on a 12 GB RTX 4070 SUPER + 32 GB RAM under Windows with --kv k8v4.  "row_bytes": 8 global
+    # layers x 8 KV heads x 128 x 2 (K, V) x 2 B (fp16) = 32,768 B/token (--kv k8v4 uses 13,312 B/token).
+    # Note: Unsloth's dspark-Inkling-2-Mini-*.gguf uses the "dflash" GGUF layout; strata-poly's optional DSpark MTP
+    # drafter currently loads inkling2_dspark GGUFs converted via tools/convert_inkling2_dspark.py.
+    "inkling2": {"title": "Inkling-2-Mini", "by": "Thinking Machines Lab; quantized by Unsloth",
+                 "about": "on the strata-poly engine: one NVIDIA card, Linux or Windows; a 14 GB file, ~18 GB of RAM "
+                          "beside an 8 GB card; three other sizes too, no images",
+                 "hf": hf("unsloth/Inkling-2-Mini-GGUF"), "file": "Inkling-2-Mini-{q}.gguf", "shards": 1,
+                 "tag": "inkling2-", "name": "inkling-2-mini", "engine": "poly", "vision": False,
+                 "experimental": True, "windows": True, "ran_on_gb": 12, "row_bytes": 32768,
+                 "models": {"UD-Q3_K_XL": {"about": "3-bit experts (Unsloth Dynamic): best balance for 8-12 GB cards",
+                                           "download_gb": 13.6, "ram_gb": 18, "arena_gb": 12.4, "vram_beside_gb": 3.5},
+                            "UD-IQ3_XXS": {"about": "3-bit i-quant experts (Unsloth Dynamic): the least RAM",
+                                           "download_gb": 11.7, "ram_gb": 16, "arena_gb": 10.4, "vram_beside_gb": 3.5},
+                            "UD-Q4_K_XL": {"about": "4- and 5-bit experts (Unsloth Dynamic): higher quality",
+                                           "download_gb": 17.6, "ram_gb": 22, "arena_gb": 16.4, "vram_beside_gb": 3.6},
+                            "UD-Q8_K_XL": {"about": "8-bit experts (Unsloth Dynamic): closest to full precision",
+                                           "download_gb": 22.9, "ram_gb": 27, "arena_gb": 21.6, "vram_beside_gb": 4.0}},
+                 "sha256": {"Inkling-2-Mini-UD-Q3_K_XL.gguf":
+                            (13631778016, "f72f396d1b479b14d76346df80baa449c8b1f399653bff38fa4764b359a40048"),
+                            "Inkling-2-Mini-UD-IQ3_XXS.gguf":
+                            (11663309504, "bd7ef0865adf119b5183e45e741c629bafa649769b33b5ebf689bb4bcc4690d6"),
+                            "Inkling-2-Mini-UD-Q4_K_XL.gguf":
+                            (17629759456, "e62d463c135ffe283df8d94b279a96ca145ac128b52ce854478613045bf4de15"),
+                            "Inkling-2-Mini-UD-Q8_K_XL.gguf":
+                            (22867451616, "dfb04bf37bee457f98800989dedf93ec442ede8636dbea9433992f1e527e9a41")}},
 }
 MMPROJ = "mmproj-Qwen3.8-Flash-Next-BF16.gguf"
 # Qwen3.6-35B-A3B (GGUF architecture qwen35moe), Unsloth's GGUFs with the MTP block: a family with an engine path of its
@@ -923,7 +952,7 @@ POLY_EXE = "strata-poly.exe" if WIN else "strata-poly"
 # encoder in it (poly_asset()), so a checkout finds the build of its own source or none.  STRATA_POLY_PREBUILT_URL:
 # another folder, a local one too.
 POLY_PREBUILT_URL = os.environ.get("STRATA_POLY_PREBUILT_URL",
-                                   "https://github.com/VecSzn/PolyStrata/releases/latest/download/")
+                                   "https://github.com/KurrynDev13/PolyStrata/releases/latest/download/")
 POLY_ASSET = "strata-poly-windows-x64-{src}.zip"
 # A model of strata-poly that reads pictures has its image encoder on the GPU from this much VRAM (GiB), and on the
 # CPU below it: the encoder holds 1.6 to 2.4 GB there, which a smaller card needs for the model
@@ -2390,7 +2419,8 @@ def verify_sha256(s: Path, size: int, sha: str, own: bool = False) -> None:
 # general.architecture of each strata-poly family's GGUFs, the name Engine::open() (src/poly/engine.cpp) picks its
 # code by; the families not listed are qwen35moe
 POLY_GGUF_ARCHS = {"glm": ("glm5-next", "glm5next"), "deepseek": ("deepseek4",), "lfm25": ("lfm2moe",),
-                   "gemma4": ("gemma4",), "flint": ("flint",), "kolibri": ("kolibri1",), "clover": ("clover_moe",)}
+                   "gemma4": ("gemma4",), "flint": ("flint",), "kolibri": ("kolibri1",), "clover": ("clover_moe",),
+                   "inkling2": ("inkling2_loop", "inkling2")}
 
 
 def gguf_arch(s: Path) -> str:
@@ -6526,7 +6556,8 @@ def poly_verdict(d, ram, vram_gb, hip, windows=False) -> str:
 
 # --kv for a model of strata-poly (docs/Q8_KV.md): the formats its architecture's attention caches have beside
 # fp16, the default.  The other engine's own are STRATA_KV.
-POLY_KV = {"q8_0": ("qwen36", "ornith", "ornith122", "tiel", "minicpmv", "kolibri", "flint", "lfm25"),
+POLY_KV = {"q8_0": ("qwen36", "ornith", "ornith122", "tiel", "minicpmv", "kolibri", "flint", "lfm25", "inkling2"),
+           "q4_0": ("inkling2",), "k8v4": ("inkling2",),
            "int8": ("gemma4",), "int8k": ("gemma4",)}
 STRATA_KV = ("int8", "q4_0", "k8v4")
 
@@ -6907,7 +6938,7 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
         warn(f"{title} on AMD cards on Windows: EXPERIMENTAL.  Setup compiles the HIP engine here (AMD's ROCm "
              "wheels), which has run Tiel Coder on an RX 9070 XT and Qwen3.6, Ornith, Tiel Coder and Gemma 4 on an "
              "RX 5700 XT, and nothing else yet; the log says where it stops if it does")
-    elif hip and family in ("glm", "deepseek", "flint", "kolibri", "clover"):   # the engine runs on AMD, these not yet
+    elif hip and family in ("glm", "deepseek", "flint", "kolibri", "clover", "inkling2"):   # the engine runs on AMD, these not yet
         warn(f"{title} on the AMD card has not been tried: the engine runs there, this model was not")
     if cuda_tk == 12:
         warn(f"{title}'s engine with CUDA 12 is compiled here (the ready-made one is CUDA 13)" +
@@ -7850,7 +7881,7 @@ def main() -> int:
                          "DeepSeek V4 Flash, lfm25 = LFM2.5-24B-A2B, flint = Flint 40B-A2.5B, qwen36 = "
                          "Qwen3.6-35B-A3B on strata-poly, clover = Clover-35B-A3B-Preview, ornith = "
                          "Ornith 1.5, gemma4 = Gemma 4 26B-A4B, tiel = Tiel Coder 35B-A3B, minicpmv = MiniCPM-V 4.7 "
-                         "35B-A3B, ornith122 = Ornith 1.5 122B (docs/BACKENDS.md), qwen36-strata = Qwen3.6-35B-A3B on the Strata project's "
+                         "35B-A3B, ornith122 = Ornith 1.5 122B, inkling2 = Inkling-2-Mini (docs/BACKENDS.md), qwen36-strata = Qwen3.6-35B-A3B on the Strata project's "
                          "own engine (UD-Q4_K_XL and up, 32 GB of RAM or more; pictures with --vision, several "
                          "requests at once with --parallel; docs/QWEN36.md)")
     ap.add_argument("--model", choices=list(dict.fromkeys(
@@ -7868,7 +7899,8 @@ def main() -> int:
                     help="KV cache precision above 8K context: int8 (default), q4_0 (half the memory, a little less "
                          "precise) or k8v4 (hybrid: INT8 K + 4-bit V, 816 B/cell). For a model of strata-poly "
                          "(docs/Q8_KV.md): q8_0 (half the KV cache's VRAM: Qwen3.6, Ornith, Tiel Coder, MiniCPM-V, "
-                         "Kolibri, Flint, LFM2.5), int8 or int8k (Gemma 4), fp16 (the default)")
+                         "Kolibri, Flint, LFM2.5, Inkling-2-Mini), k8v4 or q4_0 (Inkling-2-Mini), int8 or int8k "
+                         "(Gemma 4), fp16 (the default)")
     ap.add_argument("--vision", choices=["yes", "no", "none", "gpu", "cpu"],
                     help="let the model read images (yes = the encoder on the GPU)")
     ap.add_argument("--vision-tokens", type=int, metavar="N",

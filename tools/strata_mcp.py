@@ -221,6 +221,17 @@ FALLBACK_FAMILIES = {
                                             "download_gb": 79.7, "ram_gb": 66, "arena_gb": 73.0},
                              "Q8_0": {"about": "8-bit throughout: the closest to the model as trained",
                                       "download_gb": 132.6, "ram_gb": 119, "arena_gb": 125.8}}},
+    "inkling2": {"title": "Inkling-2-Mini",
+                 "about": "on the strata-poly engine: one NVIDIA card, Linux or Windows; a 14 GB file, ~18 GB of RAM beside an 8 GB card; three other sizes too, no images",
+                 "tag": "inkling2-", "engine": "poly", "vision": False, "experimental": True,
+                 "models": {"UD-Q3_K_XL": {"about": "3-bit experts (Unsloth Dynamic): best balance for 8-12 GB cards",
+                                           "download_gb": 13.6, "ram_gb": 18, "arena_gb": 12.4},
+                            "UD-IQ3_XXS": {"about": "3-bit i-quant experts (Unsloth Dynamic): the least RAM",
+                                           "download_gb": 11.7, "ram_gb": 16, "arena_gb": 10.4},
+                            "UD-Q4_K_XL": {"about": "4- and 5-bit experts (Unsloth Dynamic): higher quality",
+                                           "download_gb": 17.6, "ram_gb": 22, "arena_gb": 16.4},
+                            "UD-Q8_K_XL": {"about": "8-bit experts (Unsloth Dynamic): closest to full precision",
+                                           "download_gb": 22.9, "ram_gb": 27, "arena_gb": 21.6}}},
 }
 FALLBACK_CONTEXTS = [8192, 32768, 65536, 131072, 204800, 262144, 393216, 524288]
 BENCH_PROMPT = ("Write a short story (about 300 words) about a lighthouse keeper who finds a message in a bottle. "
