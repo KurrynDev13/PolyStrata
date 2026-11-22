@@ -1,372 +1,79 @@
-<h1 align="center">PolyStrata</h1>
+# PolyStrata-Inkling2
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md) · **Türkçe**
 
-<p align="center"><b>Büyük yapay zekâ modellerini kendi bilgisayarında çalıştır</b><br>
-Inkling 2 Mini, Qwen3.8-Flash-Next, GLM 5.3 Flash, DeepSeek V4 Flash, LFM2.5, Flint, Qwen3.6, Clover, Ornith 1.5, Gemma 4, Tiel Coder, MiniCPM-V ve Kolibri 1 · ücretsiz ve açık kaynak</p>
+**Tek bir 12 GB GPU üzerinde Inkling-2-Mini — resmi olmayan PolyStrata çatalı**
 
-<p align="center"><a href="https://github.com/simplexai-labs/linger"><img height="28" alt="Used by Linger" src="docs/media/used-by-linger.svg"></a></p>
+![PolyStrata-Inkling2: UD-Q3_K_XL + DSpark vs llama.cpp PR #32704 — Code, Mixed long jobs, 32K Prompt okuma, HumanEval+, GPQA Diamond](docs/img/inkling2-card.png)
 
-<p align="center"><img src="docs/media/speed.svg" width="820" alt="Yanıt yazarken saniyede token: 8 GB kartlı bir dizüstünde Qwen3.6-35B-A3B ile 94 ila 100, bir RTX 5090'da 394 ila 395"></p>
+PolyStrata-Inkling2, Thinking Machines Lab'in **Inkling-2-Mini** (48 sanal adımlı döngüsel MoE, `26B-A3B`) modelini **tek bir 12 GB GPU ve 32 GB RAM** ile CUDA (`strata-poly.exe`) üzerinde çalıştırmak için özelleştirilmiş resmi olmayan bir [PolyStrata](https://github.com/VecSzn/PolyStrata) ([Strata](https://github.com/Niko1221/Strata) tabanlı) çatalıdır; isteğe bağlı **DSpark MTP** spekülatif taslak üretimi, **`--kv k8v4`** / **`q4_0`** KV önbelleği ve CPU görüntü kodlayıcı içerir.
 
-<p align="center"><img src="docs/media/claude-code-demo.gif" width="820" alt="Bir terminalde Claude Code ve yanında PolyStrata'nın API Monitor ekranı"><br>
-<sub>Claude Code, Qwen3.6-35B-A3B UD-Q3_K_M ile 8 GB kartlı dizüstünde, gerçek zamanlı: küçük bir programa <code>--json</code> seçeneği ekliyor, bunun için bir test yazıyor ve testleri çalıştırıyor. Sunucu, başlarken Claude Code'un sistem prompt'unu okumuştu (<code>"warm_start": true</code>).</sub></p>
+Tek bir masaüstü bilgisayarda ölçülmüştür (`~3–8 %` çalıştırmalar arası fark olabilir); Thinking Machines Lab, Unsloth, Strata veya PolyStrata ile bağlantısı yoktur.
 
-<p align="center"><a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4"><img src="docs/media/pagoda-preview.webp" width="720" alt="Modelin yazdığı, tarayıcıda çalışan voksel bir pagoda bahçesi"></a><br>
-<sub>Voksel bir pagoda bahçesi; tek bir prompt'la yazıldı, <a href="https://github.com/Niko1221/Strata">Strata</a> ile bir RTX 5070'te çalışıyor (Qwen3.8-Flash-Next IQ3_S, 128K bağlam) ·
-<a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4">videonun tamamı (49 sn)</a></sub></p>
+- **Tek tıkla kurulum:** [START-HERE.bat](START-HERE.bat) (Windows) veya `./setup.sh --family inkling2 --kv k8v4` çalıştırarak [`unsloth/Inkling-2-Mini-GGUF`](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) dosyalarını otomatik indirebilirsiniz.
+- **Önceki çoklu model README'si:** [README.upstream.md](README.upstream.md) · **Ayrıntılı ölçüm raporu:** [Inkling 2 Mini Benchmark.md](Inkling%202%20Mini%20Benchmark.md).
 
-PolyStrata, normalde bir sunucu gerektiren büyük yapay zekâ modellerini sıradan bir bilgisayarda çalıştırır. Bu
-modeller sohbet eder, kod yazar, uygulamaların ve kodlama ajanlarınla birlikte çalışır. Hiçbir veri bilgisayarından
-dışarı çıkmaz.
+## Referans PC Sonuçları
 
-İki motor üzerinde on üç model çalıştırır:
+![RTX 4070 SUPER 12 GB üzerinde Inkling-2-Mini bellek yerleşimi ve hız sonuçları](docs/img/inkling2-summary.png)
 
-- **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)**: Windows veya Linux'ta, 12 GB ya da
-  daha fazla belleği olan bir NVIDIA veya AMD ekran kartında. Resimleri de okur. Motoru
-  [Strata](https://github.com/Niko1221/Strata) projesinin motorudur, değiştirilmeden kullanılır.
+Ryzen 9 7900X (12C/24T, AVX-512) · RTX 4070 SUPER 12 GB (`sm_89`) · DDR5 32 GB (`31,1 GiB` kullanılabilir) · Windows 11 · model: [`unsloth/Inkling-2-Mini-GGUF`](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) **`UD-Q3_K_XL`** (`13,6 GB`) ve **`UD-Q4_K_XL`** (`16,4 GiB`, 0–19 katmanlarda NVFP4 + 20–23'te Q8_0), DSpark MTP açık (`inkling2-dspark.gguf`), `--kv k8v4 --cache-bias 0.2`, `131K–262K` bağlam.
 
-Diğer on ikisi, PolyStrata için yazılmış bir motorda, bir NVIDIA kartıyla ya da [iki](docs/MULTI_GPU.md#the-strata-poly-models) kartla çalışır: hepsi
-Linux'ta, GLM 5.3 Flash ve DeepSeek V4 Flash dışındakiler Windows'ta da. Deneyseldirler: 32 GB kartlı bir
-bilgisayarda, küçük olanları ayrıca 8 GB veya 12 GB kartlı bilgisayarlarda da çalıştırıldı.
+| | `llama.cpp` PR `#32704` (`-ngl 99 -cmoe`) | `UD-Q4_K_XL` + DSpark (`k8v4`, NVFP4/Q8) | `UD-Q3_K_XL` + DSpark (`k8v4`, varsayılan) |
+|---|---|---|---|
+| VRAM'deki uzman sayısı | 0 / 3.072 (`0 GiB`) | 1.520–1.613 / 3.072 (`7,3–7,5 GiB`) | **1.989 / 3.072 (`7,5 GiB`, 64,7 %)** |
+| Code (`temperature 0`, 1.500 token, 3 koşu ort.) | 13,7 tok/s *(25-tok üretimi)* | 55,4 tok/s (`59,1 / 53,0 / 54,2`) | **63,2 tok/s (`61,4 / 65,4 / 62,8`)** |
+| Mixed long jobs (`düzyazı, kod, araç çağrısı, çeviri, düşünme`) | — | 58,1 tok/s (`50,6 / 62,8 / 81,0 / 46,3 / 49,7`) | **64,7 tok/s (`56,3 / 74,8 / 82,0 / 54,3 / 56,1`)** |
+| Saf üretim (`--window 1 --no-draft` sabit) | 13,7 tok/s | 47,3 tok/s | **59,7 tok/s** (`2.098` uzman) |
+| 32K bağlamda üretim | — | 43,8 tok/s | **47,8 tok/s** |
+| 120K bağlamda üretim | — | — | **31,8 tok/s** |
+| Canlı `181,6K` OpenCode oturumu | — | — | **28,1–30,0 tok/s** |
+| İstemi okuma, 1,8K–5,4K token | 263 tok/s *(1,8K)* | **1.307 tok/s** *(5,4K, MTP'siz)* | — |
+| İstemi okuma, 32K token | — | 1.035 tok/s | **1.137 tok/s** |
+| İstemi okuma, 120K token | — | — | **847 tok/s** |
+| `llama.cpp` ile greedy token uyumu | *referans* | **48 / 48 (100 %)** | 48 / 48 *(FP16 & `q8_0` KV)* |
+| HumanEval / HumanEval+ (EvalPlus 0.3.1, `temp 0`, effort 0) | — | **97,6 / 92,7 %** (`160 / 152` / 164) | **95,7 / 90,9 %** (`157 / 149` / 164) |
+| GPQA Diamond (198 soru) | — *(model kartı: 86,6 %)* | ölçülmedi | ölçülmedi |
 
-- **[Inkling 2 Mini](Inkling%202%20Mini%20Benchmark.md)**, Thinking Machines Lab tarafından geliştirilen 48 sanal katmanlı döngüsel MoE modeli (`inkling2_loop` / `inkling2`): 12 ila 18 GB'lık bir dosya ([`unsloth/Inkling-2-Mini-GGUF`](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF): 14,4 GiB `UD-Q3_K_XL` veya 0–19. katmanları yerel NVFP4 olarak koruyan 16,4 GiB `UD-Q4_K_XL`). İsteğe bağlı yerel **DSpark MTP** 8-token blok spekülatif çözümlemeyi (`--draft-model inkling2-dspark.gguf`) ve MTP olmadan sıfır VRAM kullanan yerleşik n-gram aramasını destekler. 48 sanal katmanının 40'ı sabit halka tamponlarda yalnızca 1.024 token geriye bakar ve yalnızca 8'i tüm bağlama dikkat eder; bu sayede FP16'da `32 KiB/token` (128K'da `4,0 GiB`), `--kv q8_0`'da `17 KiB/token`, `--kv k8v4`'te `13 KiB/token` (`Q8_0` anahtarlar + `Q4_0` değerler) veya `--kv q4_0`'da `9 KiB/token` kullanır ve `--kv-grow` ile 1M `max_context` değerine kadar ölçeklenir. Ayrıca CPU görüntü kodlayıcısı (`mmproj-F16.gguf`) aracılığıyla resimleri de okur.
-- **[GLM 5.3 Flash](docs/models/glm.md)**, en büyükleri: 79 ila 114 GB'lık bir dosya, çoğu RAM'de kalır.
-- **[DeepSeek V4 Flash](docs/models/deepseek.md)**, 91 GB'lık bir dosya; bunun da çoğu RAM'de kalır. Bir sohbeti
-  hafızasında tutmak için az yer kaplar: 128K bağlam, 32K'ya göre yalnızca 0,7 GB daha fazla VRAM alır.
-- **[LFM2.5-24B-A2B](docs/models/lfm25.md)**, Liquid AI tarafından geliştirildi: 11 ila 25 GB'lık bir dosya. Katmanlarının
-  çoğunda attention yok, bu yüzden uzun bir sohbet az VRAM alır: 128K bağlam, 32K'ya göre 2 GB daha fazla alır.
-  Lisansı, ticari kullanıma yalnızca yıllık geliri 10 milyon dolardan az olan şirketler için izin verir.
-- **[Flint 40B-A2.5B](docs/models/flint.md)**, Recursive tarafından kodlama ajanları için geliştirildi: 18 ila 42 GB'lık
-  bir dosya. Katmanlarının çoğu yalnızca 513 token geriye bakar, bu yüzden uzun bir sohbet az VRAM alır: 128K bağlam,
-  32K'ya göre 2,6 GB daha fazla alır.
-- **[Qwen3.6-35B-A3B](docs/models/qwen36.md)**, 13 ila 23 GB'lık bir dosya. Resimleri de okur.
-- **[Clover-35B-A3B-Preview](docs/models/clover.md)**, DiffuSpace tarafından, bir seferde bir blok token da yazabilmesi
-  için daha fazla eğitilmiş Qwen3.6-35B-A3B: 13 ila 21 GB'lık bir dosya. Yalnızca metin okur.
-- **[Ornith 1.5](docs/models/ornith.md)**, Qwen3.6-35B-A3B'nin mimarisine ve farklı ağırlıklara sahip: 14 ila 24 GB'lık
-  bir dosya. Resimleri de okur.
-- **[Gemma 4 26B-A4B](docs/models/gemma4.md)**, 11 ila 17 GB'lık bir dosya. Resimleri de okur.
-- **[Tiel Coder 35B-A3B](docs/models/tiel.md)**, Ornith 1.5'in peculiar-ragdoll tarafından kodlama ajanları için
-  kuantize edilmiş hâli: 14 ila 23 GB'lık bir dosya. Resimleri de okur.
-- **[MiniCPM-V 4.7 35B-A3B](docs/models/minicpmv.md)**, OpenBMB tarafından resim okumak için geliştirildi;
-  Qwen3.6-35B-A3B'nin mimarisine ve kendine ait ağırlıklara sahip: 16 ila 29 GB'lık bir dosya.
-- **[Kolibri 1](docs/models/kolibri.md)**, Aleph Alpha tarafından geliştirildi; İngilizcenin yanı sıra Almanca da yazar:
-  29 ila 48 GB'lık bir dosya, çoğu küçük bir kartın yanında RAM'de kalır.
+## Değişiklikler ve Derleme
 
-Sunucu, çalışırken kurulu modeller arasında geçiş yapabilir ([nasıl](docs/BACKENDS.md#changing-the-model)).
+Tüm iyileştirmeler `src/poly/inkling2.*`, `src/poly/kernels_inkling2.cu` ve `src/poly/inkling2_test.cu` dosyalarındadır (**50 / 50 birim testi geçti**): yerel `inkling2_loop`/`inkling2` motoru, CUDA Graph tabanlı **DSpark MTP** (`--draft-model`), **`--kv k8v4`** / **`q4_0`**, gruplanmış GQA-3 çekirdeği, `--cache-bias 0.2` ve yerinde artık akış ekleme (`647ae64e`).
 
-PolyStrata, [VecSzn](https://github.com/VecSzn) tarafından oluşturuldu.
-PolyStrata, Niko1221'in [Strata](https://github.com/Niko1221/Strata) projesi üzerine kurulmuştur.
-Neden ayrı bir depo olduğu, AMD ve daha küçük kartlar, ince ayarlı modeller (fine-tune) ve diğer sorular:
-[SSS](docs/FAQ.md).
-
-> Bu sayfanın bağlantı verdiği belgeler (model sayfaları ve `docs/` klasörü) İngilizcedir.
-
-## Ne kadar hızlı?
-
-Bir token, kabaca bir kelimenin dörtte üçü kadardır.
-
-- **Yanıt yazma:** kısa bir sohbette yanıtın ne kadar hızlı belirdiği. Saniyede 60 token, senin okuyabileceğinden
-  daha hızlıdır.
-- **Prompt okuma:** gönderdiğin şeyi (bir belge, kod ya da bir sohbet geçmişi) ne kadar hızlı içine aldığı.
-
-Tablo, her model için yükleyicinin seçtiği boyutu, saniyede token olarak verir. Tüm boyutların sayıları, llama.cpp ile karşılaştırma ve nasıl ölçüldükleri her modelin kendi sayfasında.
-
-| Model | 8 GB kartlı dizüstü<br>yazma / okuma | RTX 5090<br>yazma / okuma | Tüm boyutlar |
-| --- | ---: | ---: | --- |
-| LFM2.5-24B-A2B | 70-73 / 3.590-3.620 | 480-485 / 23.390-23.460 | [LFM2.5](docs/models/lfm25.md) |
-| Flint 40B-A2.5B | 61-63 / 2.000-2.010 | 251-252 / 12.900 | [Flint](docs/models/flint.md) |
-| Qwen3.6-35B-A3B | 94-100 / 1.690 | 394-395 / 7.800-7.810 | [Qwen3.6](docs/models/qwen36.md) |
-| Clover-35B-A3B-Preview | 68-73 / 1.560-1.700 | ölçülmedi | [Clover](docs/models/clover.md) |
-| Ornith 1.5 | 76-82 / 1.620 | 316-319 / 8.040-8.110 | [Ornith](docs/models/ornith.md) |
-| Gemma 4 26B-A4B | 92-93 / 2.240 | 353-356 / 8.420-8.480 | [Gemma 4](docs/models/gemma4.md) |
-| Tiel Coder 35B-A3B | 83 / 1.700 | 337-345 / 8.080-8.110 | [Tiel Coder](docs/models/tiel.md) |
-| MiniCPM-V 4.7 35B-A3B | 64 / 1.150 | 308-311 / 7.910-7.950 | [MiniCPM-V](docs/models/minicpmv.md) |
-| Kolibri 1 | ölçülmedi | 189-192 / 4.980-5.070 | [Kolibri 1](docs/models/kolibri.md) |
-| GLM 5.3 Flash | çalışmaz: 32 GB kart gerekir | 59-66 / 820 | [GLM](docs/models/glm.md) |
-| DeepSeek V4 Flash | çalışmaz: 32 GB kart gerekir | 56 / 1.040 | [DeepSeek](docs/models/deepseek.md) |
-
-Dizüstü: RTX 4070 Laptop (8 GB), Core i7-14700HX, 32 GB RAM. İş istasyonu: RTX 5090 (32 GB), Xeon Platinum 8470Q (25 vCPU), 90 ila 120 GB RAM. Flint, dizüstünde UD-Q3_K_XL boyutuyla (yükleyicinin 32 GB RAM ile seçtiği boyut), iş istasyonunda UD-Q4_K_XL boyutuyla ölçüldü. Kolibri 1, iş istasyonunda Q2_K boyutuyla ölçüldü; yükleyici orada Q4_K_M boyutunu seçer, bu boyut ölçülmedi.
-
-**Inkling 2 Mini (`UD-Q3_K_XL` 14,4 GiB & `UD-Q4_K_XL` 16,4 GiB)**, RTX 4070 SUPER (12 GB VRAM) ve 32 GB DDR5 RAM'li bir masaüstünde **128K–1M `max_context`** ile ölçüldü: yerel **DSpark MTP** (`--draft-model inkling2-dspark.gguf --kv k8v4 --cache-bias 0.2`) ile `UD-Q3_K_XL`, kısa prompt'larda saniyede **64,4 token** (kodda **99,4 token/sn**'ye kadar), 32,7K bağlamda **50,2 token/sn** (**821 token/sn** okuma) ve canlı bir **181,6K token**'lık kodlama oturumunda **28,1–30,0 token/sn** hızla yazar (`UD-Q4_K_XL` + DSpark: kısa **60,2 token/sn** / 32,7K'da **44,1 token/sn**). **MTP olmadan** (`UD-Q4_K_XL`), yanıtları saniyede **45,0–47,3 token** hızla yazar (çok turlu kod/günlük oturumlarında yerleşik lookup taslaklarıyla **108,2 token/sn**'ye kadar) ve 5.461 token'lık bir prompt'u saniyede **1.307 token** hızla okur — **llama.cpp'den (PR `#32704`) 3,4 ila 3,7 kat daha hızlı**; saf çözümlemede (`--window 1`, `1048576` `max_context`) FP16'da **~92K**, `--kv q8_0`'da **~122K** ve `--kv q4_0`'da **~137K–141K token**'a kadar `>= 30 token/sn` hızını korur ([tam benchmark, indirme ve MTP'li / MTP'siz kurulum rehberi](Inkling%202%20Mini%20Benchmark.md)).
-
-Qwen3.8-Flash-Next, [Strata](https://github.com/Niko1221/Strata) projesinin motorunda çalışır ve o proje tarafından RTX 5070 (12 GB) ve 64 GB RAM'li bir bilgisayarda ölçüldü: IQ2_XS boyutu saniyede 79 token yazar ve 32K'lık bir prompt'u saniyede 2.090 token hızla okur ([tüm boyutlar](docs/models/qwen38.md)).
-
-PolyStrata'nın kendi motorundaki on bir model, kendi bilgisayarında da çalıştırabileceğin benchmark aracıyla ölçüldü:
-`python polystrata.py benchmark --model <name> --prompt-tokens 24000`
-([ne gönderdiği ve ne yazdırdığı](docs/BACKENDS.md#benchmark)).
-Başkalarının kendi kartlarında ölçtükleri ve kendi kartında llama.cpp ile nasıl karşılaştıracağın:
-[topluluk sonuçları](docs/COMMUNITY_BENCHMARKS.md#the-models-polystrata-adds).
-Dizüstünde, Qwen3.6 ve Tiel Coder ile PolyStrata, prompt'ları llama.cpp b11540 sürümüne göre 2,7 ila 3,5 kat daha
-hızlı okudu ve 1,5 ila 1,8 kat daha hızlı yazdı ([iki çalıştırma](docs/COMMUNITY_BENCHMARKS.md#comparing-with-llamacpp)).
-
-## Ne kadar RAM tutar?
-
-0.1.45-poly.7 sürümünden beri on bir modelin motoru RAM'inin daha azını tutuyor: model dosyasının zaten ekran
-kartında olan kısımlarını artık RAM'de tutmuyor. Dizüstünde Qwen3.6-35B-A3B, 32.000 token'lık bir prompt'tan sonra
-0.1.45-poly.6 ile 17,9 GiB tutuyordu; şimdi 13,1 GiB tutuyor ve aynı hızda yazıyor. Linux'ta 17,8 GiB yerine
-12,6 GiB.
-
-Daha azını tutması için `strata-<model>.json` dosyasındaki `"args"` listesine `"--ram-experts-mib", "6144"` ekle
-([nerede](docs/INSTALL.md#where-things-are-stored)) ve yeniden başlat. Motor bundan sonra VRAM dışında kalan uzmanlar
-(experts) için, yanıt verirken de, RAM'de bu kadar MiB tutar ve başlarken bunu söyler. Geri kalanlar sistemin dosya
-önbelleğinde kalır; orada diğer programların bu belleği kullanabilir ve bir token onlara ihtiyaç duyduğunda oradan
-okunurlar. Uzmanlar boştaki RAM'e sığıyorsa daha yavaş yazdığı için varsayılan olarak kapalıdır ve bunun üzerinde
-hâlâ çalışıyoruz; sığmıyorsa motor bunu kendisi açar (aşağıda). Dizüstünde (RTX 4070 Laptop 8 GB, 32 GB RAM,
-Windows 11), Qwen3.6-35B-A3B UD-Q3_K_M:
-
-| | varsayılan | `--ram-experts-mib 6144` |
-| --- | ---: | ---: |
-| Motorun yüklendikten sonra tuttuğu RAM | 11,7 GiB | **6,5 GiB** |
-| yazarken en fazla: kısa sohbet / 32K prompt'tan sonra | 14,3 / 14,0 GiB | **6,7 / 7,3 GiB** |
-| istekler arasında | 12,8 GiB | **7,1 GiB** |
-| Yazma, token/sn: ilk kısa sohbet | 71,6 | 69,4 (%3 daha yavaş) |
-| 32K prompt'tan sonra | 65,4 | 63,7 (%3 daha yavaş) |
-| ondan sonraki kısa bir sohbet | 84,2 | 72,9 (%13 daha yavaş) |
-| uzun bir yanıt (kısa bir sohbette 1.024 token) | 90,6 | 78,3 (%14 daha yavaş) |
-
-Bu çalıştırmada kartın VRAM'inin bir kısmını başka programlar tutuyordu, bu yüzden iki sütun da kart boşken
-olduğundan daha yavaş yazıyor. Diğer iki çalıştırmada 32K prompt'tan sonra %6 ila 8, ondan sonraki sohbette %8 ila 10
-daha yavaş yazdı. Linux'ta (yaklaşık 8 GB ile sınırlanmış bir RTX PRO 6000) 12,3 ila 14,3 GiB yerine 7,0 ila 7,7 GiB
-tuttu ve %7 ila 14 daha yavaş yazdı. Uzman önbelleği sabit tutulduğunda (bir sürüm kontrol edilirken yapıldığı gibi),
-yanıtlar token token aynıdır.
-
-VRAM dışındaki uzmanlar boştaki RAM'e sığmadığında motor artık en çok kullanılanları o RAM'in 4 GiB eksiği kadar bir
-bütçede tutar, diğerlerini bir token onlara ihtiyaç duyduğunda SSD'den okur ve başlarken bunu söyler. Önceden hepsini
-eşliyordu ve sistem onları sayfa hatası başına bir sayfa olarak geri okuyordu. Bir konteynerin bellek sınırı da
-sayılır. Linux'ta yaklaşık 8 GB ile sınırlanmış bir RTX PRO 6000 üzerinde, motor 12 GB ve 10 GB RAM ile (16 GB'lık bir
-PC'nin ona bıraktığı kadar) sınırlanmış ve model dosyası her başlangıçta dosya önbelleğinin dışındayken ölçüldü:
-Qwen3.6-35B-A3B UD-Q3_K_M, token/sn olarak ilk kısa sohbette, 24.000 token'lık bir prompt'tan sonra ve ondan sonraki
-kısa bir sohbette.
-
-| Motora kalan RAM | her uzman eşlenmiş (önce) | şimdi aldığı bütçe |
-| --- | ---: | ---: |
-| 12 GB | 51 / 75-78 / 94-98 | **57-60 / 77-85 / 131-139** |
-| 10 GB | 39 / 48 / 69 | **51 / 64 / 92** |
-
-Sınır olmadan aynı makine 63 / 169 / 203 yazar. Aynı kodun çalıştığı Windows'ta ölçülmedi.
-`"--ram-experts-mib", "-1"` her uzmanı önceki gibi eşlenmiş tutar.
-
-Tersine, `"--lock-experts"` VRAM dışındaki uzmanları RAM'de kilitler; böylece sistem onların belleğini diğer
-programlara verip motorun onları daha sonra SSD'den yeniden okumasına yol açamaz. Linux'ta `ulimit -l`'in izin
-verdiğinden fazlasını kilitlemez ve motor başlarken ne kadarını kilitlediğini söyler.
-
-Motor ayrıca prompt okumak için 350 ila 400 MiB daha az VRAM'e ihtiyaç duyar: bu alanı uzman önbelleği kullanır
-(Qwen3.6, VRAM'de 2.444 yerine 2.712 uzman tutar) ya da `--vram-reserve-mib` onu diğer programlara bırakır.
-Nasıl çalıştığı ve nasıl ölçüldüğü: [docs/BACKENDS.md](docs/BACKENDS.md#less-of-the-pcs-ram-and-vram).
-
-## Neye ihtiyacın var?
-
-| Model | Ekran kartı | RAM (yükleyicinin seçtiği boyut için) | Disk | Sistem |
-| --- | --- | --- | --- | --- |
-| [Qwen3.8-Flash-Next](docs/models/qwen38.md) | NVIDIA RTX 20 ila 50 serisi ya da AMD RX 6800 / 6900, RX 7700 XT / 7800 XT / 7900 XT / XTX, RX 9060 XT / 9070 / 9070 XT, Radeon AI PRO R9700; 12 GB veya daha fazla | 32 GB veya daha fazla; 64 GB ile her boyut çalışır | yaklaşık 80 GB | Windows, Linux |
-| [GLM 5.3 Flash](docs/models/glm.md) | NVIDIA RTX 20 serisi veya daha yenisi; yalnızca 32 GB'lık bir kartta çalıştırıldı | 32 GB'lık bir kartın yanında 96 GB | 79 ila 114 GB, bir SSD'de | Linux |
-| [DeepSeek V4 Flash](docs/models/deepseek.md) | yukarıdakiyle aynı | 32 GB'lık bir kartın yanında 72 GB | 91 GB, bir SSD'de | Linux |
-| [LFM2.5-24B-A2B](docs/models/lfm25.md) | NVIDIA RTX 20 serisi veya daha yenisi, 8 GB veya daha fazla | 8 GB'lık bir kartın yanında yaklaşık 20 GB | 11 ila 25 GB | Windows, Linux, Mac (beta) |
-| [Flint 40B-A2.5B](docs/models/flint.md) | yukarıdakiyle aynı | 8 GB'lık bir kartın yanında yaklaşık 22 GB | 18 ila 42 GB | Windows, Linux |
-| [Qwen3.6-35B-A3B](docs/models/qwen36.md) | yukarıdakiyle aynı; AMD beta olarak | 8 GB'lık bir kartın yanında yaklaşık 21 GB | 13 ila 23 GB | Windows, Linux, Mac (beta) |
-| [Clover-35B-A3B-Preview](docs/models/clover.md) | NVIDIA RTX 20 serisi veya daha yenisi, 8 GB veya daha fazla | 8 GB'lık bir kartın yanında yaklaşık 20 GB | 13 ila 21 GB | Windows, Linux |
-| [Ornith 1.5](docs/models/ornith.md) | yukarıdakiyle aynı; AMD beta olarak | 8 GB'lık bir kartın yanında yaklaşık 22 GB | 14 ila 24 GB | Windows, Linux |
-| [Gemma 4 26B-A4B](docs/models/gemma4.md) | yukarıdakiyle aynı; AMD beta olarak | 8 GB'lık bir kartın yanında yaklaşık 18 GB | 11 ila 17 GB | Windows, Linux |
-| [Tiel Coder 35B-A3B](docs/models/tiel.md) | yukarıdakiyle aynı; AMD beta olarak | 8 GB'lık bir kartın yanında yaklaşık 21 GB | 14 ila 23 GB | Windows, Linux |
-| [MiniCPM-V 4.7 35B-A3B](docs/models/minicpmv.md) | yukarıdakiyle aynı; AMD beta olarak | 8 GB'lık bir kartın yanında yaklaşık 25 GB | 16 ila 29 GB | Windows, Linux |
-| [Kolibri 1](docs/models/kolibri.md) | NVIDIA RTX 20 serisi veya daha yenisi, 8 GB veya daha fazla | 8 GB'lık bir kartın yanında yaklaşık 33 GB | 29 ila 48 GB | Windows, Linux |
-
-RAM değeri yükleyicinin tahminidir; daha büyük bir kartla daha azı gerekir. Geri kalan her şeyi yükleyici kurar: Windows'ta motoru hazır derlenmiş olarak indirir; yalnızca AVX2 desteği olmayan bir işlemcide ya da senin kopyandaki motor son sürümden daha yeniyse onu bilgisayarında derler ve gereken araçları kurmayı önerir. İki ya da üç kart bir modeli paylaşabilir ([çoklu GPU](docs/MULTI_GPU.md)). Eski ekran kartları, Intel Arc, Apple Silicon Mac'ler (Qwen3.8-Flash-Next; beta olarak Qwen3.6 ve LFM2.5), Strix Halo ve AVX2 desteği olmayan eski işlemciler: [tam liste](docs/INSTALL.md#what-you-need). Her modelin kart, RAM ve boyut ayrıntıları kendi sayfasında.
-
-Qwen3.6, Clover, Ornith 1.5, Gemma 4, Tiel Coder ve MiniCPM-V'nin her birinin neye ihtiyaç duyduğu ve bunun nasıl kontrol edildiği: [docs/BACKENDS.md](docs/BACKENDS.md#install).
-
-## Kurulum
-
-### Kurulumu yapay zekâna yaptır
-
-Bir yapay zekâ kodlama asistanı (Claude Code, Cursor, Codex, GitHub Copilot, ...) kullanıyor musun? Şunu ona yapıştır:
-
-```text
-Set up PolyStrata on this PC for me: https://github.com/simplexai-labs/PolyStrata - follow docs/AI_SETUP.md in that repository.
+```bat
+python setup.py --family inkling2 --model UD-Q3_K_XL --kv k8v4 --context 131072 --yes
+.venv\Scripts\python.exe tools\convert_inkling2_dspark.py --out models\inkling2\inkling2-dspark.gguf
 ```
 
-Asistan ekran kartını, RAM'ini ve diskini kontrol eder ve sana uyan modeli seçer. Sonra onu kurar, başlatır ve
-uygulamalarını nasıl bağlayacağını söyler. Yapay zekâ araçları PolyStrata'yı [MCP sunucusu](docs/MCP_SERVER.md)
-üzerinden de kurabilir, başlatabilir ve durdurabilir.
+Kaynaktan derleme (Windows, CUDA 13, Ninja):
 
-### Ya da kendin yap
+```bat
+call "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat"
+cmake -B build-inkling2 -G Ninja -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=ON -DCMAKE_CUDA_ARCHITECTURES=89
+cmake --build build-inkling2 --target strata-poly poly_inkling2_test -j 8
+```
 
-[PolyStrata'yı indir](https://github.com/simplexai-labs/PolyStrata/archive/refs/heads/main.zip) ve zip'ten çıkar (ya da `git clone` ile klonla).
-**Windows:** **`START-HERE.bat`** dosyasına çift tıkla. **Linux:** PolyStrata klasöründe **`./setup.sh`** komutunu çalıştır.
-
-**Mac (Apple Silicon, M1 ila M5, macOS 15 veya daha yenisi):** Apple'ın Command Line Tools paketini bir kez kur
-(Terminal'de `xcode-select --install`; Xcode'un kendisine gerek yok). Sonra PolyStrata klasöründe Terminal'i aç ve
-**`./setup.sh`** komutunu çalıştır. Mac motorunu Mac'inde derler (yaklaşık 7 dakika), aynı soruları sorar, modeli
-indirir ve başlatır. Bir dahaki sefere `./setup.sh` onu hemen başlatır. Mac'ine hangi boyutun uyduğu ve ne kadar hızlı
-olduğu: [docs/MAC.md](docs/MAC.md). Varsayılan olarak Qwen3.8-Flash-Next'i kurar. `./setup.sh --family qwen36` ya da
-`--family lfm25` onun yerine Qwen3.6'yı ya da LFM2.5'i strata-poly'nin Metal motorunda beta olarak kurar: bir M5
-Ultra'da Qwen3.6 UD-Q2_K_XL kısa bir sohbette saniyede 134 token yazdı ve 3.768 token'lık bir prompt'u saniyede 2.978
-token hızla okudu. Kurulum Mac'te GLM, DeepSeek, Ornith, Gemma 4, Tiel Coder ve MiniCPM-V'yi de sunar, ama bunlar
-orada henüz gerçek ağırlıklarıyla çalıştırılmadı. Kolibri, Flint ve Clover bir NVIDIA veya AMD kart gerektirir.
-
-Yükleyici kartını bulur ve ona uygun motoru kurar. Sana birkaç soru sorar:
-
-- hangi model ve hangi boyut,
-- ne kadar bağlam (modelin aklında ne kadar metin tuttuğu),
-- resimleri okuyup okumayacağı (GLM 5.3 Flash, DeepSeek V4 Flash, LFM2.5, Flint, Clover ve Kolibri 1 resim okumaz).
-
-Önerilen yanıt için her seferinde Enter'a bas. Ardından modeli indirir (Qwen3.8-Flash-Next için yaklaşık 70 GB,
-GLM 5.3 Flash için 79 ila 114 GB, DeepSeek V4 Flash için 91 GB, Kolibri 1 için 29 ila 48 GB, diğer sekizi için 11 ila 42 GB) ve başlatır. İndirme yarıda kalırsa yeniden çalıştır:
-kaldığı yerden devam eder. Tarayıcın PolyStrata uygulamasını `http://127.0.0.1:8080` adresinde açar.
-
-On ikisinin hepsi yükleyicinin model listesinde. `./setup.sh --family glm`, `deepseek`, `lfm25`, `flint`, `qwen36`, `clover`, `ornith`,
-`gemma4`, `tiel`, `minicpmv` veya `kolibri` doğrudan o modele gider ([ne sorduğu ve ne yazdığı](docs/GLM.md#install)).
-
-> **Model başlarken bilgisayarın 1-3 dakika boyunca yavaşlayabilir ya da yanıt vermeyebilir** (en uzunu ilk seferde).
-> PolyStrata RAM'ine 35-55 GB yükler ve bir kısmını ekran kartı için kilitler. Bu normaldir. Bekle ve pencereyi
-> kapatma. Pencere PolyStrata'nın ne yaptığını gösterir.
-
-**Bir dahaki sefere** `START-HERE.bat` dosyasını (ya da `./setup.sh` komutunu) yeniden çalıştır. Hemen başlar ve
-hiçbir şeyi iki kez indirmez. Modeli durdurmak için penceresini kapat. `UPDATE.bat` (`./update.sh`) PolyStrata'yı
-başlatmadan günceller. Güncelleme, Docker, birden fazla kart, dosyaların nereye gittiği ve tüm seçenekler:
-[docs/INSTALL.md](docs/INSTALL.md).
-
-**Senin bilgisayarında hızlı mı?** `BENCH.bat` (`./bench.sh`) çalıştır: yaklaşık 5-10 dakika sürer; kendi ayarlarınla sohbeti, 4K/16K prompt'ları ve ajan tarzı bir oturumu ölçer ve paylaşabileceğin bir rapor yazar ([nasıl](docs/COMMUNITY_BENCHMARKS.md#run-the-benchmark)).
-
-## Hangi modeli seçmeliyim?
-
-Aynı model, az ya da çok sıkıştırılmış birkaç boyutta gelir: küçük boyutlar daha hızlıdır ve daha az RAM ister, büyükler ise orijinale daha yakındır. Enter'a bastığında yükleyici RAM'ine ve kartına uygun olanı seçer; başka bir boyut için kurarken `--model <boyut>` ekle.
-
-| Model | Yükleyicinin seçtiği | Daha az RAM ile | Adıyla seçilebilenler |
-| --- | --- | --- | --- |
-| [Qwen3.8-Flash-Next](docs/models/qwen38.md) | 32 GB RAM: Coder; 48 ila 64 GB: IQ2_XS; 96 GB veya daha fazla: IQ3_S |  | Q2_0, IQ3_XXS, Unsloth'un 4 ila 8 bitlik dosyaları |
-| [GLM 5.3 Flash](docs/models/glm.md) | 3.0BIT | UD-IQ2_XXS, sonra REAP50-Q3_K_M |  |
-| [DeepSeek V4 Flash](docs/models/deepseek.md) | UD-IQ2_XXS (tek boyut) |  |  |
-| [LFM2.5-24B-A2B](docs/models/lfm25.md) | UD-Q4_K_XL | UD-Q3_K_XL | QAD-Q4_0, UD-Q6_K_XL, Q8_0 |
-| [Flint 40B-A2.5B](docs/models/flint.md) | yaklaşık 40 GB RAM'den itibaren UD-Q4_K_XL | UD-Q3_K_XL | UD-Q6_K_XL, Q8_0 |
-| [Qwen3.6-35B-A3B](docs/models/qwen36.md) | UD-Q3_K_M | UD-Q2_K_XL | UD-Q4_K_M |
-| [Clover-35B-A3B-Preview](docs/models/clover.md) | Q3_K_M | APEX-I-NANOPLUS | Q4_K_M |
-| [Ornith 1.5](docs/models/ornith.md) | APEX-I-COMPACT | APEX-I-MINI | APEX-I-QUALITY |
-| [Gemma 4 26B-A4B](docs/models/gemma4.md) | UD-Q3_K_M | UD-Q2_K_XL | UD-Q4_K_M, QAT-UD-Q4_K_XL |
-| [Tiel Coder 35B-A3B](docs/models/tiel.md) | UD-Q3_K_XL | UD-IQ3_XXS | UD-Q4_K_XL |
-| [MiniCPM-V 4.7 35B-A3B](docs/models/minicpmv.md) | Q4_K_M | mix_q3gud_im | Q6_K |
-| [Kolibri 1](docs/models/kolibri.md) | yaklaşık 48 GB RAM'den itibaren Q4_K_M | Q2_K | Q3_K_M |
-
-Her boyutun ne olduğu, indirme bilgisi, başka kartların yanında ne kadar RAM istediği ve en büyük boyuta ne kadar yaklaştığı: her modelin kendi sayfasında; sayfalara "Ne kadar hızlı?" başlığının altındaki tablodan ulaşabilirsin.
-
-## Kullanım
-
-On iki modelin hepsi aynı şekilde kullanılır: aynı uygulama, aynı API.
-
-<p align="center"><img src="docs/media/runpagoda.png" width="900" alt="Uygulamanın Monitor sekmesi, bir kodlama ajanının yanında"><br>
-<sub>Bir kodlama ajanı videodaki pagoda bahçesini yazarken (sağda) uygulamanın <b>Monitor</b> sekmesi (solda). Ekran görüntüsü <a href="https://github.com/Niko1221/Strata">Strata</a> projesinden.</sub></p>
-
-- **Tarayıcıda:** `http://127.0.0.1:8080` adresini aç. Uygulamada **Chat**, modeli ve GPU/CPU/RAM kullanımını canlı
-  gösteren **Monitor** ve ayarlarla adresleri gösteren **About** sekmeleri var.
-- **Kişisel ajan olarak:** [Linger](https://github.com/simplexai-labs/linger)'i indir: [Mac (Apple Silicon)](https://github.com/simplexai-labs/linger/releases/download/desktop-v0.1.2/Linger-0.1.2-macos-arm64.dmg) ·
-  [Windows](https://github.com/simplexai-labs/linger/releases/download/desktop-v0.1.2/Linger-0.1.2-windows-x64-setup.exe) · [Linux](https://github.com/simplexai-labs/linger/releases/download/desktop-v0.1.2/Linger-0.1.2-linux-x64.tar.gz).
-- **Uygulamaların ve kodlama ajanların:** temel URL'si **`http://127.0.0.1:8080/v1`** olan "OpenAI-compatible" bir
-  sağlayıcı ekle. Herhangi bir API anahtarı ve herhangi bir model adı çalışır.
-  - Anthropic'in API'sini kullanan uygulamalar: `http://127.0.0.1:8080/v1/messages` (Claude Code:
-    `ANTHROPIC_BASE_URL=http://127.0.0.1:8080` ve `strata-<model>.json` içinde `"fit_max_tokens": true`
-    ([neden](docs/FAQ.md#can-i-use-it-with-claude-code-codex-or-other-apps))).
-  - Codex CLI ve OpenAI Responses API'yi kullanan diğer uygulamalar: `/v1/responses`
-    ([kurulum](docs/DETAILS.md#the-responses-api-and-codex-cli)).
-- **Düşünme:** sohbet menüsünde ya da uygulamanın "reasoning effort" ayarında **off, low, medium veya high** (kapalı,
-  düşük, orta, yüksek) seç. Off en hızlısıdır. High zor sorular için en iyisidir.
-- **Telefonundan ya da başka bir bilgisayardan:** `START-HERE.bat --setup --host 0.0.0.0 --api-key <gizli-anahtar>`.
-  Her zaman bir anahtar belirle.
-
-Farklı oldukları yerler:
-
-| | Qwen3.8-Flash-Next | GLM 5.3 Flash | DeepSeek V4 Flash | LFM2.5-24B-A2B | Flint 40B-A2.5B | Kolibri 1 | Qwen3.6-35B-A3B, Clover-35B-A3B-Preview, Ornith 1.5, Gemma 4 26B-A4B, Tiel Coder 35B-A3B, MiniCPM-V 4.7 35B-A3B |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| **Resimler** | Kurulumda "Images?" sorusuna evet de. Sonra sohbette **Picture** düğmesine tıkla ya da uygulamanda resim ekle. AMD kartlar Linux'ta resimleri işlemci üzerinden okur; Windows'ta henüz okuyamaz. | Henüz değil. | Yalnızca metin okur. | Yalnızca metin okur. | Yalnızca metin okur. | Yalnızca metin okur. | Kurulumda "Images?" sorusuna evet de; sonrası Qwen3.8-Flash-Next ile aynı. 16 GB'tan az belleği olan bir kartta resim kodlayıcı işlemcide çalışır ve bir resim birkaç saniye sürer. Clover yalnızca metin okur. |
-| **Birden fazla istek** | Varsayılan olarak aynı anda bir tane; diğerleri bekler. `"parallel": 2` birkaçını aynı anda yanıtlar ([BATCHING.md](docs/BATCHING.md)); 12 GB'lık bir kartta her yanıt yavaşlar. | Aynı anda bir tane; diğerleri bekler. | Aynı anda bir tane; diğerleri bekler. | Aynı anda bir tane; diğerleri bekler. | Aynı anda bir tane; diğerleri bekler. | Aynı anda bir tane; diğerleri bekler. | Aynı anda bir tane; diğerleri bekler. |
-| **Birden fazla sohbet** | Sonuncusu saklanır, böylece devam mesajları saniyeler içinde başlar. İki motor argümanı birkaçını RAM'de tutar ([ayrıntılar](docs/DETAILS.md#using-it)). | Sonuncusu saklanır. Kurulum, birkaçının RAM'de tutulup tutulmayacağını sorar; böylece bir ajan ve alt ajanları, prompt'ları yeniden okunmadan sırayla çalışabilir ([nasıl](docs/GLM.md#several-conversations-at-once)). | GLM 5.3 Flash ile aynı. | GLM 5.3 Flash ile aynı. | GLM 5.3 Flash ile aynı. | GLM 5.3 Flash ile aynı. | GLM 5.3 Flash ile aynı. |
-| **Uzun prompt'lar** | Bir sohbetin ilk mesajı baştan sona okunur; 30.000 token başına yaklaşık 1 dakika. | İlk mesaj baştan sona okunur; 30.000 token başına yaklaşık 40 saniye. | İlk mesaj baştan sona okunur; 30.000 token başına yaklaşık 29 saniye. | İlk mesaj baştan sona okunur: 30.000 token, iş istasyonunda 1,3 ila 1,5 saniye, 8 GB'lık dizüstünde 8 ila 10 saniye sürer. | İlk mesaj baştan sona okunur: 30.000 token, iş istasyonunda yaklaşık 2,3 saniye, 8 GB'lık dizüstünde 15 ila 22 saniye sürer. | İlk mesaj baştan sona okunur: 30.000 token, iş istasyonunda Q2_K ile yaklaşık 6 saniye sürer. | İlk mesaj baştan sona okunur: 30.000 token, iş istasyonunda 4 ila 5 saniye, 8 GB'lık dizüstünde 14 ila 27 saniye sürer. |
-
-Daha fazlası: [sohbetlerin nerede saklandığı](docs/INSTALL.md#where-things-are-stored), [API](docs/DETAILS.md#using-it).
-
-### İsteğe bağlı: model RAM'e tamamen sığdığında tek kartta daha fazla hız
-
-İsteğe bağlı olarak açılan iki ayar (RubenTorney tarafından, #1904 ve #1905). Tek bir ekran kartı kullandığında ve
-RAM'in tüm uzmanları tutabildiğinde işe yararlar (PolyStrata'nın arena modu, örneğin 64 GB'lık bir bilgisayarda Q2_0
-veya IQ3_XXS). PolyStrata veri klasöründeki yapılandırma dosyan olan `strata-<model>.json` dosyasını aç
-([nerede](docs/INSTALL.md#where-things-are-stored)) ve şunları ekle:
-
-- **Daha hızlı yanıt üretme (decode):** `"args"` listesine `"--adapt-async", "1"`. Uzman önbelleği böylece yanıtı
-  duraklatmak yerine yardımcı bir iş parçacığında güncellenir. Bir RTX 5070'te ölçüldü (Windows, Q2_0): decode'da
-  %4-5, kodda ve uzun belgelerde %7-10 artış. Yanıtlar varsayılandan biraz farklı olabilir (çalıştırmadan
-  çalıştırmaya aynı kalırlar).
-- **Windows'ta daha hızlı prompt okuma:** `"env"` bloğuna `"STRATA_PIN_BY_NEED": "1"`. Windows, RAM'in yalnızca
-  yaklaşık yarısını ekran kartı için kilitleyebilir; bu ayar, kartın gerçekten ihtiyaç duyduğu uzmanları önce kilitler.
-  RTX 5070'te ölçüldü: prompt okumada %4,4 artış.
+## Referans PC Ayarları (`UD-Q3_K_XL` + DSpark MTP)
 
 ```json
-"args": [ ..., "--adapt-async", "1" ],
-"env": { "STRATA_PIN_BY_NEED": "1" }
+{
+  "exe": "D:\\PolyStrata\\engine-poly-inkling2\\strata-poly.exe",
+  "args": [
+    "--model", "path\\to\\Inkling-2-Mini-UD-Q3_K_XL.gguf",
+    "--draft-model", "path\\to\\inkling2-dspark.gguf",
+    "--max-context", "262144",
+    "--kv", "k8v4",
+    "--cache-bias", "0.2",
+    "--vram-reserve-mib", "1280",
+    "--prompt-batch", "512",
+    "--ram-experts-mib", "-1",
+    "--expert-profile", "path\\to\\expert-profile.txt",
+    "--conversation-cache-mib", "auto"
+  ],
+  "reasoning_close_retry": true,
+  "repeat_stop_tokens": 64
+}
 ```
 
-Değişiklikten sonra PolyStrata'yı yeniden başlat (`START-HERE.bat` veya `./setup.sh`). Geri almak için iki girdiyi sil.
+## Teşekkürler
 
-## Bir sorun mu çıktı?
-
-- **PolyStrata ilk kez başladığında bilgisayarım dondu.** Model yüklenirken bu normaldir. Bekle ve pencereyi kapatma.
-  10 dakika sonra hâlâ donuk mu? Bilgisayarı yeniden başlat, diğer programları kapat ve tekrar dene ya da daha küçük
-  bir boyut seç.
-- **İndirme ya da kurulum sırasında durdu.** `START-HERE.bat` dosyasını (ya da `./setup.sh` komutunu) yeniden
-  çalıştır. Kaldığı yerden devam eder.
-- **Çok yavaş ve disk ışığı sürekli yanıp sönüyor ya da "the engine stopped unexpectedly" (motor beklenmedik şekilde
-  durdu) diyor.** Bilgisayarında yeterince boş RAM yok. Diğer programları kapat (tarayıcılar çok kullanır) ya da daha
-  küçük bir boyut seç (Q2_0 veya IQ2_XS).
-- **8080 portunun zaten kullanımda olduğunu söylüyor.** PolyStrata zaten çalışıyor. Penceresini ara.
-
-Diğer sorunlar ve çözümleri: [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md). Hâlâ takıldın mı? Bir
-[issue](https://github.com/simplexai-labs/PolyStrata/issues) aç ve PolyStrata klasöründeki `strata-<model>.log` dosyasını ekle.
-Bir güvenlik sorunu mu buldun? Gizli olarak bildir: [SECURITY.md](SECURITY.md).
-
-## Nasıl çalışıyor?
-
-Bu tür modeller genellikle yüzlerce gigabayt grafik belleği olan sunucularda çalışır. Senin ekran kartında 8-32 GB
-var. PolyStrata, **işi tüm bilgisayarına paylaştırarak** modeli sığdırır. Bir mutfak düşün: sürekli kullandığın
-şeyler tezgâhta durur, geri kalanı kilerde bekler.
-
-Her modelin diyagramı ve nasıl çalıştığı: [docs/HOW_IT_WORKS_MODELS.md](docs/HOW_IT_WORKS_MODELS.md).
-
-## PolyStrata üzerine kurulanlar
-
-<p align="center"><a href="https://github.com/simplexai-labs/linger"><img src="https://raw.githubusercontent.com/simplexai-labs/linger/main/assets/linger-story.webp" width="820" alt="28 saniyede Linger: yerel bir model kurar, uygulamalarını bağlar, e-postaları ve toplantıları hafızaya dönüştürür ve bir e-posta göndermeden önce sorar."></a><br>
-<sub>28 saniyede Linger: yerel bir model kurar, uygulamalarını bağlar, e-postaları ve toplantıları hafızaya dönüştürür ve bir e-posta göndermeden önce sorar.</sub></p>
-
-**[Linger](https://github.com/simplexai-labs/linger)**, tamamen kendi bilgisayarında çalışan açık kaynaklı kişisel bir ajandır; yerel modelleri
-PolyStrata üzerinde çalışır. Uygulamaların arasında ihtiyacın olanı bulur, önemli olanı hatırlar ve sen yokken
-işleri ilerletir. [Belgeler](https://docs.heylinger.com/) · [GitHub](https://github.com/simplexai-labs/linger)
-
-PolyStrata üzerine bir şey mi geliştirdin? Bir [issue](https://github.com/simplexai-labs/PolyStrata/issues) aç, buraya ekleyelim.
-
-## Emeği geçenler ve lisans
-
-Qwen3.8-Flash-Next, [Qwen ekibi](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) tarafından geliştirildi.
-[ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF), UkisAI (Swift 1.5) ve Unsloth
-tarafından sıkıştırıldı.
-GLM 5.3 Flash;
-[neuralll](https://huggingface.co/neuralll/GLM-5.3-Flash-GSQ-RCO-3.0bit-Q4Kattn-GGUF), Unsloth ve patrickbdevaney
-tarafından hazırlanan dosyalarla çalışır.
-Qwen3.6-35B-A3B Qwen ekibi, Gemma 4 Google, DeepSeek V4 Flash ise DeepSeek tarafından geliştirildi; üçü de
-[Unsloth](https://huggingface.co/unsloth) kuantizasyonuyla kullanılıyor. LFM2.5-24B-A2B,
-[Liquid AI](https://huggingface.co/LiquidAI/LFM2.5-24B-A2B) tarafından geliştirildi; Unsloth kuantizasyonuyla ve
-Liquid AI'ın kendi QAD-Q4_0 sürümüyle kullanılıyor. Flint 40B-A2.5B, [Recursive](https://huggingface.co/RecursiveSI/flint)
-tarafından geliştirildi; Unsloth kuantizasyonuyla kullanılıyor.
-Kolibri 1, [Aleph Alpha](https://huggingface.co/Aleph-Alpha/Kolibri-1) tarafından geliştirildi;
-[Hob-forge](https://huggingface.co/Hob-forge/Kolibri-1-GGUF) tarafından yapılan GGUF dönüşümüyle kullanılıyor.
-Clover-35B-A3B-Preview, [DiffuSpace](https://huggingface.co/Diffuspace/Clover-35B-A3B-Preview) tarafından geliştirildi;
-[maternion](https://huggingface.co/maternion/Clover-35B-A3B-Preview-GGUF) kuantizasyonuyla ve IsValorum'un APEX sürümüyle kullanılıyor.
-Ornith 1.5, ornith-ai tarafından geliştirildi;
-[mudler](https://huggingface.co/mudler/Ornith-1.5-35B-A3B-APEX-MTP-GGUF) tarafından yapılan APEX kuantizasyonuyla kullanılıyor.
-Tiel Coder 35B-A3B, Ornith 1.5 modelinin
-[peculiar-ragdoll](https://huggingface.co/peculiar-ragdoll/Tiel-Coder-35B-A3B-GGUF-MTP) tarafından kuantize edilmiş hâlidir;
-PolyStrata'da çalıştığını [u/Sensitive_Song4219](https://www.reddit.com/r/LocalLLM/comments/1x22inc/comment/pf3r111/) keşfetti.
-MiniCPM-V 4.7 35B-A3B, [OpenBMB](https://huggingface.co/openbmb/MiniCPM-V-4.7-35B-A3B-gguf) tarafından geliştirildi
-ve kendi kuantizasyonlarıyla kullanılıyor; PolyStrata'ya [iMilnb](https://github.com/iMilnb) getirdi.
-PolyStrata, Niko1221 ve katkıda bulunanların geliştirdiği
-[Strata](https://github.com/Niko1221/Strata) üzerine kurulmuştur ve
-[llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) projesinin bazı parçalarını kullanır. Emeği geçenlerin tamamı:
-[docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md#credits). PolyStrata, [MIT Lisansı](LICENSE) altında açık kaynaktır.
-Birkaç parçanın ve tüm modellerin kendi lisansları vardır ([hangileri](docs/HOW_IT_WORKS.md#license)).
+- [PolyStrata](https://github.com/VecSzn/PolyStrata) ([VecSzn](https://github.com/VecSzn)), [Strata](https://github.com/Niko1221/Strata) ([Niko1221](https://github.com/Niko1221)), Thinking Machines Lab (**Inkling-2-Mini**), [Unsloth](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF), [llama.cpp](https://github.com/ggml-org/llama.cpp) (`PR #32704`) ve README / grafik düzeni ilhamı için [midokino/kuu-Strata-fork](https://github.com/midokino/kuu-Strata-fork).

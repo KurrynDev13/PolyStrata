@@ -1,316 +1,102 @@
-<h1 align="center">PolyStrata</h1>
+# PolyStrata-Inkling2
 
 [English](README.md) · [简体中文](README.zh-CN.md) · **日本語** · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md) · [Türkçe](README.tr.md)
 
-<p align="center"><b>大きな AI モデルを、手元の PC で動かす</b><br>
-Inkling 2 Mini、Qwen3.8-Flash-Next、GLM 5.3 Flash、DeepSeek V4 Flash、LFM2.5、Flint、Qwen3.6、Clover、Ornith 1.5、Gemma 4、Tiel Coder、MiniCPM-V、Kolibri 1 · 無料のオープンソース</p>
+**12 GB GPU 1 枚で動かす Inkling-2-Mini — 非公式 PolyStrata フォーク**
 
-<p align="center"><a href="https://github.com/simplexai-labs/linger"><img height="28" alt="Used by Linger" src="docs/media/used-by-linger.svg"></a></p>
+![PolyStrata-Inkling2: UD-Q3_K_XL + DSpark 対 llama.cpp PR #32704 — Code、Mixed long jobs、32K Prompt read、HumanEval+、GPQA Diamond](docs/img/inkling2-card.png)
 
-<p align="center"><img src="docs/media/speed.svg" width="820" alt="回答を書く速さ（トークン/秒）：8 GB のノート PC で Qwen3.6-35B-A3B は 94〜100、RTX 5090 で 394〜395"></p>
+PolyStrata-Inkling2 は、[PolyStrata](https://github.com/VecSzn/PolyStrata)（および上流の [Strata](https://github.com/Niko1221/Strata)）をベースに、Thinking Machines Lab の **Inkling-2-Mini**（`26B-A3B` 48 仮想レイヤー・ループ型 MoE）を **12 GB VRAM GPU + 32 GB RAM** の一般的なデスクトップ PC 向けに最適化した非公式フォークです。CUDA エンジン（`strata-poly.exe`）上で **DSpark MTP** 投機的デコード、混合精度 **`--kv k8v4`** / **`q4_0`** KV キャッシュ、CPU オフロード版ビジョンエンコーダに対応しています。
 
-<p align="center"><img src="docs/media/claude-code-demo.gif" width="820" alt="ターミナルの Claude Code と、その横の PolyStrata の API Monitor"><br>
-<sub>Claude Code と Qwen3.6-35B-A3B UD-Q3_K_M、8 GB のカードのノート PC で、実時間：小さなプログラムに <code>--json</code> オプションを足し、テストを書いて実行します。サーバーは起動時に Claude Code のシステムプロンプトを読んであります（<code>"warm_start": true</code>）。</sub></p>
+1 台の PC で丁寧に計測した個人フォークであり、Thinking Machines Lab・Unsloth・Strata・上流 PolyStrata とは提携していません。
 
-<p align="center"><a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4"><img src="docs/media/pagoda-preview.webp" width="720" alt="PolyStrata のモデルが書いたボクセルの五重塔の庭。ブラウザで動いている様子"></a><br>
-<sub>ボクセルの五重塔の庭。1 回のプロンプトで作成し、RTX 5070 上の <a href="https://github.com/Niko1221/Strata">Strata</a>（Qwen3.8-Flash-Next IQ3_S、128K コンテキスト）で実行 ·
-<a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4">動画全体（49 秒）</a></sub></p>
+- **ワンクリック導入:** [START-HERE.bat](START-HERE.bat)（Windows）または `./setup.sh --family inkling2 --kv k8v4` を実行すると、環境構築から [`unsloth/Inkling-2-Mini-GGUF`](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) の検証済みダウンロードまで自動で行われます。
+- **元のマルチモデル版 README** は [README.upstream.md](README.upstream.md) に保存しています。
+- **詳細ベンチマーク & カーネル解説:** [Inkling 2 Mini Benchmark.md](Inkling%202%20Mini%20Benchmark.md)
+- 以下の高速化はすべてソフトウェア実装によるもので、別環境では数値が前後します（試行間ばらつき約 `3–8 %`）。
 
-PolyStrata は、ふつうはサーバーが必要な大きな AI モデルを普通の PC で動かします。チャットをしたり、コードを書いたり、
-アプリやコーディングエージェントと連携したりできます。データが PC の外に出ることはありません。
+## 検証 PC での計測結果
 
-動かせるモデルは 13 個で、エンジンは 2 つです。
+![RTX 4070 SUPER 12 GB 上での Inkling-2-Mini メモリ配置・生成速度・プロンプト読込速度](docs/img/inkling2-summary.png)
 
-- **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)**：12 GB 以上の NVIDIA または AMD の
-  グラフィックカード、Windows または Linux。画像も読めます。エンジンは
-  [Strata](https://github.com/Niko1221/Strata) のものをそのまま使っています。
+Ryzen 9 7900X (12C/24T, AVX-512) · RTX 4070 SUPER 12 GB (`sm_89`) · DDR5 32 GB (`31.1 GiB` 使用可能) · Windows 11 · モデル：[`unsloth/Inkling-2-Mini-GGUF`](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) **`UD-Q3_K_XL`** (`13.6 GB`) および **`UD-Q4_K_XL`** (`16.4 GiB`, 0–19 層 NVFP4 + 20–23 層 Q8_0)、DSpark MTP 有効 (`inkling2-dspark.gguf`)、`--kv k8v4 --cache-bias 0.2`、コンテキスト `131K–262K`。
 
-残りの 12 個は PolyStrata のために書いたエンジンで動きます。NVIDIA カードが 1 枚必要です（[2 枚](docs/MULTI_GPU.md#the-strata-poly-models)でも動きます）。12 個とも Linux で動き、
-GLM 5.3 Flash と DeepSeek V4 Flash 以外は Windows でも動きます。まだ実験的で、32 GB のカードを載せた PC と、
-小さいモデルについては 8 GB や 12 GB のカードを載せた PC でも動いています。
+| | `llama.cpp` PR `#32704` (`-ngl 99 -cmoe`) | `UD-Q4_K_XL` + DSpark (`k8v4`, NVFP4/Q8) | `UD-Q3_K_XL` + DSpark (`k8v4`, 本フォーク標準) |
+|---|---|---|---|
+| VRAM 常駐エキスパート | 0 / 3,072 (`0 GiB`) | 1,520–1,613 / 3,072 (`7.3–7.5 GiB`) | **1,989 / 3,072 (`7.5 GiB`, 64.7 %)** |
+| Code (`temperature 0`, 1,500 tokens, 3回平均) | 13.7 tok/s *(25-tok decode)* | 55.4 tok/s (`59.1 / 53.0 / 54.2`) | **63.2 tok/s (`61.4 / 65.4 / 62.8`)** |
+| Mixed long jobs（長文・コード・ツール・翻訳・思考） | — | 58.1 tok/s (`50.6 / 62.8 / 81.0 / 46.3 / 49.7`) | **64.7 tok/s (`56.3 / 74.8 / 82.0 / 54.3 / 56.1`)** |
+| 純粋デコード (固定 `--window 1 --no-draft`) | 13.7 tok/s | 47.3 tok/s | **59.7 tok/s** (`2,098` experts) |
+| 32K コンテキスト時デコード | — | 43.8 tok/s | **47.8 tok/s** |
+| 120K コンテキスト時デコード | — | — | **31.8 tok/s** |
+| 実戦 `181.6K` OpenCode セッション | — | — | **28.1–30.0 tok/s** |
+| プロンプト読込 (1.8K–5.4K tokens) | 263 tok/s *(1.8K)* | **1,307 tok/s** *(5.4K, no MTP)* | — |
+| プロンプト読込 (32K tokens) | — | 1,035 tok/s | **1,137 tok/s** |
+| プロンプト読込 (120K tokens) | — | — | **847 tok/s** |
+| `llama.cpp` との greedy トークン一致率 | *基準* | **48 / 48 (100 %)** | 48 / 48 *(FP16 & `q8_0` KV)* |
+| HumanEval / HumanEval+ (EvalPlus 0.3.1, `temp 0`, effort 0) | — | **97.6 / 92.7 %** (`160 / 152` / 164) | **95.7 / 90.9 %** (`157 / 149` / 164) |
+| GPQA Diamond (198 問) | — *(公式モデルカード: 86.6 %)* | 未計測 | 未計測 |
 
-- **[Inkling 2 Mini](Inkling%202%20Mini%20Benchmark.md)**：Thinking Machines Lab の 48 仮想層ループ型 MoE モデル（`inkling2_loop` / `inkling2`）で、ファイルは 12〜18 GB（[`unsloth/Inkling-2-Mini-GGUF`](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF)：`UD-Q3_K_XL` 14.4 GiB、または 0〜19 層をネイティブ NVFP4 で保持する `UD-Q4_K_XL` 16.4 GiB）。オプションのネイティブ **DSpark MTP** 8 トークン一括投機的デコード（`--draft-model inkling2-dspark.gguf`）にも、MTP なしのゼロ VRAM 内蔵 n-gram lookup にも対応しています。48 仮想層のうち 40 層は固定リングバッファで直前の 1,024 トークンだけを見て、8 層だけが全文脈を見るため、トークンあたり FP16 で `32 KiB`（128K で `4.0 GiB`）、`--kv q8_0` で `17 KiB`（`2.13 GiB`）、`--kv k8v4` で `13 KiB`（`1.63 GiB`、`Q8_0` キー + `Q4_0` バリュー）、`--kv q4_0` で `9 KiB`（`1.13 GiB`）しか使わず、`--kv-grow` により最大 1M `max_context` まで拡張できます。CPU ビジョンエンコーダー（`mmproj-F16.gguf`）で画像も読めます。
-- **[GLM 5.3 Flash](docs/models/glm.ja.md)**：いちばん大きいモデル。ファイルは 79〜114 GB で、その大部分は RAM に置かれます。
-- **[DeepSeek V4 Flash](docs/models/deepseek.ja.md)**：ファイルは 91 GB で、これも大部分は RAM に置かれます。会話を覚えておくための VRAM が少なく、128K のコンテキストでも 32K より 0.7 GB 多いだけです。
-- **[LFM2.5-24B-A2B](docs/models/lfm25.ja.md)**：Liquid AI のモデルで、ファイルは 11〜25 GB。ほとんどの層にアテンションがないので、
-  長い会話でも VRAM をあまり使いません。128K のコンテキストでも 32K より 2 GB 多いだけです。ライセンスで商用利用が認められるのは、
-  年間売上が 1,000 万ドル未満の会社だけです。
-- **[Flint 40B-A2.5B](docs/models/flint.ja.md)**：Recursive がコーディングエージェント向けに作ったモデルで、ファイルは 18〜42 GB。
-  ほとんどの層は直前の 513 トークンしか見ないので、長い会話でも VRAM をあまり使いません。128K のコンテキストでも 32K より 2.6 GB 多いだけです。
-- **[Qwen3.6-35B-A3B](docs/models/qwen36.ja.md)**：ファイルは 13〜23 GB。画像も読めます。
-- **[Clover-35B-A3B-Preview](docs/models/clover.ja.md)**：DiffuSpace のモデル。Qwen3.6-35B-A3B をさらに学習させ、トークンのまとまりを一度に書けるようにしたもの。ファイルは 13〜21 GB。読めるのはテキストだけです。
-- **[Ornith 1.5](docs/models/ornith.ja.md)**：構造は Qwen3.6-35B-A3B と同じで、重みが違います。ファイルは 14〜24 GB。画像も読めます。
-- **[Gemma 4 26B-A4B](docs/models/gemma4.ja.md)**：ファイルは 11〜17 GB。画像も読めます。
-- **[Tiel Coder 35B-A3B](docs/models/tiel.ja.md)**：peculiar-ragdoll がコーディングエージェント向けに量子化した Ornith 1.5。ファイルは 14〜23 GB。画像も読めます。
-- **[MiniCPM-V 4.7 35B-A3B](docs/models/minicpmv.ja.md)**：OpenBMB のモデル。Qwen3.6-35B-A3B と同じ構造で、重みは独自のもの。画像を読むために作られています。ファイルは 16〜29 GB。
-- **[Kolibri 1](docs/models/kolibri.ja.md)**：Aleph Alpha のモデル。英語と同じようにドイツ語も書けます。ファイルは 29〜48 GB で、小さいカードではほとんどが RAM に置かれます。
+**HumanEval / HumanEval+** 全 164 問（`temperature = 0`, `reasoning_effort = "none"`, `max_tokens = 4096`）において、**`UD-Q4_K_XL`** は **97.6 % (160/164)** / **92.7 % (152/164)**、**`UD-Q3_K_XL`** は **95.7 % (157/164)** / **90.9 % (149/164)** を達成しました。GPQA Diamond は本フォークでは未計測です（Thinking Machines Lab 公式値は `86.6 %`）。
 
-サーバーは動かしたまま、インストール済みのモデルを切り替えられます（[方法](docs/BACKENDS.md#changing-the-model)、英語）。
+## 主な変更点
 
-PolyStrata は [VecSzn](https://github.com/VecSzn) が作りました。
-PolyStrata は Niko1221 の [Strata](https://github.com/Niko1221/Strata) をもとにしています。
-別のリポジトリにしている理由、AMD や VRAM の少ないカード、ファインチューンなどの質問は [FAQ](docs/FAQ.md)（英語）にあります。
+変更はすべて `src/poly/inkling2.*`、`src/poly/kernels_inkling2.cu`、`src/poly/inkling2_test.cu`（FP64 基準に対して **50 / 50 テスト合格**）および `setup.py` に実装されています。
 
-## どのくらい速い？
+| 内容 | 仕組み | 実測効果 |
+|---|---|---|
+| ネイティブ `inkling2_loop` / `inkling2` エンジン | 48 ステップ・ループ推論、6 ストリーム Block AttnRes、動的 `conv4` + ロールバック、CPU+GPU SiTU エキスパート | `llama.cpp` PR `#32704` 比 **2.4–3.7 倍高速** |
+| ネイティブ **DSpark MTP** (`--draft-model`) | 5 層 block-8 ドラフタ + 7 ステップ Markov RNN を単一 CUDA Graph 化 | Code **63.2 tok/s** / Mixed **64.7 tok/s** |
+| `--kv k8v4` / `q4_0` + GQA-3 統合カーネル + `--kv-grow` | 8-bit K + 4-bit V（`13 KiB/tok`）、CUDA VMM による動的確保（最大 `1M`）、純粋デコード `>= 30 tok/s` を **137K–141K** まで維持 | 181K で `q8_0` 比 `~800 MiB` 削減、32K **+9.1 %** |
+| `--cache-bias 0.2`（無バイアス重み再計算） | ルーティング選択時のみ VRAM エキスパートを優遇し、最終結合重みは元のロジットから算出 | 12 GB GPU ヒット率 **94–96 %** |
+| `647ae64e` カーネル高速化パス | インプレース残差加算、SWA `cudaMemcpyAsync` 40 回削減、ベクトル化 KV 逆量子化キャッシュ、DSpark FFN 融合 | 固定 `--window 1` **+13.1 %** (`52.8 -> 59.7 tok/s`) |
 
-1 トークンは英単語のおよそ ¾ です。
+## クイックスタート & ビルド
 
-- **回答の書き出し：** 短いチャットで返答が表示される速さです。毎秒 60 トークンあれば、読むより速く表示されます。
-- **プロンプトの読み込み：** 送った内容を取り込む速さです（ここでは 32K トークンの文書、コード、またはチャット履歴）。
-
-表はインストーラーが選ぶサイズで、単位は毎秒のトークン数です。各サイズの数値、llama.cpp との比較、測り方は各モデルのページにあります。
-
-| モデル | 8 GB のカードのノート PC<br>書き出し / 読み込み | RTX 5090<br>書き出し / 読み込み | 全サイズ |
-| --- | ---: | ---: | --- |
-| LFM2.5-24B-A2B | 70-73 / 3,590-3,620 | 480-485 / 23,390-23,460 | [LFM2.5](docs/models/lfm25.ja.md) |
-| Flint 40B-A2.5B | 61-63 / 2,000-2,010 | 251-252 / 12,900 | [Flint](docs/models/flint.ja.md) |
-| Qwen3.6-35B-A3B | 94-100 / 1,690 | 394-395 / 7,800-7,810 | [Qwen3.6](docs/models/qwen36.ja.md) |
-| Clover-35B-A3B-Preview | 68-73 / 1,560-1,700 | 未測定 | [Clover](docs/models/clover.ja.md) |
-| Ornith 1.5 | 76-82 / 1,620 | 316-319 / 8,040-8,110 | [Ornith](docs/models/ornith.ja.md) |
-| Gemma 4 26B-A4B | 92-93 / 2,240 | 353-356 / 8,420-8,480 | [Gemma 4](docs/models/gemma4.ja.md) |
-| Tiel Coder 35B-A3B | 83 / 1,700 | 337-345 / 8,080-8,110 | [Tiel Coder](docs/models/tiel.ja.md) |
-| MiniCPM-V 4.7 35B-A3B | 64 / 1,150 | 308-311 / 7,910-7,950 | [MiniCPM-V](docs/models/minicpmv.ja.md) |
-| Kolibri 1 | 未測定 | 189-192 / 4,980-5,070 | [Kolibri 1](docs/models/kolibri.ja.md) |
-| GLM 5.3 Flash | 動きません（32 GB のカードが必要） | 59-66 / 820 | [GLM](docs/models/glm.ja.md) |
-| DeepSeek V4 Flash | 動きません（32 GB のカードが必要） | 56 / 1,040 | [DeepSeek](docs/models/deepseek.ja.md) |
-
-ノート PC：RTX 4070 Laptop（8 GB）、Core i7-14700HX、RAM 32 GB。ワークステーション：RTX 5090（32 GB）、Xeon Platinum 8470Q（25 vCPU）、RAM 90〜120 GB。Flint はノート PC では UD-Q3_K_XL（RAM 32 GB でインストーラーが選ぶサイズ）、ワークステーションでは UD-Q4_K_XL です。Kolibri 1 はワークステーションでは Q2_K です。そこでインストーラーが選ぶ Q4_K_M は測っていません。
-
-**Inkling 2 Mini（`UD-Q3_K_XL` 14.4 GiB & `UD-Q4_K_XL` 16.4 GiB）** は RTX 4070 SUPER（12 GB VRAM）と 32 GB DDR5 RAM のデスクトップで **128K〜1M `max_context`** で測定されました。ネイティブ **DSpark MTP**（`--draft-model inkling2-dspark.gguf --kv k8v4 --cache-bias 0.2`）有効時、`UD-Q3_K_XL` は短いプロンプトで **64.4 トークン/秒**（コード生成で最大 **99.4 トークン/秒**）、32.7K コンテキストで **50.2 トークン/秒**（読み込み **821 トークン/秒**）、実際の **181.6K トークン**のコーディングセッション中でも **28.1〜30.0 トークン/秒**で書き出します（`UD-Q4_K_XL` + DSpark は短文 **60.2 トークン/秒** / 32.7K で **44.1 トークン/秒**）。**MTP なし**（`UD-Q4_K_XL`）でも単発プロンプトで **45.0〜47.3 トークン/秒**（マルチターンのコード/ログでは内蔵 lookup ドラフトにより最大 **108.2 トークン/秒**）で書き出し、5,461 トークンのプロンプトを **1,307 トークン/秒**で読み込みます（**llama.cpp PR `#32704` の 3.4〜3.7 倍の速さ**）。厳密な純粋デコード（`--window 1`、`1048576` `max_context`）でも FP16 で **~92K**、`--kv q8_0` で **~122K**、`--kv q4_0` で **~137K〜141K トークン**まで `>= 30 トークン/秒` を維持します（ダウンロード手順と MTP あり/なしの設定ガイドは [Inkling 2 Mini Benchmark.md](Inkling%202%20Mini%20Benchmark.md)）。
-
-Qwen3.8-Flash-Next は [Strata](https://github.com/Niko1221/Strata) プロジェクトのエンジンで動き、そのプロジェクトが RTX 5070（12 GB）、RAM 64 GB の PC で測りました：IQ2_XS で書き出し 79、32K プロンプトの読み込み 2,090（[全サイズ](docs/models/qwen38.ja.md)）。
-
-PolyStrata 独自のエンジンで動く 11 個のモデルは、付属のベンチマークで測りました。あなたの PC でも実行できます：
-`python polystrata.py benchmark --model <name> --prompt-tokens 24000`
-（[何を送り、何を表示するか](docs/BACKENDS.md#benchmark)、英語）。
-ほかの人が自分のカードで測った結果と、あなたの PC で llama.cpp と比べる方法：
-[コミュニティの測定結果](docs/COMMUNITY_BENCHMARKS.md#the-models-polystrata-adds)（英語）。
-ノート PC では Qwen3.6 でも Tiel Coder でも、PolyStrata はプロンプトを llama.cpp b11540 の 2.7〜3.5 倍の速さで読み、
-1.5〜1.8 倍の速さで書きました（[2 回の測定](docs/COMMUNITY_BENCHMARKS.md#comparing-with-llamacpp)、英語）。
-
-## RAM をどれだけ使うか
-
-0.1.45-poly.7 から、11 モデルのエンジンが使う RAM が減りました。グラフィックカードに載せ終えたモデルファイルの部分を、
-RAM に持たなくなったためです。ノート PC で Qwen3.6-35B-A3B が 32,000 トークンのプロンプトを読んだあと、0.1.45-poly.6 は
-17.9 GiB、いまは 13.1 GiB で、書く速さは変わりません。Linux では 17.8 GiB から 12.6 GiB になりました。
-
-さらに減らすには、`strata-<model>.json` の `"args"` に `"--ram-experts-mib", "6144"` を加えて
-（[場所](docs/INSTALL.md#where-things-are-stored)）再起動します。エンジンは VRAM の外に残るエキスパートのために、回答中も含めて
-その MiB だけ RAM を使い、起動時にそう表示します。残りはシステムのファイルキャッシュに残り、ほかのプログラムがそのメモリを
-使えます。トークンが必要とするときにそこから読みます。エキスパートが空いている RAM に収まるときは、書く速度が落ちるので既定では
-オフで、改善は続けています。収まらないときはエンジンが自分でオンにします（下記）。ノート PC
-（RTX 4070 Laptop 8 GB、RAM 32 GB、Windows 11）で Qwen3.6-35B-A3B UD-Q3_K_M の場合：
-
-| | 既定 | `--ram-experts-mib 6144` |
-| --- | ---: | ---: |
-| 読み込み後にエンジンが使う RAM | 11.7 GiB | **6.5 GiB** |
-| 書いている間の最大：短い会話 / 32K プロンプトのあと | 14.3 / 14.0 GiB | **6.7 / 7.3 GiB** |
-| リクエストの合間 | 12.8 GiB | **7.1 GiB** |
-| 書く速度（トークン/秒）：最初の短い会話 | 71.6 | 69.4（3% 遅い） |
-| 32K プロンプトのあと | 65.4 | 63.7（3% 遅い） |
-| そのあとの短い会話 | 84.2 | 72.9（13% 遅い） |
-| 長い回答（短い会話で 1,024 トークン） | 90.6 | 78.3（14% 遅い） |
-
-この測定ではほかのプログラムが VRAM の一部を使っていたので、どちらの列もカードが空いているときより遅くなっています。ほかの
-2 回では、32K プロンプトのあとで 6〜8%、そのあとの短い会話で 8〜10% 遅くなりました。Linux（約 8 GB に制限した RTX PRO
-6000）では既定の 12.3〜14.3 GiB が 7.0〜7.7 GiB になり、書く速度は 7〜14% 落ちました。エキスパートキャッシュを固定すると
-（リリース前の確認と同じ条件）、回答はトークン単位で同じです。
-
-VRAM の外のエキスパートが空いている RAM に収まらないとき、エンジンはその RAM から 4 GiB を引いた分を予算にして、よく使う
-エキスパートをそこに置き、残りはトークンが必要とするときに SSD から読むようになりました。起動時にそう表示します。以前はすべてを
-マップし、システムがページフォールトのたびに読み直していました。コンテナのメモリ上限も考慮します。Linux で、約 8 GB に制限した
-RTX PRO 6000、エンジンの RAM を 12 GB と 10 GB に制限（16 GB の PC でエンジンに残る分）、起動のたびにモデルファイルを
-ファイルキャッシュから外して測定：Qwen3.6-35B-A3B UD-Q3_K_M、最初の短い会話、24,000 トークンのプロンプトのあと、そのあとの
-短い会話でのトークン/秒。
-
-| エンジンの RAM | すべてマップ（以前） | 今の予算 |
-| --- | ---: | ---: |
-| 12 GB | 51 / 75-78 / 94-98 | **57-60 / 77-85 / 131-139** |
-| 10 GB | 39 / 48 / 69 | **51 / 64 / 92** |
-
-制限なしでは同じマシンで 63 / 169 / 203 です。Windows では測っていませんが、同じコードが動きます。
-`"--ram-experts-mib", "-1"` で以前どおりすべてをマップします。
-
-逆に `"--lock-experts"` を加えると、VRAM の外のエキスパートを RAM に固定します。システムがそのメモリをほかのプログラムに
-回して、あとで SSD から読み直すことがなくなります。Linux では `ulimit -l` の範囲までで、固定した量は起動時に表示されます。
-
-プロンプトを読むための VRAM も 350〜400 MiB 減りました。その分はエキスパートキャッシュが使うか（Qwen3.6 は VRAM の
-エキスパートが 2,444 個から 2,712 個に）、`--vram-reserve-mib` でほかのプログラムに残せます。
-しくみと測り方：[docs/BACKENDS.md](docs/BACKENDS.md#less-of-the-pcs-ram-and-vram)。
-
-## 必要なもの
-
-| モデル | グラフィックカード | RAM（インストーラーのサイズ） | ディスク | OS |
-| --- | --- | --- | --- | --- |
-| [Qwen3.8-Flash-Next](docs/models/qwen38.ja.md) | NVIDIA RTX 20〜50 シリーズ、または AMD RX 6800 / 6900, RX 7700 XT / 7800 XT / 7900 XT / XTX, RX 9060 XT / 9070 / 9070 XT, Radeon AI PRO R9700、12 GB 以上 | 32 GB 以上、64 GB ですべてのサイズ | 約 80 GB | Windows、Linux |
-| [GLM 5.3 Flash](docs/models/glm.ja.md) | NVIDIA RTX 20 シリーズ以降、32 GB のカードでのみ動作確認 | 32 GB のカードで 96 GB | 79〜114 GB、SSD に | Linux |
-| [DeepSeek V4 Flash](docs/models/deepseek.ja.md) | 同上 | 32 GB のカードで 72 GB | 91 GB、SSD に | Linux |
-| [LFM2.5-24B-A2B](docs/models/lfm25.ja.md) | NVIDIA RTX 20 シリーズ以降、8 GB 以上 | 8 GB のカードで約 20 GB | 11〜25 GB | Windows、Linux、Mac（ベータ版） |
-| [Flint 40B-A2.5B](docs/models/flint.ja.md) | 同上 | 8 GB のカードで約 22 GB | 18〜42 GB | Windows、Linux |
-| [Qwen3.6-35B-A3B](docs/models/qwen36.ja.md) | 同上、AMD はベータ | 8 GB のカードで約 21 GB | 13〜23 GB | Windows、Linux、Mac（ベータ版） |
-| [Clover-35B-A3B-Preview](docs/models/clover.ja.md) | NVIDIA RTX 20 シリーズ以降、8 GB 以上 | 8 GB のカードで約 20 GB | 13〜21 GB | Windows、Linux |
-| [Ornith 1.5](docs/models/ornith.ja.md) | 同上、AMD はベータ | 8 GB のカードで約 22 GB | 14〜24 GB | Windows、Linux |
-| [Gemma 4 26B-A4B](docs/models/gemma4.ja.md) | 同上、AMD はベータ | 8 GB のカードで約 18 GB | 11〜17 GB | Windows、Linux |
-| [Tiel Coder 35B-A3B](docs/models/tiel.ja.md) | 同上、AMD はベータ | 8 GB のカードで約 21 GB | 14〜23 GB | Windows、Linux |
-| [MiniCPM-V 4.7 35B-A3B](docs/models/minicpmv.ja.md) | 同上、AMD はベータ | 8 GB のカードで約 25 GB | 16〜29 GB | Windows、Linux |
-| [Kolibri 1](docs/models/kolibri.ja.md) | NVIDIA RTX 20 シリーズ以降、8 GB 以上 | 8 GB のカードで約 33 GB | 29〜48 GB | Windows、Linux |
-
-RAM はインストーラーの見積もりで、カードが大きいほど少なくて済みます。ほかはすべてインストーラーが用意します。Windows ではビルド済みのエンジンをダウンロードし、AVX2 のないプロセッサーや、手元のエンジンが最新リリースより新しいときだけ PC でコンパイルします（足りないツールは入れるか聞きます）。2〜3 枚のカードで 1 つのモデルを分担できます（[マルチ GPU](docs/MULTI_GPU.md)）。古いグラフィックカード、Intel Arc、Apple シリコンの Mac（Qwen3.8-Flash-Next、ベータ版として Qwen3.6 と LFM2.5）、Strix Halo、AVX2 のない古いプロセッサー：[詳しい一覧](docs/INSTALL.md#what-you-need)。各モデルのカード、RAM、サイズの詳細はそれぞれのページにあります。
-
-Qwen3.6、Clover、Ornith 1.5、Gemma 4、Tiel Coder、MiniCPM-V の 6 つのモデルそれぞれに必要なものと確認の方法：[docs/BACKENDS.md](docs/BACKENDS.md#install)（英語）。
-
-## インストール
-
-### AI にセットアップしてもらう
-
-AI コーディングアシスタント（Claude Code、Cursor、Codex、GitHub Copilot など）を使っていますか？ これを貼り付けてください：
-
-```text
-Set up PolyStrata on this PC for me: https://github.com/simplexai-labs/PolyStrata - follow docs/AI_SETUP.md in that repository.
+```bat
+python setup.py --family inkling2 --model UD-Q3_K_XL --kv k8v4 --context 131072 --yes
 ```
 
-AI がグラフィックカード、RAM、ディスクを調べて、合うモデルを選びます。それからインストールして起動し、
-アプリのつなぎ方を教えてくれます。AI ツールは PolyStrata の [MCP サーバー](docs/MCP_SERVER.md) を通じて、
-PolyStrata のインストール、起動、停止もできます。
+DSpark MTP を使う場合（任意・追加 VRAM `~400 MiB`）は、Unsloth の `dspark-Inkling-2-Mini-*.gguf` を一度だけ変換します：
 
-### 自分でやる
+```bat
+.venv\Scripts\python.exe tools\convert_inkling2_dspark.py --out models\inkling2\inkling2-dspark.gguf
+```
 
-[PolyStrata をダウンロード](https://github.com/simplexai-labs/PolyStrata/archive/refs/heads/main.zip)して展開します（または `git clone` します）。
-**Windows：** **`START-HERE.bat`** をダブルクリック。**Linux：** PolyStrata フォルダーで **`./setup.sh`** を実行します。
+ソースビルド（Windows / CUDA 13 / Ninja）：
 
-手順は NVIDIA でも AMD でも同じです。インストーラーがカードを見つけて、それに合うエンジンを用意します。
-いくつか質問があります：
+```bat
+call "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat"
+cmake -B build-inkling2 -G Ninja -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=ON -DCMAKE_CUDA_ARCHITECTURES=89
+cmake --build build-inkling2 --target strata-poly poly_inkling2_test -j 8
+```
 
-- どのモデルを、どのサイズで使うか
-- コンテキストをどのくらいにするか（モデルが覚えておけるテキストの量）
-- 画像を読ませるかどうか（GLM 5.3 Flash、DeepSeek V4 Flash、LFM2.5、Flint、Clover、Kolibri 1 は画像を読めません）
-
-**Mac（Apple シリコン、M1〜M5、macOS 15 以降）：** まず一度だけ Apple の Command Line Tools をインストールします（ターミナルで `xcode-select --install`。Xcode 本体は不要です）。次に PolyStrata フォルダーでターミナルを開き、**`./setup.sh`** を実行します。Mac 用エンジンをお使いの Mac 上でビルドし（約 7 分）、同じ質問をしてからモデルをダウンロードして起動します。次回からは `./setup.sh` ですぐに起動します。どのサイズが Mac に合うかと速度：[docs/MAC.md](docs/MAC.md)。標準では Qwen3.8-Flash-Next をセットアップします。`./setup.sh --family qwen36` または `--family lfm25` を使うと、代わりに Qwen3.6 か LFM2.5 を strata-poly の Metal エンジンでセットアップします（ベータ版）。M5 Ultra では Qwen3.6 UD-Q2_K_XL が短いチャットで毎秒 134 トークンを書き、3,768 トークンのプロンプトを毎秒 2,978 トークンで読みました。GLM、DeepSeek、Ornith、Gemma 4、Tiel Coder、MiniCPM-V も Mac でセットアップできますが、Mac ではまだ実際の重みで動かしていません。Kolibri、Flint、Clover には NVIDIA か AMD のグラフィックカードが必要です。
-
-毎回 Enter を押せば、おすすめの答えになります。そのあとモデル（Qwen3.8-Flash-Next は約 70 GB、GLM 5.3 Flash は 79〜114 GB、DeepSeek V4 Flash は 91 GB、Kolibri 1 は 29〜48 GB、ほかの 8 つは 11〜42 GB）をダウンロードして起動します。
-ダウンロードが止まったら、もう一度実行してください。続きから再開します。ブラウザーで PolyStrata アプリが
-`http://127.0.0.1:8080` に開きます。
-
-12 個ともインストーラーのモデル一覧にあります。`./setup.sh --family glm`（または `deepseek`、`lfm25`、`flint`、`qwen36`、`clover`、`ornith`、`gemma4`、`tiel`、`minicpmv`、`kolibri`）なら
-直接そこへ進みます（[何を尋ね、何を書き出すか](docs/GLM.md#install)、英語）。
-
-> **モデルの起動中、1-3 分ほど PC が重くなったり、反応しなくなったりすることがあります**（初回がいちばん長いです）。
-> PolyStrata は 35-55 GB を RAM に読み込み、その一部をグラフィックカード用に固定します。これは正常です。
-> ウィンドウを閉じずに待ってください。PolyStrata が何をしているかはウィンドウに表示されます。
-
-**次回からは** `START-HERE.bat`（または `./setup.sh`）をもう一度実行します。すぐに起動し、同じものを 2 回ダウンロードすることはありません。
-モデルを止めるときはウィンドウを閉じます。`UPDATE.bat`（`./update.sh`）を使うと、PolyStrata を起動せずに更新できます。
-更新、Docker、複数のカード、ファイルの保存場所、すべてのオプションについて：[docs/INSTALL.md](docs/INSTALL.md)。
-
-**自分の PC で速いか知りたいときは** `BENCH.bat`（`./bench.sh`）を実行します。5〜10 分ほどで、チャット、4K/16K のプロンプト、エージェント風のセッションを自分の設定のまま測り、共有できるレポートを書き出します（[やり方](docs/COMMUNITY_BENCHMARKS.md#run-the-benchmark)）。
-
-## どのモデルを選べばいい
-
-同じモデルにも圧縮の度合いが違うサイズがいくつかあります。小さいサイズほど速く RAM も少なくて済み、大きいほど元のモデルに近くなります。Enter を押せばインストーラーが RAM とカードに合わせて選びます。別のサイズはインストール時に `--model <サイズ>` を付けます。
-
-| モデル | インストーラーの選択 | RAM が足りないとき | 名前で指定 |
-| --- | --- | --- | --- |
-| [Qwen3.8-Flash-Next](docs/models/qwen38.ja.md) | RAM 32 GB：Coder、48〜64 GB：IQ2_XS、96 GB 以上：IQ3_S |  | Q2_0、IQ3_XXS、Unsloth の 4〜8 bit |
-| [GLM 5.3 Flash](docs/models/glm.ja.md) | 3.0BIT | UD-IQ2_XXS、さらに足りなければ REAP50-Q3_K_M |  |
-| [DeepSeek V4 Flash](docs/models/deepseek.ja.md) | UD-IQ2_XXS（これだけ） |  |  |
-| [LFM2.5-24B-A2B](docs/models/lfm25.ja.md) | UD-Q4_K_XL | UD-Q3_K_XL | QAD-Q4_0, UD-Q6_K_XL, Q8_0 |
-| [Flint 40B-A2.5B](docs/models/flint.ja.md) | RAM 約 40 GB から UD-Q4_K_XL | UD-Q3_K_XL | UD-Q6_K_XL, Q8_0 |
-| [Qwen3.6-35B-A3B](docs/models/qwen36.ja.md) | UD-Q3_K_M | UD-Q2_K_XL | UD-Q4_K_M |
-| [Clover-35B-A3B-Preview](docs/models/clover.ja.md) | Q3_K_M | APEX-I-NANOPLUS | Q4_K_M |
-| [Ornith 1.5](docs/models/ornith.ja.md) | APEX-I-COMPACT | APEX-I-MINI | APEX-I-QUALITY |
-| [Gemma 4 26B-A4B](docs/models/gemma4.ja.md) | UD-Q3_K_M | UD-Q2_K_XL | UD-Q4_K_M, QAT-UD-Q4_K_XL |
-| [Tiel Coder 35B-A3B](docs/models/tiel.ja.md) | UD-Q3_K_XL | UD-IQ3_XXS | UD-Q4_K_XL |
-| [MiniCPM-V 4.7 35B-A3B](docs/models/minicpmv.ja.md) | Q4_K_M | mix_q3gud_im | Q6_K |
-| [Kolibri 1](docs/models/kolibri.ja.md) | RAM 約 48 GB から Q4_K_M | Q2_K | Q3_K_M |
-
-各サイズの中身、ダウンロード量、ほかのカードでの必要 RAM、最大サイズとの差：各モデルのページ（「どのくらい速い？」の表のモデル名から）。
-
-## 使い方
-
-12 個のモデルの使い方は同じです。同じアプリ、同じ API です。
-
-<p align="center"><img src="docs/media/runpagoda.png" width="900" alt="PolyStrata アプリの Monitor タブと、その横で動くコーディングエージェント"><br>
-<sub>PolyStrata アプリの <b>Monitor</b>（左）。コーディングエージェントが動画の五重塔の庭を書いているところ（右）。<a href="https://github.com/Niko1221/Strata">Strata</a> のスクリーンショットです。</sub></p>
-
-- **ブラウザーで：** `http://127.0.0.1:8080` を開きます。**Chat**、モデルと GPU/CPU/RAM の様子をリアルタイムで見る **Monitor**、
-  設定とアドレスが載った **About** があります。
-- **パーソナルエージェントとして：** [Linger](https://github.com/simplexai-labs/linger) をダウンロード：[Mac（Apple シリコン）](https://github.com/simplexai-labs/linger/releases/download/desktop-v0.1.2/Linger-0.1.2-macos-arm64.dmg) ·
-  [Windows](https://github.com/simplexai-labs/linger/releases/download/desktop-v0.1.2/Linger-0.1.2-windows-x64-setup.exe) · [Linux](https://github.com/simplexai-labs/linger/releases/download/desktop-v0.1.2/Linger-0.1.2-linux-x64.tar.gz)。
-- **アプリやコーディングエージェントから：** 「OpenAI-compatible」プロバイダーを追加し、ベース URL に
-  **`http://127.0.0.1:8080/v1`** を指定します。API キーとモデル名は何でもかまいません。
-  - Anthropic の API を使うアプリ：`http://127.0.0.1:8080/v1/messages`（Claude Code：
-    `ANTHROPIC_BASE_URL=http://127.0.0.1:8080`、`strata-<model>.json` に `"fit_max_tokens": true`
-    （[理由](docs/FAQ.md#can-i-use-it-with-claude-code-codex-or-other-apps)））。
-  - Codex CLI など OpenAI Responses API を使うアプリ：`/v1/responses`
-    （[設定方法](docs/DETAILS.md#the-responses-api-and-codex-cli)）。
-- **思考（Thinking）：** チャットのメニュー、またはアプリの「reasoning effort」で **off、low、medium、high** を選びます。
-  off がいちばん速く、high は難しい質問に向いています。
-- **スマートフォンや別の PC から：** `START-HERE.bat --setup --host 0.0.0.0 --api-key <secret>`。キーは必ず設定してください。
-
-モデルによって違うところ：
-
-| | Qwen3.8-Flash-Next | GLM 5.3 Flash | DeepSeek V4 Flash | LFM2.5-24B-A2B | Flint 40B-A2.5B | Kolibri 1 | Qwen3.6-35B-A3B、Clover-35B-A3B-Preview、Ornith 1.5、Gemma 4 26B-A4B、Tiel Coder 35B-A3B、MiniCPM-V 4.7 35B-A3B |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| **画像** | セットアップで「Images?」に yes と答えます。そのあとチャットで **Picture** をクリックするか、アプリで画像を添付します。AMD のカードは、Linux ではプロセッサーを使って画像を読みます。Windows ではまだ読めません。 | まだ読めません。 | テキストだけです。 | テキストだけです。 | テキストだけです。 | テキストだけです。 | セットアップで「Images?」に yes と答えます。あとは Qwen3.8-Flash-Next と同じです。16 GB 未満のカードでは画像エンコーダーがプロセッサーで動き、画像 1 枚に数秒かかります。Clover はテキストだけです。 |
-| **リクエストは 1 つずつ** | 初期設定では PolyStrata は 1 つのリクエストに答え、ほかは待ちます。複数に同時に答えるには`"parallel": 2` を設定します（[BATCHING.md](docs/BATCHING.md)）。12 GB のカードでは、それぞれの回答が遅くなります。 | 1 つずつ答え、ほかは待ちます。 | 1 つずつ答え、ほかは待ちます。 | 1 つずつ答え、ほかは待ちます。 | 1 つずつ答え、ほかは待ちます。 | 1 つずつ答え、ほかは待ちます。 | 1 つずつ答え、ほかは待ちます。 |
-| **複数の会話** | 直前の会話は保持されるので、2 通目以降は数秒で始まります。エンジンの引数を 2 つ足すと、複数の会話を RAM に保持できます（[詳細](docs/DETAILS.md#using-it)）。 | 直前の会話は保持されます。セットアップで、複数の会話を RAM に保持するかどうかを尋ねます。保持すると、エージェントとサブエージェントが交互に使っても、プロンプトを読み直しません（[仕組み](docs/GLM.md#several-conversations-at-once)）。 | GLM 5.3 Flash と同じです。 | GLM 5.3 Flash と同じです。 | GLM 5.3 Flash と同じです。 | GLM 5.3 Flash と同じです。 | GLM 5.3 Flash と同じです。 |
-| **長いプロンプト** | PolyStrata はチャットの最初のメッセージをすべて読みます。30,000 トークンあたり約 1 分かかります。2 通目以降のメッセージは数秒で始まります。 | 最初のメッセージはすべて読みます。30,000 トークンあたり約 40 秒かかります。 | 最初のメッセージはすべて読みます。30,000 トークンあたり約 29 秒かかります。 | 最初のメッセージはすべて読みます。30,000 トークンにワークステーションで 1.3〜1.5 秒、8 GB のノート PC で 8〜10 秒かかります。 | 最初のメッセージはすべて読みます。30,000 トークンにワークステーションで約 2.3 秒、8 GB のノート PC で 15〜22 秒かかります。 | 最初のメッセージはすべて読みます。30,000 トークンにワークステーションの Q2_K で約 6 秒かかります。 | 最初のメッセージは全部読みます。30,000 トークンで、ワークステーションは 4〜5 秒、8 GB のノート PC は 14〜27 秒です。 |
-
-詳しくは：[チャットの保存場所](docs/INSTALL.md#where-things-are-stored)、[API](docs/DETAILS.md#using-it)。
-
-### オプション：モデル全体が RAM に収まる場合、GPU 1 枚でさらに高速化
-
-2 つのオプトイン設定です（RubenTorney 氏による #1904 と #1905）。GPU を 1 枚使い、RAM にすべてのエキスパートが収まる場合（PolyStrata の arena モード。例：64 GB の PC で Q2_0 や IQ3_XXS）に効果があります。PolyStrata のデータフォルダーにある設定ファイル `strata-<model>.json`（[場所](docs/INSTALL.md#where-things-are-stored)）を開き、次を追加します：
-
-- **生成の高速化：** `"args"` リストに `"--adapt-async", "1"`。エキスパートキャッシュの更新が回答を止めずに補助スレッドで行われます。RTX 5070（Windows、Q2_0）での実測：生成 +4〜5%、コードや長文では +7〜10%。回答はデフォルトとわずかに異なる場合があります（実行ごとには同じです）。
-- **Windows でのプロンプト読み込みの高速化：** `"env"` ブロックに `"STRATA_PIN_BY_NEED": "1"`。Windows はGPU 用に RAM の約半分しか固定できないため、この設定で GPU が本当に必要とするエキスパートから先に固定します。RTX 5070 での実測：プロンプト読み込み +4.4%。
+## 検証 PC の設定例 (`UD-Q3_K_XL` + DSpark)
 
 ```json
-"args": [ ..., "--adapt-async", "1" ],
-"env": { "STRATA_PIN_BY_NEED": "1" }
+{
+  "exe": "D:\\PolyStrata\\engine-poly-inkling2\\strata-poly.exe",
+  "args": [
+    "--model", "path\\to\\Inkling-2-Mini-UD-Q3_K_XL.gguf",
+    "--draft-model", "path\\to\\inkling2-dspark.gguf",
+    "--max-context", "262144",
+    "--kv", "k8v4",
+    "--cache-bias", "0.2",
+    "--vram-reserve-mib", "1280",
+    "--prompt-batch", "512",
+    "--ram-experts-mib", "-1",
+    "--expert-profile", "path\\to\\expert-profile.txt",
+    "--conversation-cache-mib", "auto"
+  ],
+  "reasoning_close_retry": true,
+  "repeat_stop_tokens": 64
+}
 ```
 
-変更後は PolyStrata を再起動してください（`START-HERE.bat` または `./setup.sh`）。元に戻すには、2 つの項目を削除します。
+`UD-Q4_K_XL` を使う場合は `--model` のパスを差し替えます。MTP なし（0 MiB 追加 VRAM）で動かす場合は `--draft-model` 行を削除してください。
 
-## うまくいかないとき
+## クレジット
 
-- **PolyStrata の初回起動で PC が固まった。** モデルの読み込み中はよくあることです。ウィンドウを閉じずに待ってください。
-  10 分たっても固まったまま？ PC を再起動し、ほかのプログラムを閉じてもう一度試すか、小さいサイズを選んでください。
-- **ダウンロードやインストールの途中で止まった。** `START-HERE.bat`（または `./setup.sh`）をもう一度実行してください。
-  止まったところから続きます。
-- **とても遅く、ディスクのランプが点滅し続ける。または「the engine stopped unexpectedly」と表示される。** PC の空き RAM が
-  足りません。ほかのプログラムを閉じるか（ブラウザーは多く使います）、小さいサイズ（Q2_0 または IQ2_XS）を選んでください。
-- **ポート 8080 がすでに使われていると表示される。** PolyStrata はもう動いています。そのウィンドウを探してください。
-
-ほかの問題と解決方法：[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)。それでも解決しない場合は
-[issue](https://github.com/simplexai-labs/PolyStrata/issues) を作成し、PolyStrata フォルダーにある `strata-<model>.log` を添付してください。
-セキュリティの問題を見つけたら、非公開で報告してください：[SECURITY.md](SECURITY.md)。
-
-## しくみ
-
-このようなモデルは、ふつう数百ギガバイトのグラフィックメモリを持つサーバーで動きます。あなたのグラフィックカードは
-8-32 GB です。PolyStrata は **PC 全体で作業を分担する** ことで、モデルを収めています。台所を思い浮かべてください。
-いつも使う道具は調理台に置き、残りは食料庫にしまっておきます。
-
-各モデルの図と説明：[docs/HOW_IT_WORKS_MODELS.ja.md](docs/HOW_IT_WORKS_MODELS.ja.md)。
-
-## PolyStrata で作られたプロジェクト
-
-<p align="center"><a href="https://github.com/simplexai-labs/linger"><img src="https://raw.githubusercontent.com/simplexai-labs/linger/main/assets/linger-story.webp" width="820" alt="28 秒でわかる Linger：ローカルモデルを用意し、アプリをつなぎ、メールや会議を記憶に変え、メールを送る前に確認します。"></a><br>
-<sub>28 秒でわかる Linger：ローカルモデルを用意し、アプリをつなぎ、メールや会議を記憶に変え、メールを送る前に確認します。</sub></p>
-
-**[Linger](https://github.com/simplexai-labs/linger)** は、PC の中だけで動くオープンソースのパーソナルエージェントです。ローカルモデルは PolyStrata で動きます。アプリをまたいで必要なものを見つけ、大事なことを覚え、あなたがいない間も作業を進めます。[ドキュメント](https://docs.heylinger.com/) · [GitHub](https://github.com/simplexai-labs/linger)
-
-PolyStrata で何か作りましたか？ [issue](https://github.com/simplexai-labs/PolyStrata/issues) を開いてください。ここに追加します。
-
-## クレジットとライセンス
-
-Qwen3.8-Flash-Next は [Qwen チーム](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) のモデルです。圧縮は
-[ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)、UkisAI（Swift 1.5）、Unsloth によるものです。
-GLM 5.3 Flash は [neuralll](https://huggingface.co/neuralll/GLM-5.3-Flash-GSQ-RCO-3.0bit-Q4Kattn-GGUF)、Unsloth、
-patrickbdevaney のファイルで動きます。Qwen3.6-35B-A3B は Qwen チーム、Gemma 4 は Google、DeepSeek V4 Flash は DeepSeek のモデルで、
-3 つとも [Unsloth](https://huggingface.co/unsloth) の量子化を使っています。LFM2.5-24B-A2B は [Liquid AI](https://huggingface.co/LiquidAI/LFM2.5-24B-A2B) のモデルで、Unsloth の量子化と Liquid AI 自身の QAD-Q4_0 を使っています。Flint 40B-A2.5B は [Recursive](https://huggingface.co/RecursiveSI/flint) のモデルで、Unsloth の量子化を使っています。Kolibri 1 は [Aleph Alpha](https://huggingface.co/Aleph-Alpha/Kolibri-1) のモデルで、[Hob-forge](https://huggingface.co/Hob-forge/Kolibri-1-GGUF) による GGUF 変換を使っています。Clover-35B-A3B-Preview は [DiffuSpace](https://huggingface.co/Diffuspace/Clover-35B-A3B-Preview) のモデルで、[maternion](https://huggingface.co/maternion/Clover-35B-A3B-Preview-GGUF) の量子化と IsValorum の APEX を使っています。Ornith 1.5 は ornith-ai のモデルで、
-[mudler](https://huggingface.co/mudler/Ornith-1.5-35B-A3B-APEX-MTP-GGUF) の APEX 量子化を使っています。Tiel Coder 35B-A3B は [peculiar-ragdoll](https://huggingface.co/peculiar-ragdoll/Tiel-Coder-35B-A3B-GGUF-MTP) が量子化した Ornith 1.5 で、PolyStrata で動くことは [u/Sensitive_Song4219](https://www.reddit.com/r/LocalLLM/comments/1x22inc/comment/pf3r111/) が見つけました。MiniCPM-V 4.7 35B-A3B は [OpenBMB](https://huggingface.co/openbmb/MiniCPM-V-4.7-35B-A3B-gguf) のモデルで、OpenBMB 自身の量子化を使っています。PolyStrata に組み込んだのは [iMilnb](https://github.com/iMilnb) です。PolyStrata は Niko1221 とコントリビューターによる [Strata](https://github.com/Niko1221/Strata) をもとにしており、
-[llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) の一部を使っています。すべてのクレジット：
-[docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md#credits)。PolyStrata は [MIT License](LICENSE) のオープンソースです。一部のパーツと
-すべてのモデルには、それぞれ独自のライセンスがあります（[どれか](docs/HOW_IT_WORKS.md#license)）。
+- [PolyStrata](https://github.com/VecSzn/PolyStrata) ([VecSzn](https://github.com/VecSzn)) ・ [Strata](https://github.com/Niko1221/Strata) ([Niko1221](https://github.com/Niko1221))
+- Thinking Machines Lab（**Inkling-2-Mini**）・ [Unsloth](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF)・ [llama.cpp](https://github.com/ggml-org/llama.cpp) (`PR #32704`)
+- README / カードレイアウト参考：[midokino/kuu-Strata-fork](https://github.com/midokino/kuu-Strata-fork)

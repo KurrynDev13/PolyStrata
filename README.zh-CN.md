@@ -1,302 +1,127 @@
-<h1 align="center">PolyStrata</h1>
+# PolyStrata-Inkling2
 
 [English](README.md) · **简体中文** · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md) · [Türkçe](README.tr.md)
 
-<p align="center"><b>在你自己的电脑上运行大型 AI 模型</b><br>
-Inkling 2 Mini、Qwen3.8-Flash-Next、GLM 5.3 Flash、DeepSeek V4 Flash、LFM2.5、Flint、Qwen3.6、Clover、Ornith 1.5、Gemma 4、Tiel Coder、MiniCPM-V 和 Kolibri 1 · 免费开源</p>
+**在单张 12 GB 显卡上本地运行 Inkling-2-Mini —— 非官方 PolyStrata 分支**
 
-<p align="center"><a href="https://github.com/simplexai-labs/linger"><img height="28" alt="Used by Linger" src="docs/media/used-by-linger.svg"></a></p>
+![PolyStrata-Inkling2：UD-Q3_K_XL + DSpark 对比 llama.cpp PR #32704 —— 代码生成、混合长任务、32K 提示词读取、HumanEval+、GPQA Diamond](docs/img/inkling2-card.png)
 
-<p align="center"><img src="docs/media/speed.svg" width="820" alt="写回答时每秒的 token 数：8 GB 显存的笔记本上 Qwen3.6-35B-A3B 为 94 到 100，RTX 5090 上为 394 到 395"></p>
+PolyStrata-Inkling2 是基于 [PolyStrata](https://github.com/VecSzn/PolyStrata)（及上游 [Strata](https://github.com/Niko1221/Strata)）的非官方分支，专为在**单张 12 GB 显存 + 32 GB 内存**的普通桌面电脑上运行 Thinking Machines Lab 的 **Inkling-2-Mini**（`26B-A3B` 48 虚拟层循环 MoE 模型）而优化，使用 CUDA 引擎（`strata-poly.exe`），支持原生 **DSpark MTP** 投机草稿解码、混合精度 **`--kv k8v4`** / **`q4_0`** KV 缓存以及零显存占用的 CPU 视觉编码器。
 
-<p align="center"><img src="docs/media/claude-code-demo.gif" width="820" alt="终端里的 Claude Code，旁边是 PolyStrata 的 API Monitor"><br>
-<sub>Claude Code 接 Qwen3.6-35B-A3B UD-Q3_K_M，在 8 GB 显卡的笔记本上，原速：给一个小程序加 <code>--json</code> 选项，写测试，跑测试。服务器启动时已经读过 Claude Code 的系统提示词（<code>"warm_start": true</code>）。</sub></p>
+本分支仅在单台参考 PC 上实测调优，与 Thinking Machines Lab、Unsloth、Strata 或上游 PolyStrata 无任何从属关系。
 
-<p align="center"><a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4"><img src="docs/media/pagoda-preview.webp" width="720" alt="模型写出的体素宝塔花园，在浏览器中运行"></a><br>
-<sub>体素宝塔花园，一次提示生成，在 RTX 5070 上用 <a href="https://github.com/Niko1221/Strata">Strata</a> 运行（Qwen3.8-Flash-Next IQ3_S，128K 上下文）·
-<a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4">完整视频（49 秒）</a></sub></p>
+- **一键安装：** 运行 [START-HERE.bat](START-HERE.bat)（Windows）或 `./setup.sh --family inkling2 --kv k8v4`，自动配置 Python/CUDA 运行环境并从 [`unsloth/Inkling-2-Mini-GGUF`](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) 下载带哈希校验的 GGUF 模型。
+- **上游 README**（其余 12 个模型及多模型总览）已归档至 [README.upstream.md](README.upstream.md)。
+- **完整基准数据与内核优化细节：** [Inkling 2 Mini Benchmark.md](Inkling%202%20Mini%20Benchmark.md)。
+- 下方加速均来自纯软件优化，数据测自单台桌面 PC，不同硬件上存在差异（多次运行波动约 `3–8 %`）。
 
-PolyStrata 能在普通电脑上运行通常要用服务器才能跑的大型 AI 模型。它们能聊天、写代码，还能配合你的应用和编程智能体一起工作。
-所有数据都留在你的电脑上。
+## 参考 PC 实测结果
 
-它能跑十三个模型，用两个引擎：
+![Inkling-2-Mini 在 RTX 4070 SUPER 12 GB 上的显存/内存分布、生成速度与提示词读取吞吐量](docs/img/inkling2-summary.png)
 
-- **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)**：12 GB 及以上的 NVIDIA 或 AMD 显卡，Windows 或
-  Linux。它还能看图片。引擎是 Strata 项目的，没有改动。
+Ryzen 9 7900X (12 核 24 线程, AVX-512) · RTX 4070 SUPER 12 GB (`sm_89`) · DDR5 32 GB (`31.1 GiB` 可用) · Windows 11 · 模型：[`unsloth/Inkling-2-Mini-GGUF`](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) **`UD-Q3_K_XL`** (`13.6 GB`) 与 **`UD-Q4_K_XL`** (`16.4 GiB`, 0–19 层为 NVFP4、20–23 层为 Q8_0)，开启 DSpark MTP (`inkling2-dspark.gguf`)，`--kv k8v4 --cache-bias 0.2`，`131K–262K` 上下文。
 
-另外十二个用的是为 PolyStrata 写的引擎，需要一张 NVIDIA 显卡，也可以用[两张](docs/MULTI_GPU.md#the-strata-poly-models)：十二个都能在 Linux 上跑，除了 GLM 5.3 Flash 和 DeepSeek V4 Flash，其余也都能在 Windows 上跑。
-目前是实验性的：在 32 GB 显卡的电脑上跑过，较小的模型也在 8 GB 或 12 GB 显卡上跑过。
+| | `llama.cpp` PR `#32704` (`-ngl 99 -cmoe`) | `UD-Q4_K_XL` + DSpark (`k8v4`, NVFP4/Q8) | `UD-Q3_K_XL` + DSpark (`k8v4`, 本分支默认) |
+|---|---|---|---|
+| 驻留显存专家数 | 0 / 3,072 (`0 GiB`) | 1,520–1,613 / 3,072 (`7.3–7.5 GiB`) | **1,989 / 3,072 (`7.5 GiB`, 64.7 %)** |
+| 代码生成（`temperature 0`，1,500 tokens，3 次均值） | 13.7 tok/s *（25-tok 短解码）* | 55.4 tok/s (`59.1 / 53.0 / 54.2`) | **63.2 tok/s (`61.4 / 65.4 / 62.8`)** |
+| 混合长任务（散文、代码、工具调用、翻译、思考） | — | 58.1 tok/s (`50.6 / 62.8 / 81.0 / 46.3 / 49.7`) | **64.7 tok/s (`56.3 / 74.8 / 82.0 / 54.3 / 56.1`)** |
+| 纯单 token 解码（冻结 `--window 1 --no-draft`） | 13.7 tok/s | 47.3 tok/s | **59.7 tok/s** (`2,098` 专家) |
+| 32K 上下文解码 | — | 43.8 tok/s | **47.8 tok/s** |
+| 120K 上下文解码 | — | — | **31.8 tok/s** |
+| 真实 `181.6K` OpenCode 长对话解码 | — | — | **28.1–30.0 tok/s** |
+| 提示词读取（1.8K–5.4K tokens） | 263 tok/s *（1.8K）* | **1,307 tok/s** *（5.4K，无 MTP）* | — |
+| 提示词读取（32K tokens） | — | 1,035 tok/s | **1,137 tok/s** |
+| 提示词读取（120K tokens） | — | — | **847 tok/s** |
+| 与 `llama.cpp` 贪心输出一致率 | *参考基线* | **48 / 48 (100 %)** | 48 / 48 *（FP16 与 `q8_0` KV）* |
+| HumanEval / HumanEval+（EvalPlus 0.3.1，`temp 0`, effort 0） | — | **97.6 / 92.7 %** (`160 / 152` / 164) | **95.7 / 90.9 %** (`157 / 149` / 164) |
+| GPQA Diamond（198 题） | — *（Thinking Machines 官方卡：86.6 %）* | 未测试 | 未测试 |
 
-- **[Inkling 2 Mini](Inkling%202%20Mini%20Benchmark.md)**：Thinking Machines Lab 的 48 虚拟层循环 MoE 模型（`inkling2_loop` / `inkling2`），文件 12 到 18 GB（[`unsloth/Inkling-2-Mini-GGUF`](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF)：`UD-Q3_K_XL` 为 14.4 GiB，`UD-Q4_K_XL` 为 16.4 GiB 且第 0–19 层保留原生 NVFP4）。支持可选的原生 **DSpark MTP** 8-token 块投机解码（`--draft-model inkling2-dspark.gguf`），也可不加载 MTP 仅使用零显存占用的内置 n-gram lookup。48 个虚拟层中有 40 层在固定环形缓冲区中只往回看 1,024 个 token，仅 8 层使用全局注意力，每 token 占 `32 KiB`（FP16，128K 下 `4.0 GiB`）、`17 KiB`（`--kv q8_0`，`2.13 GiB`）、`13 KiB`（`--kv k8v4`，`1.63 GiB`，`Q8_0` K + `Q4_0` V）或 `9 KiB`（`--kv q4_0`，`1.13 GiB`），配合 `--kv-grow` 可扩展至 1M `max_context`。它也能通过 CPU 视觉编码器（`mmproj-F16.gguf`）看图片。
-- **[GLM 5.3 Flash](docs/models/glm.zh-CN.md)**：最大的一个，文件 79 到 114 GB，大部分留在内存里。
-- **[DeepSeek V4 Flash](docs/models/deepseek.zh-CN.md)**：文件 91 GB，大部分也留在内存里。它记对话占的显存很少：128K 上下文只比 32K 多占 0.7 GB。
-- **[LFM2.5-24B-A2B](docs/models/lfm25.zh-CN.md)**：Liquid AI 的模型，文件 11 到 25 GB。它大部分层没有注意力，所以长对话占的显存很少：
-  128K 上下文只比 32K 多占 2 GB。它的许可证只允许年收入低于 1,000 万美元的公司商用。
-- **[Flint 40B-A2.5B](docs/models/flint.zh-CN.md)**：Recursive 为编程智能体做的模型，文件 18 到 42 GB。它大部分层只往回看 513 个 token，
-  所以长对话占的显存很少：128K 上下文只比 32K 多占 2.6 GB。
-- **[Qwen3.6-35B-A3B](docs/models/qwen36.zh-CN.md)**：文件 13 到 23 GB。它还能看图片。
-- **[Clover-35B-A3B-Preview](docs/models/clover.zh-CN.md)**：DiffuSpace 的模型，在 Qwen3.6-35B-A3B 上接着训练，还能一次写出一整块 token，文件 13 到 21 GB。只看文字。
-- **[Ornith 1.5](docs/models/ornith.zh-CN.md)**：结构和 Qwen3.6-35B-A3B 相同，权重不同，文件 14 到 24 GB。它还能看图片。
-- **[Gemma 4 26B-A4B](docs/models/gemma4.zh-CN.md)**：文件 11 到 17 GB。它还能看图片。
-- **[Tiel Coder 35B-A3B](docs/models/tiel.zh-CN.md)**：peculiar-ragdoll 为编程智能体量化的 Ornith 1.5，文件 14 到 23 GB。它还能看图片。
-- **[MiniCPM-V 4.7 35B-A3B](docs/models/minicpmv.zh-CN.md)**：OpenBMB 的模型，结构和 Qwen3.6-35B-A3B 相同，权重是自己训练的，专门做看图，文件 16 到 29 GB。
-- **[Kolibri 1](docs/models/kolibri.zh-CN.md)**：Aleph Alpha 的模型，写德语和写英语一样好，文件 29 到 48 GB，显卡小的时候大部分放在内存里。
+在完整的 **HumanEval / HumanEval+** 全部 164 题测试中（`temperature = 0`, `reasoning_effort = "none"`, `max_tokens = 4096`），**`UD-Q4_K_XL`** 拿下 **97.6 % (160/164)** 基础通过率与 **92.7 % (152/164)** HumanEval+ 通过率；**`UD-Q3_K_XL`** 拿下 **95.7 % (157/164)** 基础通过率与 **90.9 % (149/164)** HumanEval+ 通过率。**GPQA Diamond** 尚未在本分支实测，Thinking Machines Lab 官方发布的原始权重成绩为 `86.6 %`。
 
-服务器运行时可以在已安装的模型之间切换（[做法](docs/BACKENDS.md#changing-the-model)，英文）。
+借助 Inkling-2-Mini 的 **40 层局部滑动窗口环形缓存**（`window = 1024`）+ **8 层全局注意力层**，配合 CUDA VMM 按需扩容（`--kv-grow`）以及 `--kv k8v4`（`13 KiB/token`）/ `--kv q4_0`（`9 KiB/token`），12 GB 显卡在 `--window 1` 纯解码下可将 `>= 30 tok/s` 维持到 **~137K–141K 已填充 tokens**（229K 下仍达 `24.2 tok/s`，224K 检索精准通过）。
 
-PolyStrata 由 [VecSzn](https://github.com/VecSzn) 创建。
-PolyStrata 基于 Niko1221 的 [Strata](https://github.com/Niko1221/Strata)。
-为什么单独开一个仓库、AMD 和显存更小的显卡、微调模型等问题，见 [FAQ](docs/FAQ.md)（英文）。
+## 引擎改动要点
 
-## 速度有多快？
+所有 Inkling-2-Mini 改动集中在 `src/poly/inkling2.*`、`src/poly/kernels_inkling2.cu`、`src/poly/inkling2_test.cu`（**50 / 50 单元测试对照 FP64 参考实现全部通过**）以及 `setup.py`：
 
-一个 token 大约相当于 ¾ 个英文单词。
+| 改动项 | 作用 | 实测收益 |
+|---|---|---|
+| 原生 `inkling2_loop` / `inkling2` 引擎（`src/poly/inkling2.cpp`） | 48 步循环执行、6 流 Block AttnRes、动态 `conv4` 与投机回滚、CPU+CUDA 混合 SiTU 专家（支持 NVFP4 与 Q2_K–Q8_0） | 对比 `llama.cpp` PR `#32704` **快 2.4–3.7 倍** |
+| 原生 **DSpark MTP**（`--draft-model`、`dspark_markov_graph_`） | 5 层双向 block-8 草稿网络 + 7 步 Markov RNN 整体捕获进单个 CUDA Graph（每步仅回传 28 字节） | 代码生成 **63.2 tok/s**，混合长任务 **64.7 tok/s** |
+| `--kv k8v4` / `q4_0` 与 GQA-3 分组注意力核 | 8-bit K + 4-bit V 混合 KV（`13 KiB/tok`），24Q/8KV 分组寄存器复用减少 3 倍全局 KV 带宽，支持最高 `1M` 虚拟上下文 | 181K 下比 `q8_0` 省 `~800 MiB` 显存，32K 解码 **+9.1 %** |
+| 路由缓存偏置 `--cache-bias 0.2`（保持无偏 Sigmoid 权重） | Top-8 路由选专家时轻度偏向显存内专家，最终仍按未加偏置的原始 logits 计算 Sigmoid 权重 | 12 GB 显卡显存专家命中率提升至 `94–96 %` |
+| `647ae64e` 精选内核快速路径 | 原地 `inkling_add_to_stream` 减少 88 次内核启动、移除 40 次 SWA `cudaMemcpyAsync`、向量化 KV 反量化预热及 DSpark FFN 融合 | 冻结 `--window 1` **+13.1 %** (`52.8 -> 59.7 tok/s`) |
 
-- **写回答：** 短对话中回复出现的速度。每秒 60 个 token 已经比你的阅读速度还快。
-- **读提示：** 读入你发送内容的速度（文档、代码或聊天记录）。
+## 启用与不启用 DSpark MTP 的运行模式
 
-下表是每个模型安装程序默认的规格，单位是每秒 token 数。每个规格的完整测速、和 llama.cpp 的对比、怎么测的，都在各模型自己的页面里。
+| 模式 | 启动参数 | 额外显存 | 说明 |
+|---|---|---|---|
+| **开启 DSpark MTP（推荐默认）** | `--draft-model inkling2-dspark.gguf` | 约 `400 MiB` | 整体生成最快（代码 **63.2 tok/s**，32K 解码 **47.8 tok/s**）。需使用 `tools/convert_inkling2_dspark.py` 转换 Unsloth 的草稿权重。 |
+| **关闭 MTP（内置 n-gram 查找草稿）** | *（省略 `--draft-model`）* | **`0 MiB`** | 释放约 `400 MiB` 显存给更多专家（多驻留约 80–100 个专家），同时保留零开销 n-gram 草稿加速（重复代码/日志最高 `108 tok/s`）。 |
+| **纯单 token 解码** | *（省略 `--draft-model`）* `--window 1` | **`0 MiB`** | 严格的逐 token 确定性生成（`UD-Q3_K_XL` 达 `59.7 tok/s`，`UD-Q4_K_XL` 达 `47.3 tok/s`）。 |
 
-| 模型 | 8 GB 显卡的笔记本<br>写回答 / 读提示 | RTX 5090<br>写回答 / 读提示 | 全部规格 |
-| --- | ---: | ---: | --- |
-| LFM2.5-24B-A2B | 70-73 / 3,590-3,620 | 480-485 / 23,390-23,460 | [LFM2.5](docs/models/lfm25.zh-CN.md) |
-| Flint 40B-A2.5B | 61-63 / 2,000-2,010 | 251-252 / 12,900 | [Flint](docs/models/flint.zh-CN.md) |
-| Qwen3.6-35B-A3B | 94-100 / 1,690 | 394-395 / 7,800-7,810 | [Qwen3.6](docs/models/qwen36.zh-CN.md) |
-| Clover-35B-A3B-Preview | 68-73 / 1,560-1,700 | 没测 | [Clover](docs/models/clover.zh-CN.md) |
-| Ornith 1.5 | 76-82 / 1,620 | 316-319 / 8,040-8,110 | [Ornith](docs/models/ornith.zh-CN.md) |
-| Gemma 4 26B-A4B | 92-93 / 2,240 | 353-356 / 8,420-8,480 | [Gemma 4](docs/models/gemma4.zh-CN.md) |
-| Tiel Coder 35B-A3B | 83 / 1,700 | 337-345 / 8,080-8,110 | [Tiel Coder](docs/models/tiel.zh-CN.md) |
-| MiniCPM-V 4.7 35B-A3B | 64 / 1,150 | 308-311 / 7,910-7,950 | [MiniCPM-V](docs/models/minicpmv.zh-CN.md) |
-| Kolibri 1 | 没测 | 189-192 / 4,980-5,070 | [Kolibri 1](docs/models/kolibri.zh-CN.md) |
-| GLM 5.3 Flash | 跑不了，要 32 GB 显卡 | 59-66 / 820 | [GLM](docs/models/glm.zh-CN.md) |
-| DeepSeek V4 Flash | 跑不了，要 32 GB 显卡 | 56 / 1,040 | [DeepSeek](docs/models/deepseek.zh-CN.md) |
+## 快速开始与编译
 
-笔记本：RTX 4070 Laptop（8 GB）、Core i7-14700HX、32 GB 内存。工作站：RTX 5090（32 GB）、Xeon Platinum 8470Q（25 vCPU）、90-120 GB 内存。Flint 在笔记本上是 UD-Q3_K_XL（32 GB 内存时安装程序选的规格），在工作站上是 UD-Q4_K_XL。Kolibri 1 在工作站上是 Q2_K；安装程序在工作站上会选 Q4_K_M，这个规格没测。
+### 1. 一键安装脚本（`START-HERE.bat` / `setup.py`）
 
-**Inkling 2 Mini（`UD-Q3_K_XL` 14.4 GiB 与 `UD-Q4_K_XL` 16.4 GiB）** 在 RTX 4070 SUPER（12 GB 显存）、32 GB DDR5 内存的台式机上，以 **128K–1M `max_context`** 测得：启用原生 **DSpark MTP**（`--draft-model inkling2-dspark.gguf --kv k8v4 --cache-bias 0.2`）时，`UD-Q3_K_XL` 短提示写回答 **64.4 token/秒**（代码生成最高 **99.4 token/秒**），32.7K 上下文下写 **50.2 token/秒**（读提示 **821 token/秒**），在 **181.6K token** 实时编程会话中仍保持 **28.1–30.0 token/秒**（`UD-Q4_K_XL` + DSpark 短提示 **60.2 token/秒** / 32.7K 下 **44.1 token/秒**）。**不启用 MTP** 时（`UD-Q4_K_XL`），单轮写回答 **45.0–47.3 token/秒**（多轮代码/日志配合内置 lookup 草稿可达 **108.2 token/秒**），读 5,461 token 提示 **1,307 token/秒**——比 **llama.cpp（PR `#32704`）快 3.4 到 3.7 倍**；在严格纯解码（`--window 1`、`1048576` `max_context`）下，FP16 可在 **~92K token** 内保持 `>= 30 token/秒`，`--kv q8_0` 可达 **~122K token**，`--kv q4_0` 可达 **~137K–141K token**（完整测速、模型下载与启用/不启用 MTP 的配置指南见 [Inkling 2 Mini Benchmark.md](Inkling%202%20Mini%20Benchmark.md)）。
+双击运行 **`START-HERE.bat`** 并选择 **`inkling2`**，或使用命令行自动部署：
 
-Qwen3.8-Flash-Next 用的是 [Strata](https://github.com/Niko1221/Strata) 的引擎，由 Strata 项目在 RTX 5070（12 GB）、64 GB 内存的电脑上测得：IQ2_XS 写 79、读 32K 提示 2,090（[全部规格](docs/models/qwen38.zh-CN.md)）。
-
-用 PolyStrata 自己引擎的这十一个模型，都是用它自带的跑分测的，你也可以在自己的电脑上跑：
-`python polystrata.py benchmark --model <name> --prompt-tokens 24000`
-（[它发什么、打印什么](docs/BACKENDS.md#benchmark)，英文）。
-别人在自己的显卡上测的结果，以及怎么在你的电脑上和 llama.cpp 对比：
-[社区测试结果](docs/COMMUNITY_BENCHMARKS.md#the-models-polystrata-adds)（英文）。
-在笔记本上跑 Qwen3.6 和 Tiel Coder，PolyStrata 读提示比 llama.cpp b11540 快 2.7 到 3.5 倍，写快 1.5 到 1.8 倍
-（[两次测试](docs/COMMUNITY_BENCHMARKS.md#comparing-with-llamacpp)，英文）。
-
-## 占多少内存
-
-从 0.1.45-poly.7 起，这十一个模型的引擎少占你的内存：已经放进显卡的那部分模型文件，它不再留在内存里。在笔记本上，
-Qwen3.6-35B-A3B 读完 32,000 个 token 的提示后，0.1.45-poly.6 占 17.9 GiB，现在占 13.1 GiB，写的速度不变。Linux 上从
-17.8 GiB 降到 12.6 GiB。
-
-想再少占一些，在 `strata-<model>.json` 的 `"args"` 列表里加上 `"--ram-experts-mib", "6144"`
-（[在哪](docs/INSTALL.md#where-things-are-stored)），然后重启。引擎就只给显卡外的专家留这么多 MiB 的内存，回答时也一样，
-启动时会说一声。其余的留在系统的文件缓存里，别的程序可以拿这部分内存去用，哪个 token 用到时再从缓存读。专家放得进空闲内存时，
-这个模式写得慢一些，所以默认关着，我们还在继续优化；放不进时，引擎会自己打开（见下）。笔记本（RTX 4070 Laptop 8 GB，32 GB 内存，Windows 11）上的 Qwen3.6-35B-A3B UD-Q3_K_M：
-
-| | 默认 | `--ram-experts-mib 6144` |
-| --- | ---: | ---: |
-| 加载后引擎占的内存 | 11.7 GiB | **6.5 GiB** |
-| 写的过程中最多：短对话 / 32K 提示后 | 14.3 / 14.0 GiB | **6.7 / 7.3 GiB** |
-| 两次请求之间 | 12.8 GiB | **7.1 GiB** |
-| 写的速度（token/秒）：第一次短对话 | 71.6 | 69.4（慢 3%） |
-| 32K 提示后 | 65.4 | 63.7（慢 3%） |
-| 之后再来一次短对话 | 84.2 | 72.9（慢 13%） |
-| 长回答（短对话写 1,024 个 token） | 90.6 | 78.3（慢 14%） |
-
-这次测的时候别的程序占了一部分显存，所以两列都比显卡空着时慢。另外两次测试里，32K 提示后慢 6% 到 8%，之后那次短对话慢
-8% 到 10%。Linux 上（RTX PRO 6000 限到约 8 GB），它占 7.0 到 7.7 GiB，默认是 12.3 到 14.3 GiB，写得慢 7% 到 14%。把专家缓存
-固定住（发布前就是这样检查的），回答逐个 token 都一样。
-
-显卡外的专家放不进空闲内存时，引擎现在会拿“空闲内存减 4 GiB”当预算，留住最常用的专家，其余的等 token 用到时再从 SSD 读，
-启动时会说一声。以前是全部映射，由系统一页一页缺页读回来。容器的内存上限也算在内。在 Linux 上测的：RTX PRO 6000 限到约 8 GB，
-引擎的内存分别限到 12 GB 和 10 GB（16 GB 的电脑能留给它的量），每次启动前把模型文件清出文件缓存；Qwen3.6-35B-A3B UD-Q3_K_M，
-第一次短对话、24,000 token 提示后、之后再一次短对话的写速度（token/秒）：
-
-| 留给引擎的内存 | 全部映射（以前） | 现在自动取的预算 |
-| --- | ---: | ---: |
-| 12 GB | 51 / 75-78 / 94-98 | **57-60 / 77-85 / 131-139** |
-| 10 GB | 39 / 48 / 69 | **51 / 64 / 92** |
-
-不限内存时，同一台机器是 63 / 169 / 203。Windows 上跑的是同一段代码，但没有测。加上 `"--ram-experts-mib", "-1"` 就和以前一样全部映射。
-
-反过来，加上 `"--lock-experts"` 会把显卡外的专家锁在内存里，系统不能把这部分内存让给别的程序，引擎也就不用回头从 SSD
-重读。Linux 上最多锁 `ulimit -l` 允许的量，引擎启动时会说锁了多少。
-
-读提示用的显存也少了 350 到 400 MiB：要么给专家缓存（Qwen3.6 显存里的专家从 2,444 个变成 2,712 个），要么用
-`--vram-reserve-mib` 留给别的程序。原理和测法见 [docs/BACKENDS.md](docs/BACKENDS.md#less-of-the-pcs-ram-and-vram)。
-
-## 你需要什么
-
-| 模型 | 显卡 | 内存（默认规格） | 硬盘 | 系统 |
-| --- | --- | --- | --- | --- |
-| [Qwen3.8-Flash-Next](docs/models/qwen38.zh-CN.md) | NVIDIA RTX 20-50 系列，或 AMD RX 6800 / 6900, RX 7700 XT / 7800 XT / 7900 XT / XTX, RX 9060 XT / 9070 / 9070 XT, Radeon AI PRO R9700，12 GB 起 | 32 GB 起，64 GB 能跑所有规格 | 约 80 GB | Windows、Linux |
-| [GLM 5.3 Flash](docs/models/glm.zh-CN.md) | NVIDIA RTX 20 系列起，只在 32 GB 显卡上跑过 | 配 32 GB 显卡 96 GB | 79-114 GB，要 SSD | Linux |
-| [DeepSeek V4 Flash](docs/models/deepseek.zh-CN.md) | 同上 | 配 32 GB 显卡 72 GB | 91 GB，要 SSD | Linux |
-| [LFM2.5-24B-A2B](docs/models/lfm25.zh-CN.md) | NVIDIA RTX 20 系列起，8 GB 起 | 配 8 GB 显卡约 20 GB | 11-25 GB | Windows、Linux、Mac（测试版） |
-| [Flint 40B-A2.5B](docs/models/flint.zh-CN.md) | 同上 | 配 8 GB 显卡约 22 GB | 18-42 GB | Windows、Linux |
-| [Qwen3.6-35B-A3B](docs/models/qwen36.zh-CN.md) | 同上；AMD 是测试版 | 配 8 GB 显卡约 21 GB | 13-23 GB | Windows、Linux、Mac（测试版） |
-| [Clover-35B-A3B-Preview](docs/models/clover.zh-CN.md) | NVIDIA RTX 20 系列起，8 GB 起 | 配 8 GB 显卡约 20 GB | 13-21 GB | Windows、Linux |
-| [Ornith 1.5](docs/models/ornith.zh-CN.md) | 同上；AMD 是测试版 | 配 8 GB 显卡约 22 GB | 14-24 GB | Windows、Linux |
-| [Gemma 4 26B-A4B](docs/models/gemma4.zh-CN.md) | 同上；AMD 是测试版 | 配 8 GB 显卡约 18 GB | 11-17 GB | Windows、Linux |
-| [Tiel Coder 35B-A3B](docs/models/tiel.zh-CN.md) | 同上；AMD 是测试版 | 配 8 GB 显卡约 21 GB | 14-23 GB | Windows、Linux |
-| [MiniCPM-V 4.7 35B-A3B](docs/models/minicpmv.zh-CN.md) | 同上；AMD 是测试版 | 配 8 GB 显卡约 25 GB | 16-29 GB | Windows、Linux |
-| [Kolibri 1](docs/models/kolibri.zh-CN.md) | NVIDIA RTX 20 系列起，8 GB 起 | 配 8 GB 显卡约 33 GB | 29-48 GB | Windows、Linux |
-
-内存是安装程序的估算；显卡越大，要的内存越少。其他的都由安装程序搞定：在 Windows 上它直接下载编译好的引擎，CPU 不支持 AVX2 或你这份代码的引擎比最新 release 新时才在本机编译，缺工具会问你要不要装。两到三张显卡可以分担同一个模型（[多 GPU](docs/MULTI_GPU.md)）。较老的显卡、Intel Arc、Apple 芯片的 Mac（Qwen3.8-Flash-Next，测试版还有 Qwen3.6 和 LFM2.5）、Strix Halo、不支持 AVX2 的老处理器：[完整列表](docs/INSTALL.md#what-you-need)。每个模型的显卡、内存和各规格的细节在它自己的页面里。
-
-Qwen3.6、Clover、Ornith 1.5、Gemma 4、Tiel Coder 和 MiniCPM-V 这六个模型各自需要什么、是怎么验证的：[docs/BACKENDS.md](docs/BACKENDS.md#install)（英文）。
-
-## 安装
-
-### 让你的 AI 帮你装
-
-你在用 AI 编程助手吗（Claude Code、Cursor、Codex、GitHub Copilot 等）？把下面这段粘贴给它：
-
-```text
-Set up PolyStrata on this PC for me: https://github.com/simplexai-labs/PolyStrata - follow docs/AI_SETUP.md in that repository.
+```bat
+python setup.py --family inkling2 --model UD-Q3_K_XL --kv k8v4 --context 131072 --yes
 ```
 
-它会检查你的显卡、内存和硬盘，选出合适的模型。然后安装并启动它，再告诉你怎么连接你的应用。AI 工具也可以通过
-PolyStrata 的 [MCP 服务器](docs/MCP_SERVER.md)来安装、启动和停止 PolyStrata。
+支持从 [`unsloth/Inkling-2-Mini-GGUF`](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) 下载并校验 `UD-Q3_K_XL`（`13.6 GB`，推荐 12 GB 显存 + 32 GB 内存）、`UD-IQ3_XXS`（`11.7 GB`）、`UD-Q4_K_XL`（`16.4 GiB`）和 `UD-Q8_K_XL`（`22.9 GB`）。预编译发布包地址指向本仓库：`https://github.com/KurrynDev13/PolyStrata/releases/latest/download/`。
 
-### 或者自己动手
+### 2. 可选：转换 DSpark MTP 草稿权重
 
-[下载 PolyStrata](https://github.com/simplexai-labs/PolyStrata/archive/refs/heads/main.zip) 并解压（或者用 `git clone`）。
-**Windows：** 双击 **`START-HERE.bat`**。**Linux：** 在 PolyStrata 文件夹里运行 **`./setup.sh`**。
+```bat
+.venv\Scripts\python.exe tools\convert_inkling2_dspark.py --out models\inkling2\inkling2-dspark.gguf
+```
 
-**Mac（Apple 芯片，M1 到 M5，macOS 15 或更新版本）：** 先安装一次 Apple 的 Command Line Tools（在终端里运行 `xcode-select --install`；不需要 Xcode 本身）。然后在 PolyStrata 文件夹里打开终端，运行 **`./setup.sh`**。它会在你的 Mac 上编译 Mac 版引擎（大约 7 分钟），问同样的问题，下载模型并启动。下次运行 `./setup.sh` 会马上启动。哪个大小适合你的 Mac、速度如何：[docs/MAC.md](docs/MAC.md)。默认装的是 Qwen3.8-Flash-Next。`./setup.sh --family qwen36` 或 `--family lfm25` 改装 Qwen3.6 或 LFM2.5，跑在 strata-poly 的 Metal 引擎上，算测试版：在 M5 Ultra 上，Qwen3.6 UD-Q2_K_XL 短对话每秒写 134 个 token，读 3,768 个 token 的提示每秒 2,978 个。安装程序在 Mac 上也提供 GLM、DeepSeek、Ornith、Gemma 4、Tiel Coder 和 MiniCPM-V，但还没在 Mac 上用真实权重跑过。Kolibri、Flint 和 Clover 需要 NVIDIA 或 AMD 显卡。
+### 3. 从源码编译（Windows, CUDA 13, Ninja）
 
-安装程序会识别你的显卡，并装好对应的引擎。它会问你几个问题：
+```bat
+call "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat"
+cmake -B build-inkling2 -G Ninja -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=ON -DCMAKE_CUDA_ARCHITECTURES=89
+cmake --build build-inkling2 --target strata-poly poly_inkling2_test -j 8
+```
 
-- 用哪个模型、哪个规格，
-- 上下文多大（模型能记住多少文字），
-- 是否要识别图片（GLM 5.3 Flash、DeepSeek V4 Flash、LFM2.5、Flint、Clover 和 Kolibri 1 不支持）。
+运行 50 项单元测试：
 
-每次直接按回车就是推荐选项。之后它会下载模型（Qwen3.8-Flash-Next 约 70 GB，GLM 5.3 Flash 79 到 114 GB，DeepSeek V4 Flash 91 GB，Kolibri 1 29 到 48 GB，另外八个 11 到 42 GB）并启动。
-如果下载中断了，再运行一次即可：它会从中断的地方继续。浏览器会打开 PolyStrata 应用，地址是 `http://127.0.0.1:8080`。
+```bat
+set PATH=D:\PolyStrata\.venv\Lib\site-packages\nvidia\cu13\bin\x86_64;%PATH%
+build-inkling2\poly_inkling2_test.exe
+```
 
-十二个模型都在安装程序的模型列表里。想直接装其中一个，运行 `./setup.sh --family glm`（或 `deepseek`、`lfm25`、`flint`、`qwen36`、`clover`、`ornith`、`gemma4`、`tiel`、`minicpmv`、`kolibri`）
-（[它会问什么、写什么](docs/GLM.md#install)）。
+## 参考 PC 配置预设
 
-> **模型启动时，你的电脑可能会变慢或卡住 1-3 分钟**（第一次最久）。
-> PolyStrata 会把 35-55 GB 加载到内存，并为显卡锁定其中一部分。这是正常的。请耐心等待，不要关闭窗口。
-> 窗口里会显示 PolyStrata 正在做什么。
-
-**下次使用时**，再运行一次 `START-HERE.bat`（或 `./setup.sh`）。它会马上启动，已下载的东西不会重复下载。关闭它的窗口就能停止模型。
-`UPDATE.bat`（`./update.sh`）只更新 PolyStrata，不启动。更新、Docker、多张显卡、文件存放位置以及所有选项：
-[docs/INSTALL.md](docs/INSTALL.md)。
-
-**想知道在你电脑上快不快？** 运行 `BENCH.bat`（`./bench.sh`）：大约 5 到 10 分钟，用你自己的设置测聊天、4K/16K 提示和一段代理式会话，并写出一份可以分享的报告（[怎么做](docs/COMMUNITY_BENCHMARKS.md#run-the-benchmark)）。
-
-## 该选哪个模型
-
-同一个模型有几种规格，压缩程度不同：规格越小越快、要的内存越少，越大越接近原模型。安装程序会按你的内存和显卡选一个，直接按回车就行；想要别的规格，安装时加 `--model <规格>`。
-
-| 模型 | 安装程序默认 | 内存不够时 | 要指名的规格 |
-| --- | --- | --- | --- |
-| [Qwen3.8-Flash-Next](docs/models/qwen38.zh-CN.md) | 32 GB 内存：Coder；48-64 GB：IQ2_XS；96 GB 起：IQ3_S |  | Q2_0、IQ3_XXS、Unsloth 的 4 到 8 bit |
-| [GLM 5.3 Flash](docs/models/glm.zh-CN.md) | 3.0BIT | UD-IQ2_XXS，再不够 REAP50-Q3_K_M |  |
-| [DeepSeek V4 Flash](docs/models/deepseek.zh-CN.md) | UD-IQ2_XXS（只有这一个） |  |  |
-| [LFM2.5-24B-A2B](docs/models/lfm25.zh-CN.md) | UD-Q4_K_XL | UD-Q3_K_XL | QAD-Q4_0, UD-Q6_K_XL, Q8_0 |
-| [Flint 40B-A2.5B](docs/models/flint.zh-CN.md) | 内存约 40 GB 起 UD-Q4_K_XL | UD-Q3_K_XL | UD-Q6_K_XL, Q8_0 |
-| [Qwen3.6-35B-A3B](docs/models/qwen36.zh-CN.md) | UD-Q3_K_M | UD-Q2_K_XL | UD-Q4_K_M |
-| [Clover-35B-A3B-Preview](docs/models/clover.zh-CN.md) | Q3_K_M | APEX-I-NANOPLUS | Q4_K_M |
-| [Ornith 1.5](docs/models/ornith.zh-CN.md) | APEX-I-COMPACT | APEX-I-MINI | APEX-I-QUALITY |
-| [Gemma 4 26B-A4B](docs/models/gemma4.zh-CN.md) | UD-Q3_K_M | UD-Q2_K_XL | UD-Q4_K_M, QAT-UD-Q4_K_XL |
-| [Tiel Coder 35B-A3B](docs/models/tiel.zh-CN.md) | UD-Q3_K_XL | UD-IQ3_XXS | UD-Q4_K_XL |
-| [MiniCPM-V 4.7 35B-A3B](docs/models/minicpmv.zh-CN.md) | Q4_K_M | mix_q3gud_im | Q6_K |
-| [Kolibri 1](docs/models/kolibri.zh-CN.md) | 内存约 48 GB 起 Q4_K_M | Q2_K | Q3_K_M |
-
-每个规格是什么、下载多大、配不同显卡要多少内存、和最大规格比答案差多少：各模型的页面，从“速度有多快？”的表里点模型名。
-
-## 使用方法
-
-十二个模型的用法一样：同一个应用，同一套 API。
-
-<p align="center"><img src="docs/media/runpagoda.png" width="900" alt="应用的 Monitor 标签页，旁边是一个编程智能体"><br>
-<sub>应用的 <b>Monitor</b>（左），编程智能体正在写视频里的宝塔花园（右）。截图来自 <a href="https://github.com/Niko1221/Strata">Strata</a>。</sub></p>
-
-- **在浏览器里：** 打开 `http://127.0.0.1:8080`。里面有 **Chat**（聊天）、实时 **Monitor**（监控模型和你的
-  GPU/CPU/内存），以及 **About**（设置和地址）。
-- **作为你的个人智能体：** 下载 [Linger](https://github.com/simplexai-labs/linger)：[Mac（Apple 芯片）](https://github.com/simplexai-labs/linger/releases/download/desktop-v0.1.2/Linger-0.1.2-macos-arm64.dmg) ·
-  [Windows](https://github.com/simplexai-labs/linger/releases/download/desktop-v0.1.2/Linger-0.1.2-windows-x64-setup.exe) · [Linux](https://github.com/simplexai-labs/linger/releases/download/desktop-v0.1.2/Linger-0.1.2-linux-x64.tar.gz)。
-- **你的应用和编程智能体：** 添加一个“OpenAI 兼容”的提供商，base URL 填 **`http://127.0.0.1:8080/v1`**。
-  API key 和模型名随便填都行。
-  - 使用 Anthropic API 的应用：`http://127.0.0.1:8080/v1/messages`（Claude Code：
-    `ANTHROPIC_BASE_URL=http://127.0.0.1:8080`，并在 `strata-<model>.json` 里加 `"fit_max_tokens": true`
-    （[原因](docs/FAQ.md#can-i-use-it-with-claude-code-codex-or-other-apps)））。
-  - Codex CLI 和其他使用 OpenAI Responses API 的应用：`/v1/responses`
-    （[设置方法](docs/DETAILS.md#the-responses-api-and-codex-cli)）。
-- **思考：** 在聊天菜单或应用的“reasoning effort”里选择 **off、low、medium 或 high**。off 最快，
-  high 最适合难题。
-- **从手机或另一台电脑访问：** `START-HERE.bat --setup --host 0.0.0.0 --api-key <secret>`。一定要设置 key。
-
-它们不一样的地方：
-
-| | Qwen3.8-Flash-Next | GLM 5.3 Flash | DeepSeek V4 Flash | LFM2.5-24B-A2B | Flint 40B-A2.5B | Kolibri 1 | Qwen3.6-35B-A3B、Clover-35B-A3B-Preview、Ornith 1.5、Gemma 4 26B-A4B、Tiel Coder 35B-A3B、MiniCPM-V 4.7 35B-A3B |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| **图片** | 在安装时对“Images?”选是。然后在聊天里点 **Picture**，或在你的应用里附上图片。AMD 显卡在 Linux 上通过处理器识别图片；在 Windows 上暂时还不行。 | 暂时不支持。 | 只能处理文字。 | 只能处理文字。 | 只能处理文字。 | 只能处理文字。 | 在安装时对“Images?”选是，之后和 Qwen3.8-Flash-Next 一样。显存不到 16 GB 的卡上，图片编码器在处理器上跑，一张图片要几秒。Clover 只能处理文字。 |
-| **多个请求** | 默认一次只回答一个，其他请求排队等待。设置 `"parallel": 2` 可以同时回答多个（[BATCHING.md](docs/BATCHING.md)）；在 12 GB 显卡上，这会让每个回答变慢。 | 一次只回答一个，其他请求排队等待。 | 一次只回答一个，其他请求排队等待。 | 一次只回答一个，其他请求排队等待。 | 一次只回答一个，其他请求排队等待。 | 一次只回答一个，其他请求排队等待。 | 一次只回答一个，其他请求排队等待。 |
-| **多个对话** | 保留最近的一个对话，所以后续消息几秒内就开始回答。加两个引擎参数可以在内存里保留多个（[详情](docs/DETAILS.md#using-it)）。 | 保留最近的一个对话。安装程序会问要不要在内存里保留多个，这样智能体和子代理轮流请求时不用重读提示（[原理](docs/GLM.md#several-conversations-at-once)）。 | 和 GLM 5.3 Flash 一样。 | 和 GLM 5.3 Flash 一样。 | 和 GLM 5.3 Flash 一样。 | 和 GLM 5.3 Flash 一样。 | 和 GLM 5.3 Flash 一样。 |
-| **长提示** | 对话的第一条消息要完整读入，大约每 30,000 个 token 需要 1 分钟。 | 第一条消息要完整读入，大约每 30,000 个 token 需要 40 秒。 | 第一条消息要完整读入，大约每 30,000 个 token 需要 29 秒。 | 第一条消息要完整读入：30,000 个 token 在工作站上要 1.3 到 1.5 秒，在 8 GB 笔记本上要 8 到 10 秒。 | 第一条消息要完整读入：30,000 个 token 在工作站上约 2.3 秒，在 8 GB 笔记本上要 15 到 22 秒。 | 第一条消息要完整读入：30,000 个 token 在工作站上用 Q2_K 约 6 秒。 | 第一条消息要完整读入：30,000 个 token，工作站要 4 到 5 秒，8 GB 显卡的笔记本要 14 到 27 秒。 |
-
-更多：[聊天记录存在哪里](docs/INSTALL.md#where-things-are-stored)、[API](docs/DETAILS.md#using-it)。
-
-### 可选：整个模型都能放进内存时，单卡再提速
-
-两个可选设置（来自 RubenTorney 的 #1904 和 #1905）。适用于只用一张显卡、并且内存能放下所有专家的情况（PolyStrata 的 arena 模式，例如 64 GB 电脑上的 Q2_0 或 IQ3_XXS）。打开 PolyStrata 数据文件夹里的配置文件 `strata-<model>.json`（[在哪里](docs/INSTALL.md#where-things-are-stored)），加入：
-
-- **生成更快：** 在 `"args"` 列表里加 `"--adapt-async", "1"`。专家缓存改在辅助线程里更新，不再暂停回答。在 RTX 5070（Windows，Q2_0）上实测：生成 +4-5%，代码和长文档 +7-10%。回答可能与默认设置略有不同（但每次运行都一样）。
-- **Windows 上读取提示更快：** 在 `"env"` 块里加 `"STRATA_PIN_BY_NEED": "1"`。Windows 只能为显卡锁定大约一半的内存；这个设置会先锁定显卡真正需要的专家。在 RTX 5070 上实测：读取提示 +4.4%。
+### `UD-Q3_K_XL` + DSpark MTP（默认最快方案）
 
 ```json
-"args": [ ..., "--adapt-async", "1" ],
-"env": { "STRATA_PIN_BY_NEED": "1" }
+{
+  "exe": "D:\\PolyStrata\\engine-poly-inkling2\\strata-poly.exe",
+  "args": [
+    "--model", "path\\to\\Inkling-2-Mini-UD-Q3_K_XL.gguf",
+    "--draft-model", "path\\to\\inkling2-dspark.gguf",
+    "--max-context", "262144",
+    "--kv", "k8v4",
+    "--cache-bias", "0.2",
+    "--vram-reserve-mib", "1280",
+    "--prompt-batch", "512",
+    "--ram-experts-mib", "-1",
+    "--expert-profile", "path\\to\\expert-profile.txt",
+    "--conversation-cache-mib", "auto"
+  ],
+  "reasoning_close_retry": true,
+  "repeat_stop_tokens": 64
+}
 ```
 
-修改后重启 PolyStrata（`START-HERE.bat` 或 `./setup.sh`）。要撤销，删掉这两项即可。
+如切换至 **`UD-Q4_K_XL`**（HumanEval+ 最高 `92.7 %`），将 `--model` 替换为 `Inkling-2-Mini-UD-Q4_K_XL.gguf` 即可；如需关闭 MTP，删除 `"--draft-model"` 及对应路径参数。
 
-## 出问题了？
+## 致谢
 
-- **PolyStrata 第一次启动时电脑卡死了。** 加载模型时这是正常的。请耐心等待，不要关闭窗口。
-  10 分钟后还卡着？重启电脑，关掉其他程序再试一次，或者换一个更小的规格。
-- **下载或安装时中断了。** 再运行一次 `START-HERE.bat`（或 `./setup.sh`）。它会从中断的地方继续。
-- **非常慢，硬盘灯一直闪，或者提示“the engine stopped unexpectedly”。** 你的电脑可用内存不够。
-  关掉其他程序（浏览器很占内存），或者换一个更小的规格（Q2_0 或 IQ2_XS）。
-- **提示 8080 端口已被占用。** PolyStrata 已经在运行了。找一下它的窗口。
-
-更多问题和解决办法：[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)。还是解决不了？提交一个
-[issue](https://github.com/simplexai-labs/PolyStrata/issues)，并附上 PolyStrata 文件夹里的 `strata-<model>.log`。发现了安全问题？
-请私下报告：[SECURITY.md](SECURITY.md)。
-
-## 它是怎么工作的？
-
-这类模型通常运行在拥有数百 GB 显存的服务器上。而你的显卡只有 8-32 GB。PolyStrata 让模型装得下的办法是
-**把工作分摊到整台电脑上**。可以想象一个厨房：常用的东西放在台面上，其余的放在储藏室里。
-
-每个模型的原理图和说明：[docs/HOW_IT_WORKS_MODELS.zh-CN.md](docs/HOW_IT_WORKS_MODELS.zh-CN.md)。
-
-## 基于 PolyStrata 构建
-
-<p align="center"><a href="https://github.com/simplexai-labs/linger"><img src="https://raw.githubusercontent.com/simplexai-labs/linger/main/assets/linger-story.webp" width="820" alt="28 秒看懂 Linger：它装好本地模型、连上你的应用，把邮件和会议变成记忆，发邮件前先问你。"></a><br>
-<sub>28 秒看懂 Linger：它装好本地模型、连上你的应用，把邮件和会议变成记忆，发邮件前先问你。</sub></p>
-
-**[Linger](https://github.com/simplexai-labs/linger)** 是一个开源的个人智能体，完全在你的电脑上运行，本地模型跑在 PolyStrata 上。它能在你的各个应用里找到你要的东西，记住重要的事，在你不在的时候把事情做完。[文档](https://docs.heylinger.com/) · [GitHub](https://github.com/simplexai-labs/linger)
-
-你也基于 PolyStrata 做了东西？开一个 [issue](https://github.com/simplexai-labs/PolyStrata/issues)，我们会把它加到这里。
-
-## 致谢与许可证
-
-Qwen3.8-Flash-Next 来自 [Qwen 团队](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)，由
-[ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)、UkisAI（Swift 1.5）
-和 Unsloth 压缩。GLM 5.3 Flash 用的是
-[neuralll](https://huggingface.co/neuralll/GLM-5.3-Flash-GSQ-RCO-3.0bit-Q4Kattn-GGUF)、Unsloth 和 patrickbdevaney 的文件。
-Qwen3.6-35B-A3B 来自 Qwen 团队，Gemma 4 来自 Google，DeepSeek V4 Flash 来自 DeepSeek，用的都是 [Unsloth](https://huggingface.co/unsloth) 的量化版本。LFM2.5-24B-A2B 来自 [Liquid AI](https://huggingface.co/LiquidAI/LFM2.5-24B-A2B)，用的是 Unsloth 的量化版本和 Liquid AI 自己的 QAD-Q4_0。Flint 40B-A2.5B 来自 [Recursive](https://huggingface.co/RecursiveSI/flint)，用的是 Unsloth 的量化版本。Kolibri 1 来自 [Aleph Alpha](https://huggingface.co/Aleph-Alpha/Kolibri-1)，用的是 [Hob-forge](https://huggingface.co/Hob-forge/Kolibri-1-GGUF) 转换的 GGUF。Clover-35B-A3B-Preview 来自 [DiffuSpace](https://huggingface.co/Diffuspace/Clover-35B-A3B-Preview)，用的是 [maternion](https://huggingface.co/maternion/Clover-35B-A3B-Preview-GGUF) 的量化版本和 IsValorum 的 APEX。Ornith 1.5 来自
-ornith-ai，用的是 [mudler](https://huggingface.co/mudler/Ornith-1.5-35B-A3B-APEX-MTP-GGUF) 的 APEX 量化版本。Tiel Coder 35B-A3B 是 [peculiar-ragdoll](https://huggingface.co/peculiar-ragdoll/Tiel-Coder-35B-A3B-GGUF-MTP) 量化的 Ornith 1.5，[u/Sensitive_Song4219](https://www.reddit.com/r/LocalLLM/comments/1x22inc/comment/pf3r111/) 发现它能在 PolyStrata 上跑。MiniCPM-V 4.7 35B-A3B 来自 [OpenBMB](https://huggingface.co/openbmb/MiniCPM-V-4.7-35B-A3B-gguf)，用的是他们自己的量化版本，由 [iMilnb](https://github.com/iMilnb) 接入 PolyStrata。PolyStrata 基于
-Niko1221 和各位贡献者的 [Strata](https://github.com/Niko1221/Strata)，并使用了
-[llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) 的部分代码。完整致谢：
-[docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md#credits)。PolyStrata 以 [MIT 许可证](LICENSE)开源。少数部分和每个模型
-有各自的许可证（[具体是哪些](docs/HOW_IT_WORKS.md#license)）。
+- [PolyStrata](https://github.com/VecSzn/PolyStrata)（作者 [VecSzn](https://github.com/VecSzn)）与 [Strata](https://github.com/Niko1221/Strata)（作者 [Niko1221](https://github.com/Niko1221)）。
+- Thinking Machines Lab（**Inkling-2-Mini**）、[Unsloth](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF)（GGUF 量化与 DSpark 草稿权重）、[llama.cpp](https://github.com/ggml-org/llama.cpp)（`PR #32704` 参考实现）。
+- README 版式与基准卡片设计参考 [midokino/kuu-Strata-fork](https://github.com/midokino/kuu-Strata-fork)。
