@@ -491,11 +491,24 @@ void inkling_attend_batch(void* blas, const float* q, const uint16_t* kcache, co
                           Kvq4 kq4 = {}, Kvq4 vq4 = {});
 
 /// Copy stream `src_stream` into stream `dst_stream` inside `r` ([rows, streams, n_embd]), or from flat `x`.
+/// In `inkling_add_to_stream`, `a == nullptr` adds `b` in-place to `dst_stream` of `r`.
 void inkling_copy_stream(float* r, int streams, int dst_stream, int src_stream, int n_embd, int rows, void* stream);
 void inkling_write_stream(const float* x, float* r, int streams, int dst_stream, int n_embd, int rows, void* stream);
 void inkling_read_stream(const float* r, int streams, int src_stream, float* out, int n_embd, int rows, void* stream);
 void inkling_add_to_stream(const float* a, const float* b, float* r, int streams, int dst_stream, int n_embd, int rows,
                            void* stream);
+
+/// Split row-interleaved fused attention projections into contiguous per-component buffers (for rows > 1).
+void inkling_split_q_fused(const float* src, float* qraw, float* gate, float* r_raw, float* sinks, int q_dim,
+                           int rel_dim, int n_head, int flags, int rows, void* stream);
+void inkling_split_kv(const float* src, float* k, float* v, int kv_dim, int rows, void* stream);
+
+/// Pre-dequantize a contiguous or ring-wrapped span `[lo, lo + count)` of quantized KV rows into FP16 `kwork`/`vwork`.
+void inkling_dequant_kv_span(int64_t lo, int count, int width, int ring, Kvq8 kq8, Kvq8 vq8, Kvq4 kq4, Kvq4 vq4,
+                             uint16_t* kwork, uint16_t* vwork, void* stream);
+
+/// Fused SwiGLU + Q8_1 quantization directly from row-interleaved `[rows, 2 * ff_dim]` gate_up output.
+void inkling_swiglu_gate_up_q8_1(const float* gate_up, void* out_q8_1, int ff_dim, int rows, void* stream);
 
 /// DSpark MTP kernels (see src/poly/inkling2.cpp).
 void inkling_dspark_extract_taps(const float* r, int n_streams, int first_tap_stream, float* taps012, int n_embd,

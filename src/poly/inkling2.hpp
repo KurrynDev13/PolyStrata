@@ -146,7 +146,7 @@ private:
 
     // Device scratch
     float *inputs_buf_ = nullptr, *msg_ = nullptr, *ctrl_cat_ = nullptr, *ctrl_r_ = nullptr, *ctrl_g_ = nullptr,
-          *ctrl_f_ = nullptr, *inp_sa_ = nullptr;
+          *ctrl_f_ = nullptr;
     float *q_fused_buf_ = nullptr, *kv_fused_buf_ = nullptr;
     float *qraw_ = nullptr, *q_ = nullptr, *kraw_ = nullptr, *k_ = nullptr, *v_ = nullptr;
     float *r_raw_ = nullptr, *r_cur_ = nullptr, *dyn_ = nullptr, *sinks_ = nullptr, *gate_ = nullptr;
@@ -170,7 +170,7 @@ private:
     mutable Likeliest h_dspark_anchor_pick_{};
     float *d_taps_ = nullptr, *d_f_rnn_ = nullptr, *d_blk_x_ = nullptr, *d_blk_xn_ = nullptr, *d_blk_h_ = nullptr;
     float *d_blk_qkv_ = nullptr, *d_blk_qraw_ = nullptr, *d_blk_kraw_ = nullptr, *d_blk_attn_ = nullptr;
-    float *d_blk_gate_ = nullptr, *d_blk_up_ = nullptr;
+    float *d_blk_gate_ = nullptr, *dspark_mask_tiled_ = nullptr;
     float *d_base_logits_ = nullptr, *d_markov_bias_ = nullptr;
     float *d_rnn_in_ = nullptr, *d_rnn_gates_ = nullptr, *d_rnn_h_gates_ = nullptr, *d_rnn_f_gates_ = nullptr;
     float *d_rnn_state_ = nullptr, *d_rnn_latent_ = nullptr;

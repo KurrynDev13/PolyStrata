@@ -625,13 +625,16 @@ void Inkling2::assign_scratch() {
     const size_t kv = n_d * n_kv_ * head_dim_;
     inputs_buf_ = fbuf(3 * n * n_embd_);
     msg_ = fbuf(4 * n * n_embd_);
-    ctrl_cat_ = fbuf(n * 2 * n_embd_);
+    const size_t qf_cols = 2 * (size_t) n_head_ * head_dim_ + (size_t) n_rel_ * n_head_ + (size_t) n_head_;
+    const size_t qf_stride = (qf_cols + 63) & ~size_t(63);
+    const size_t ctrl_n = std::max(4 * n * n_embd_, n * (qf_stride + 2 * (size_t) n_kv_ * head_dim_));
+    float* ctrl_arena = fbuf(ctrl_n);
+    ctrl_cat_ = ctrl_arena;
+    ctrl_g_ = ctrl_arena + n * 2 * n_embd_;
     ctrl_r_ = fbuf(n * gate_rank_);
-    ctrl_g_ = fbuf(2 * n * n_embd_);
     ctrl_f_ = fbuf(n * n_embd_);
-    inp_sa_ = fbuf(n * n_embd_);
-    q_fused_buf_ = fbuf(2 * (size_t) n_head_ * head_dim_ + (size_t) n_rel_ * n_head_ + (size_t) n_head_);
-    kv_fused_buf_ = fbuf(2 * (size_t) n_kv_ * head_dim_);
+    q_fused_buf_ = ctrl_arena;
+    kv_fused_buf_ = ctrl_arena + n * qf_stride;
 
     qraw_ = fbuf(heads);
     q_ = fbuf(heads);
@@ -679,8 +682,8 @@ void Inkling2::assign_scratch() {
         d_blk_qraw_ = fbuf(blk * q_dim);
         d_blk_kraw_ = fbuf(blk * kv_dim);
         d_blk_attn_ = fbuf(blk * n_embd_);
-        d_blk_gate_ = fbuf(blk * dspark_ff_);
-        d_blk_up_ = fbuf(blk * dspark_ff_);
+        d_blk_gate_ = fbuf(blk * 2 * dspark_ff_);
+        dspark_mask_tiled_ = fbuf((blk - 1) * n_embd_);
         d_base_logits_ = fbuf((blk - 1) * (size_t) dv);
         d_markov_bias_ = fbuf((size_t) dv);
         d_rnn_in_ = fbuf((size_t) (2 * dspark_rank_));
@@ -1031,12 +1034,6 @@ void Inkling2::attn(const Step& st, Block& B, SlotCache& sc, int64_t pos, int n)
         }
         if (B.swa) {
             inkling_mix(r_, ns_all, ms, ns, fp(B.attn_res_query), 1, in0, n_embd_, n, 1e-6f, st_);
-            if (pass > 0) {
-                ck(cudaMemcpyAsync(in1, in0, (size_t) n * n_embd_ * sizeof(float), cudaMemcpyDeviceToDevice, cs(st_)),
-                   "copy input");
-                ck(cudaMemcpyAsync(in2, in0, (size_t) n * n_embd_ * sizeof(float), cudaMemcpyDeviceToDevice, cs(st_)),
-                   "copy input");
-            }
         } else {
             inkling_mix(r_, ns_all, ms, ns, fp(B.attn_res_query), 3, in0, n_embd_, n, 1e-6f, st_);
         }
@@ -1045,9 +1042,9 @@ void Inkling2::attn(const Step& st, Block& B, SlotCache& sc, int64_t pos, int n)
     // 2. Cross-pass loop controls (pass > 0)
     const bool share_swa = B.swa && pass == 0;
     if (pass > 0) {
+        apply_ctrl(B.swa ? in0 : in1, msg_ + 1 * (size_t) n * n_embd_, B, 1, in1, n);
+        apply_ctrl(B.swa ? in0 : in2, msg_ + 2 * (size_t) n * n_embd_, B, 2, in2, n);
         apply_ctrl(in0, msg_ + 0 * (size_t) n * n_embd_, B, 0, in0, n);
-        apply_ctrl(in1, msg_ + 1 * (size_t) n * n_embd_, B, 1, in1, n);
-        apply_ctrl(in2, msg_ + 2 * (size_t) n * n_embd_, B, 2, in2, n);
     }
 
     // 3. Input norm + linear projections -> Q, K, V, R, sinks, gate
@@ -1057,14 +1054,21 @@ void Inkling2::attn(const Step& st, Block& B, SlotCache& sc, int64_t pos, int n)
 
     kernels::native_add_rms_norm_q8_1(in0, nullptr, fp(nq), xn_, xq_, n_embd_, n, rms_eps_, threads, st_);
     const float *qraw_p = qraw_, *gate_p = gate_, *r_raw_p = r_raw_, *sinks_p = sinks_;
-    if (n == 1 && B.wq_fused.p) {
-        lin(B.wq_fused, xn_, q_fused_buf_, 1, xq_);
-        qraw_p = q_fused_buf_;
-        gate_p = q_fused_buf_ + (size_t) n_head_ * head_dim_;
-        if (B.wq_fuse_flags & 2) r_raw_p = q_fused_buf_ + B.wq_rel_off;
-        else lin(B.attn_rel, xn_, r_raw_, 1, xq_);
-        if (B.wq_fuse_flags & 4) sinks_p = q_fused_buf_ + B.wq_sink_off;
-        else lin(B.attn_sink_proj, xn_, sinks_, 1, xq_);
+    if (B.wq_fused.p) {
+        lin(B.wq_fused, xn_, q_fused_buf_, n, xq_);
+        if (n == 1) {
+            qraw_p = q_fused_buf_;
+            gate_p = q_fused_buf_ + (size_t) n_head_ * head_dim_;
+            if (B.wq_fuse_flags & 2) r_raw_p = q_fused_buf_ + B.wq_rel_off;
+            else lin(B.attn_rel, xn_, r_raw_, 1, xq_);
+            if (B.wq_fuse_flags & 4) sinks_p = q_fused_buf_ + B.wq_sink_off;
+            else lin(B.attn_sink_proj, xn_, sinks_, 1, xq_);
+        } else {
+            inkling_split_q_fused(q_fused_buf_, qraw_, gate_, r_raw_, sinks_, n_head_ * head_dim_,
+                                  n_rel_ * n_head_, n_head_, B.wq_fuse_flags, n, st_);
+            if (!(B.wq_fuse_flags & 2)) lin(B.attn_rel, xn_, r_raw_, n, xq_);
+            if (!(B.wq_fuse_flags & 4)) lin(B.attn_sink_proj, xn_, sinks_, n, xq_);
+        }
     } else {
         lin(B.wq, xn_, qraw_, n, xq_);
         lin(B.attn_rel, xn_, r_raw_, n, xq_);
@@ -1072,14 +1076,22 @@ void Inkling2::attn(const Step& st, Block& B, SlotCache& sc, int64_t pos, int n)
         lin(B.wqkv_gate, xn_, gate_, n, xq_);
     }
 
-    if (share_swa && n == 1 && B.wkv_fused.p) {
-        lin(B.wkv_fused, xn_, kv_fused_buf_, 1, xq_);
-        inkling_conv4(kv_fused_buf_, state_ + sc.state_off + off_k_conv_, fp(B.attn_k_conv), nullptr, head_dim_,
-                      k_, n_kv_ * head_dim_, 1, st_, snap_bits_ ? snap_at_ + sc.state_off + off_k_conv_ : nullptr,
+    if (share_swa && B.wkv_fused.p) {
+        const int kv_w = n_kv_ * head_dim_;
+        lin(B.wkv_fused, xn_, kv_fused_buf_, n, xq_);
+        const float* k_src = kv_fused_buf_;
+        const float* v_src = kv_fused_buf_ + kv_w;
+        if (n > 1) {
+            inkling_split_kv(kv_fused_buf_, kraw_, att_, kv_w, n, st_);
+            k_src = kraw_;
+            v_src = att_;
+        }
+        inkling_conv4(k_src, state_ + sc.state_off + off_k_conv_, fp(B.attn_k_conv), nullptr, head_dim_,
+                      k_, kv_w, n, st_, snap_bits_ ? snap_at_ + sc.state_off + off_k_conv_ : nullptr,
                       rec_n_, snap_bits_);
-        inkling_conv4(kv_fused_buf_ + (size_t) n_kv_ * head_dim_, state_ + sc.state_off + off_v_conv_,
-                      fp(B.attn_v_conv), nullptr, head_dim_, v_, n_kv_ * head_dim_, 1, st_,
-                      snap_bits_ ? snap_at_ + sc.state_off + off_v_conv_ : nullptr, rec_n_, snap_bits_);
+        inkling_conv4(v_src, state_ + sc.state_off + off_v_conv_, fp(B.attn_v_conv), nullptr, head_dim_,
+                      v_, kv_w, n, st_, snap_bits_ ? snap_at_ + sc.state_off + off_v_conv_ : nullptr,
+                      rec_n_, snap_bits_);
     } else {
         if (!share_swa) {
             kernels::native_add_rms_norm_q8_1(in1, nullptr, fp(nk), xn_, xq_, n_embd_, n, rms_eps_, threads, st_);
@@ -1126,6 +1138,16 @@ void Inkling2::attn(const Step& st, Block& B, SlotCache& sc, int64_t pos, int n)
     const Kvq8 vq = v_q8 ? Kvq8{sc.v_codes, sc.v_scales} : Kvq8{};
     const Kvq4 kq4 = k_q4 ? Kvq4{sc.k_q4, sc.k_scales} : Kvq4{};
     const Kvq4 vq4 = v_q4 ? Kvq4{sc.v_q4, sc.v_scales} : Kvq4{};
+    const int kv_width = n_kv_ * head_dim_;
+    const int work_rows = kv_width > 0 ? (int) (work_halves_ / (size_t) kv_width) : 0;
+    const int64_t lo_all = (window > 0 && pos >= window) ? (pos - window + 1) : 0;
+    const int64_t keys_all_64 = (pos + n) - lo_all;
+    const bool pre_dq = n >= kStageRows && quant && keys_all_64 > 0 && keys_all_64 <= work_rows;
+    uint16_t* kw = quant ? (uint16_t*) q8w_ : nullptr;
+    uint16_t* vw = quant ? kw + work_halves_ : nullptr;
+    if (pre_dq) {
+        inkling_dequant_kv_span(lo_all, (int) keys_all_64, kv_width, ring, kq, vq, kq4, vq4, kw, vw, st_);
+    }
     const int c_step = n >= kStageRows ? chunk_batch_ : chunk_dec_;
     for (int first = 0; first < n; first += c_step) {
         const int c = std::min(c_step, n - first);
@@ -1135,12 +1157,16 @@ void Inkling2::attn(const Step& st, Block& B, SlotCache& sc, int64_t pos, int n)
         float* att_sub = att_ + (size_t) first * n_head_ * head_dim_;
         inkling_rel_table(r_sub, fp(B.attn_rel_bias), s_sub, table_, n_rel_, n_extent, n_head_, c, st_);
         if (n >= kStageRows) {
-            uint16_t* kw = quant ? (uint16_t*) q8w_ : nullptr;
-            uint16_t* vw = quant ? kw + work_halves_ : nullptr;
-            inkling_attend_batch(blas_, q_sub, quant ? nullptr : sc.keys, quant ? nullptr : sc.vals, table_, s_sub,
-                                 n_extent, pos + first, c, score_, score_n_, awork_, att_sub, head_dim_, n_head_,
-                                 n_kv_, scale, st_, window, ring, kq, vq, kw, vw, quant ? work_halves_ : 0, kq4,
-                                 vq4);
+            if (pre_dq) {
+                inkling_attend_batch(blas_, q_sub, kw, vw, table_, s_sub, n_extent, (pos - lo_all) + first, c,
+                                     score_, score_n_, awork_, att_sub, head_dim_, n_head_, n_kv_, scale, st_,
+                                     window, 0, Kvq8{}, Kvq8{}, nullptr, nullptr, 0, Kvq4{}, Kvq4{});
+            } else {
+                inkling_attend_batch(blas_, q_sub, quant ? nullptr : sc.keys, quant ? nullptr : sc.vals, table_,
+                                     s_sub, n_extent, pos + first, c, score_, score_n_, awork_, att_sub, head_dim_,
+                                     n_head_, n_kv_, scale, st_, window, ring, kq, vq, kw, vw,
+                                     quant ? work_halves_ : 0, kq4, vq4);
+            }
         } else {
             const long long* at_sub = at ? at + 2 * first : nullptr;
             const int rm = !at ? 0 : B.swa ? std::min(window_ + n - 1, opt_.max_context) : room(n);
@@ -1183,8 +1209,7 @@ void Inkling2::layer_head(Layer& L, int slot, int n) {
     if (ip % block_size_ == 0) {
         inkling_write_stream(ao_, r_, ns_all, 0, n_embd_, n, st_);
     } else {
-        inkling_read_stream(r_, ns_all, 0, inp_sa_, n_embd_, n, st_);
-        inkling_add_to_stream(inp_sa_, ao_, r_, ns_all, 0, n_embd_, n, st_);
+        inkling_add_to_stream(nullptr, ao_, r_, ns_all, 0, n_embd_, n, st_);
     }
 
     // FFN Block AttnRes mix + optional loop control + ffn_norm -> xn_, xq_
@@ -1213,8 +1238,7 @@ void Inkling2::layer_tail(Layer&, int slot, int n) {
     const int ns_all = streams();
     inkling_conv4(fo_, state_ + sc.state_off + off_ffn_post_, fp(B.ffn_post_conv), nullptr, 0, cur_, n_embd_, n, st_,
                   snap_bits_ ? snap_at_ + sc.state_off + off_ffn_post_ : nullptr, rec_n_, snap_bits_);
-    inkling_read_stream(r_, ns_all, 0, inp_sa_, n_embd_, n, st_);
-    inkling_add_to_stream(inp_sa_, cur_, r_, ns_all, 0, n_embd_, n, st_);
+    inkling_add_to_stream(nullptr, cur_, r_, ns_all, 0, n_embd_, n, st_);
 
     if (ip == core_start_ - 1) {
         inkling_copy_stream(r_, ns_all, 2, 0, n_embd_, n, st_);
@@ -1481,6 +1505,10 @@ void Inkling2::init_drafter() {
         }
         inkling_dspark_pack_q8_0_block(tmp_out, (uint8_t*) dspark_fold_w_.p, n_vocab_, b, n_blocks, st_);
     }
+    for (int r = 0; r < dspark_block_ - 1; ++r)
+        ck(cudaMemcpyAsync(dspark_mask_tiled_ + (size_t) r * n_embd_, dspark_mask_.p, (size_t) n_embd_ * sizeof(float),
+                           cudaMemcpyDeviceToDevice, cs(st_)),
+           "dspark mask tile");
     ck(cudaStreamSynchronize(cs(st_)), "init_drafter");
     cudaFree(tmp_in);
     cudaFree(tmp_out);
@@ -1538,18 +1566,17 @@ void Inkling2::draft_commit(int64_t pos, int n) {
             kernels::native_quantize_q8_1(cur_, xq_, n_embd_ * n, 1, st_);
             xq_ctx = xq_;
         }
+        lin(dl.kv_proj_ctx, cur_, qraw_, n, xq_ctx);
         if (n == 1) {
-            lin(dl.kv_proj_ctx, cur_, qraw_, 1, xq_ctx);
             head_norm_rope(qraw_, dspark_head_dim_, fp(dl.k_norm_ctx), k_, dspark_head_dim_, dspark_kv_,
                            dspark_head_dim_, dspark_theta_scale_, pos, 1, dspark_eps_, st_);
             store_d_kv(k_, dl, false);
             store_d_kv(qraw_ + kv_width, dl, true);
         } else {
-            lin(dl.k_proj_ctx, cur_, q_, n, xq_ctx);
+            inkling_split_kv(qraw_, q_, v_, kv_width, n, st_);
             head_norm_rope(q_, dspark_head_dim_, fp(dl.k_norm_ctx), k_, dspark_head_dim_, dspark_kv_, dspark_head_dim_,
                            dspark_theta_scale_, pos, n, dspark_eps_, st_);
             store_d_kv(k_, dl, false);
-            lin(dl.v_proj_ctx, cur_, v_, n, xq_ctx);
             store_d_kv(v_, dl, true);
         }
     }
@@ -1567,10 +1594,9 @@ void Inkling2::draft_block(int32_t token) {
     ck(cudaMemcpyAsync(d_blk_x_, h_dspark_anchor_.data(), (size_t) n_embd_ * sizeof(float), cudaMemcpyHostToDevice,
                        cs(st_)),
        "dspark anchor");
-    for (int r = 1; r < dspark_block_; ++r)
-        ck(cudaMemcpyAsync(d_blk_x_ + (size_t) r * n_embd_, dspark_mask_.p, (size_t) n_embd_ * sizeof(float),
-                           cudaMemcpyDeviceToDevice, cs(st_)),
-           "dspark mask");
+    ck(cudaMemcpyAsync(d_blk_x_ + n_embd_, dspark_mask_tiled_,
+                       (size_t) (dspark_block_ - 1) * n_embd_ * sizeof(float), cudaMemcpyDeviceToDevice, cs(st_)),
+       "dspark mask");
 
     const int B = dspark_block_;
     const int q_dim = dspark_heads_ * dspark_head_dim_;
@@ -1632,9 +1658,8 @@ void Inkling2::draft_block(int32_t token) {
 
         kernels::native_add_rms_norm_q8_1(d_blk_x_, d_blk_attn_, fp(dl.ff_norm), d_blk_xn_, d_blk_xq_, n_embd_, B,
                                           dspark_eps_, threads, st_);
-        lin(dl.gate_proj, d_blk_xn_, d_blk_gate_, B, d_blk_xq_);
-        lin(dl.up_proj, d_blk_xn_, d_blk_up_, B, d_blk_xq_);
-        kernels::native_swiglu_quantize_q8_1(d_blk_gate_, d_blk_up_, d_blk_q8ff_, dspark_ff_, B, st_);
+        lin(dl.gate_up_proj, d_blk_xn_, d_blk_gate_, B, d_blk_xq_);
+        inkling_swiglu_gate_up_q8_1(d_blk_gate_, d_blk_q8ff_, dspark_ff_, B, st_);
         lin(dl.down_proj, d_blk_gate_, d_blk_attn_, B, d_blk_q8ff_);
     }
 
