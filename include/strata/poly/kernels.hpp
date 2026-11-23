@@ -490,6 +490,32 @@ void inkling_attend_batch(void* blas, const float* q, const uint16_t* kcache, co
                           uint16_t* kwork = nullptr, uint16_t* vwork = nullptr, size_t work_halves = 0,
                           Kvq4 kq4 = {}, Kvq4 vq4 = {});
 
+/// Pick count tracking for experts routed on card.
+void count_picks(const int32_t* ids, int rr, int n_expert, int32_t* uses, void* stream);
+
+/// A doorbell in pinned memory between the card and the host for a token's routed experts outside VRAM, after Strata
+/// v0.2.19's Inkling hybrid mode: the card rings it with the experts it lacks and goes on with its own, the host
+/// computes those and answers, and the card waits for the answer only where it adds their sum.
+constexpr int kBellJobs = 32;
+struct ExpertBell {
+    volatile uint32_t ring;    ///< the card's rings so far; a new value is a new job
+    uint32_t pad0[15];
+    volatile uint32_t ack;     ///< the ring the host has answered
+    uint32_t pad1[15];
+    volatile uint32_t abort;   ///< the host gave up: every wait ends at once
+    uint32_t pad2[15];
+    int32_t layer, n;          ///< the job: layer and how many experts
+    int32_t e[kBellJobs];      ///< their ids
+    float w[kBellJobs];        ///< their router weights
+};
+/// One token's picks ids[0..n_used) with weights w at layer `layer`: the ones whose slots[] entry is null, at a place
+/// under skip_from, go into the bell, x (n floats) into hx, and the bell rings (seq[0] counts the rings; seq[1] is
+/// this one, or 0 when there is none). One block. CUDA only.
+void bell_ring(const void* const* slots, const int32_t* ids, const float* w, int n_used, int skip_from, int layer,
+               const float* x, float* hx, int n, ExpertBell* bell, uint32_t* seq, void* stream);
+/// Where seq[1] is a ring: wait until the bell's ack is that ring (or abort is set), then acc += hy (n floats).
+void bell_add(const ExpertBell* bell, const uint32_t* seq, const float* hy, float* acc, int n, void* stream);
+
 /// Copy stream `src_stream` into stream `dst_stream` inside `r` ([rows, streams, n_embd]), or from flat `x`.
 /// In `inkling_add_to_stream`, `a == nullptr` adds `b` in-place to `dst_stream` of `r`.
 void inkling_copy_stream(float* r, int streams, int dst_stream, int src_stream, int n_embd, int rows, void* stream);

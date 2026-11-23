@@ -677,7 +677,7 @@ Engine::~Engine() {
     for (unsigned long long h : vpool_) cuMemRelease(h);   // the pool goes back to the card with the engine
     vpool_.clear();
     for (void* p : host_allocs_) cudaFreeHost(p);
-    for (void* e : {ev_stage_[0], ev_stage_[1], ev_ahead_, ev_free_, ev_in_[0], ev_in_[1], ev_out_[0], ev_out_[1], ev_hr_})
+    for (void* e : {ev_stage_[0], ev_stage_[1], ev_ahead_, ev_free_, ev_in_[0], ev_in_[1], ev_out_[0], ev_out_[1], ev_hr_, ev_bell_})
         if (e) cudaEventDestroy((cudaEvent_t) e);
     for (void* e : swap_pin_ev_)
         if (e) cudaEventDestroy((cudaEvent_t) e);
@@ -2480,6 +2480,16 @@ void Engine::follow(int written) {
     // first token claim them.
     if (freeze_experts_) return;
     const size_t ne = (size_t) n_expert_;
+#if !defined(STRATA_GPU_METAL)
+    if (h_bell_ && d_use_ && bell_counts_ > 0) {
+        bell_counts_ = 0;
+        const size_t count = layers_.size() * ne;
+        h_use_.resize(count);
+        ck(cudaMemcpy(h_use_.data(), d_use_, count * sizeof(int32_t), cudaMemcpyDeviceToHost), "expert uses");
+        ck(cudaMemset(d_use_, 0, count * sizeof(int32_t)), "expert uses");
+        for (size_t i = 0; i < count; ++i) use_[i] += h_use_[i];
+    }
+#endif
     int n_free = 0;
     for (int j = 0; j < n_swap_; ++j) {
         Swap& s = swap_[(size_t) j];
@@ -3188,6 +3198,34 @@ void Engine::alloc() {
         d_wts_ = (float*) dmalloc(rr * sizeof(float), "scratch");
         h_ids_ = (int32_t*) hmalloc(rr * sizeof(int32_t), "pinned memory");
         d_slots_ = (void**) dmalloc((size_t) n_layer_ * n_expert_ * sizeof(void*), "scratch");
+        d_use_ = (int32_t*) dmalloc(layers_.size() * (size_t) n_expert_ * sizeof(int32_t), "scratch");
+        ck(cudaMemset(d_use_, 0, layers_.size() * (size_t) n_expert_ * sizeof(int32_t)), "expert uses");
+#if !defined(STRATA_USE_HIP)
+        // the doorbell (bell_on()): every layer's experts by picks on the card, or none of them; STRATA_POLY_BELL=0: none
+        const char* bell_env = std::getenv("STRATA_POLY_BELL");
+        bool bell = bells() && !split_ && !(bell_env && bell_env[0] == '0');
+        size_t most_slot = 0;
+        for (int il = 0; il < n_layer_ && bell; ++il) {
+            const Layer& L = layers_[(size_t) il];
+            if (!L.moe) continue;
+            bell = kernels::native_mmvq_ids_supported((int) L.gu_type) &&
+                   kernels::native_mmvq_ids_supported((int) L.u_type) && kernels::native_mmvq_ids_supported((int) L.d_type);
+            most_slot = std::max(most_slot, L.gu2() + L.d_bytes);
+        }
+        if (bell && most_slot > 0) {
+            h_bell_ = (ExpertBell*) hmalloc(sizeof(ExpertBell), "pinned memory");
+            std::memset((void*) h_bell_, 0, sizeof(ExpertBell));
+            d_bell_seq_ = (uint32_t*) dmalloc(2 * sizeof(uint32_t), "scratch");
+            ck(cudaMemset(d_bell_seq_, 0, 2 * sizeof(uint32_t)), "the doorbell");
+            d_zslots_ = (void**) dmalloc((size_t) n_layer_ * n_expert_ * sizeof(void*), "scratch");
+            most_slot = (most_slot + 4096 + kTail) / 256 * 256;
+            zero_slot_ = (uint8_t*) dmalloc(most_slot, "scratch");
+            ck(cudaMemset(zero_slot_, 0, most_slot), "the doorbell");
+            cudaEvent_t ev = nullptr;
+            ck(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming), "cudaEventCreate");
+            ev_bell_ = ev;
+        }
+#endif
         tab_ = (int32_t*) dmalloc(tab, "scratch");
         h_tab_ = (int32_t*) hmalloc(tab, "pinned memory");
         iota_ = (int32_t*) dmalloc(rr * sizeof(int32_t), "scratch");
@@ -3466,6 +3504,15 @@ void Engine::trim() {
     hfree(h_res_);
     h_res_ = nullptr;
     h_res_rows_ = 0;
+#if !defined(STRATA_GPU_METAL)
+    if (h_bell_ && n_swap_ == 0 && d_use_) {   // the doorbell's picks into the profile
+        const size_t count = layers_.size() * (size_t) n_expert_;
+        h_use_.resize(count);
+        ck(cudaMemcpy(h_use_.data(), d_use_, count * sizeof(int32_t), cudaMemcpyDeviceToHost), "expert uses");
+        ck(cudaMemset(d_use_, 0, count * sizeof(int32_t)), "expert uses");
+        for (size_t i = 0; i < count; ++i) use_[i] += h_use_[i];
+    }
+#endif
     if (pool_ && !answered) pool_fill();
     if (pool_) {
         std::fill(prompt_use_.begin(), prompt_use_.end(), 0.f);
@@ -4295,7 +4342,8 @@ void Engine::moe_add(int n) { axpy(h_cpu_, 1.f, fo_, n * n_embd_, true, st_); }
 // With every routed expert in VRAM, a few tokens' experts are routed on the card and found there by its picks
 // (moe_card()), so a layer never waits for the host.  The cache's slots go to the card again when they changed.
 bool Engine::card_moe(int n) {
-    if (!all_cached() || !d_slots_ || n * n_used_ > card_rows() || opt_.dump) return false;
+    const bool bell = bell_on(n);
+    if (!(all_cached() || bell) || !d_slots_ || n * n_used_ > card_rows() || opt_.dump) return false;
     bool same = !h_slots_.empty();
     for (int il = lo_; il < hi_ && same; ++il) {
         const Layer& L = layers_[(size_t) il];
@@ -4310,6 +4358,12 @@ bool Engine::card_moe(int n) {
                           h_slots_.begin() + (ptrdiff_t) il * n_expert_);
         ck(cudaMemcpy(d_slots_, h_slots_.data(), h_slots_.size() * sizeof(void*), cudaMemcpyHostToDevice),
            "expert slots");
+        if (bell && d_zslots_) {
+            std::vector<void*> z = h_slots_;
+            for (void*& p : z)
+                if (!p) p = zero_slot_;
+            ck(cudaMemcpy(d_zslots_, z.data(), z.size() * sizeof(void*), cudaMemcpyHostToDevice), "expert slots");
+        }
 #if defined(STRATA_GPU_METAL)
         ck(gpu::metal::register_indirect(d_slots_, h_slots_.data(), h_slots_.size()), "expert dependencies");
 #endif
@@ -4330,6 +4384,15 @@ bool Engine::moe_card(Layer& L, int il, int n) {
     L.card = 1;
     const int rr = n * n_used_;
     const void* const* table = d_slots_ + (size_t) il * n_expert_;
+    [[maybe_unused]] const bool rings = bell_ && n == 1;
+#if !defined(STRATA_GPU_METAL)
+    if (rings) {   // the doorbell: the misses to the host, a token's place under --tail-skip's
+        if (!block_pass_) count_picks(d_ids_, rr, n_expert_, d_use_ + (size_t) il * n_expert_, st_);
+        bell_ring(table, d_ids_, d_wts_, n_used_, opt_.tail_skip > 0 ? opt_.tail_skip : n_used_, il, xn_, h_x_, n_embd_,
+                  h_bell_, d_bell_seq_, st_);
+        table = d_zslots_ + (size_t) il * n_expert_;
+    }
+#endif
     const size_t xq_row = kernels::native_q8_1_bytes(n_embd_), ff = (size_t) n_ff_exp_;
     // a mixed layer's gate and up are each a matrix of n_ff rows of its own type, up's into the second half
     const kernels::MmvqIds gate_up{table, d_ids_, 0, xq_, xq_row, n_used_, g_, 2 * ff};
@@ -4348,7 +4411,68 @@ bool Engine::moe_card(Layer& L, int il, int n) {
                                 (size_t) n_embd_};
     kernels::native_mmvq_ids((int) L.d_type, down, rr, n_ff_exp_, n_embd_, st_);
     moe_sum(d_, d_wts_, fo_, n_embd_, n_used_, n, st_);
+#if !defined(STRATA_GPU_METAL)
+    if (rings) bell_add(h_bell_, d_bell_seq_, h_cpu_, fo_, n_embd_, st_);
+#endif
     return true;
+}
+
+bool Engine::bell_on(int n) const {
+#if defined(STRATA_GPU_METAL) || defined(STRATA_USE_HIP)
+    (void) n;
+    return false;
+#else
+    return n == 1 && h_bell_ && !all_cached() && !pool_ && !split_ && !block_pass_ && !opt_.dump;
+#endif
+}
+
+void Engine::bell_serve() {
+#if !defined(STRATA_GPU_METAL) && !defined(STRATA_USE_HIP)
+    ck(cudaEventRecord((cudaEvent_t) ev_bell_, cs(st_)), "the doorbell");
+    for (;;) {
+        const uint32_t r = h_bell_->ring;
+        if (r != bell_seen_) {
+            std::atomic_thread_fence(std::memory_order_acquire);
+            bell_seen_ = r;
+            try {
+                bell_job();
+            } catch (...) {
+                h_bell_->abort = 1;
+                cudaStreamSynchronize(cs(st_));
+                h_bell_->abort = 0;
+                bell_seen_ = h_bell_->ring;
+                throw;
+            }
+            std::atomic_thread_fence(std::memory_order_release);
+            h_bell_->ack = r;
+            continue;
+        }
+        const cudaError_t q = cudaEventQuery((cudaEvent_t) ev_bell_);
+        if (q == cudaSuccess) return;
+        if (q != cudaErrorNotReady) ck(q, "the doorbell");
+        _mm_pause();
+    }
+#endif
+}
+
+void Engine::bell_job() {
+    const int il = h_bell_->layer, n = std::min<int>(h_bell_->n, kBellJobs);
+    const Layer& L = layers_[(size_t) il];
+    CpuExpert host[kBellJobs];
+    for (int j = 0; j < n; ++j) {
+        const size_t e = (size_t) h_bell_->e[j];
+        const float w = L.h_s_down.empty() ? h_bell_->w[j] : h_bell_->w[j] * L.h_s_down[e];
+        const float gs = L.h_s_gate.empty() ? 1.f : L.h_s_gate[e], us = L.h_s_up.empty() ? 1.f : L.h_s_up[e];
+        host[j] = {L.exp_gate + e * L.gu_stride, L.exp_up + e * L.u_stride, L.exp_down + e * L.d_bytes, w, 0, gs, us};
+    }
+    if (pool_) pool_take(L, il, host, n);
+    const Clock::time_point t0 = Clock::now();
+    cpu_experts(*workers_, host, n, 1, (int) L.gu_type, (int) L.u_type, (int) L.d_type, n_embd_, n_ff_exp_, h_x_,
+                clamp_exp_[(size_t) il], gelu_, h_cpu_, nullptr, nullptr, nullptr, situ_beta_, situ_linear_beta_);
+    pool_reads_.clear();
+    stats_.cpu_ms += ms_since(t0);
+    stats_.cpu_experts += n;
+    stats_.gpu_experts -= n;
 }
 
 // m experts from the mapped file into the staging buffer: gate and up of each back to back from the start, the
@@ -5014,7 +5138,14 @@ void Engine::run(const int32_t* tokens, int n) {
         return;
     }
     // The routed experts on the card alone, when every one of them is in VRAM: recorded too, once a layer has
-    // shown it routes there (Layer::card).
+    // shown it routes there (Layer::card).  With the doorbell (bells()) a token's misses go to this thread's
+    // workers from inside the launches, which bell_serve() answers once they are all handed to the card.
+    bell_ = bell_on(n);
+    struct BellOff {
+        bool& on;
+        ~BellOff() { on = false; }
+    } bell_off{bell_};
+    if (bell_) bell_counts_++;
     const bool card = n < kStageRows && card_moe(n);
     const auto on_card = [&](int il, int m, size_t rec) {
         Layer& L = layers_[(size_t) il];
@@ -5034,7 +5165,7 @@ void Engine::run(const int32_t* tokens, int n) {
     // A block of guesses is recorded whole or not at all: a layer's own recordings are a window's, of other kernels.
     if (block_pass_ && !whole) replay = false;
     if (whole) {
-        std::vector<int> key{block_pass_ ? -n : n};
+        std::vector<int> key{block_pass_ ? -n : n, bell_ ? 1 : 0};
         for (int s = step0; s < step1; ++s) key.push_back(head_key(step_ps(s).slot, n));
         void*& pass = passes_[key];
         if (!pass)
@@ -5052,6 +5183,7 @@ void Engine::run(const int32_t* tokens, int n) {
         ck(cudaGraphLaunch((cudaGraphExec_t) pass, cs(st_)), "layer graph");
         for (int s = step0; s < step1; ++s)
             stats_.gpu_experts += layers_[(size_t) step_ps(s).phys].moe ? n * n_used_ : 0;
+        if (bell_) bell_serve();
         return;
     }
     for (int s = step0; s < step1; ++s) {
@@ -5059,8 +5191,13 @@ void Engine::run(const int32_t* tokens, int n) {
         Layer& L = layers_[(size_t) phys];
         up(phys, slot, n, (size_t) n - 1);
         if (!L.moe) continue;
-        if (batched(L, n)) moe_rows(L, phys, n);
-        else if (!on_card(phys, n, (size_t) n - 1) && moe(L, phys, n)) moe_add(n);
+        if (batched(L, n)) {
+            moe_rows(L, phys, n);
+        } else if (!on_card(phys, n, (size_t) n - 1)) {
+            if (moe(L, phys, n)) moe_add(n);
+        } else if (bell_) {
+            bell_serve();
+        }
         tail(phys, slot, n, (size_t) n - 1);
     }
 }

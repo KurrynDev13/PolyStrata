@@ -56,6 +56,7 @@ protected:
     bool route_card(int il, int n, int32_t* ids, float* w) override;
     void moe_shared(const Layer& L, int il, int n) override;
     int head_key(int slot, int n) const override;
+    bool bells() const override { return true; }
     const Names* tensor_alias(const char* name) const override;
     const Names* meta_alias(const char* key) const override;
 

@@ -519,6 +519,9 @@ protected:
     /// The rotary position of a row of text: its place in the sequence, unless pictures before it took fewer
     /// positions than rows.
     virtual int64_t turn(int64_t row) const { return row; }
+    /// A token's experts outside VRAM may go to the host's threads through the doorbell (h_bell_): the architecture
+    /// routes on the card (route_card()) and sums a token's experts in moe_card().
+    virtual bool bells() const { return false; }
     /// The buffers that hold a row a token, and pos(), moved `by` rows on (back, when negative): a call for one
     /// token then works in the place of another row of a window (run()).  An architecture adds its own buffers
     /// that a layer's head leaves for the layer's tail.
@@ -889,6 +892,20 @@ protected:
     int32_t* h_ids_ = nullptr;                    ///< pinned: the experts, back from the card
     void** d_slots_ = nullptr;                    ///< every layer's L.slot on the card, n_expert_ a layer (moe_card())
     std::vector<void*> h_slots_;                  ///< what d_slots_ holds
+    // The doorbell (bells()): a token routed on the card with experts outside VRAM.
+    ExpertBell* h_bell_ = nullptr;                ///< pinned, the card's and the host's
+    uint32_t* d_bell_seq_ = nullptr;              ///< the card's rings so far, and the ring of the layer under way
+    uint32_t bell_seen_ = 0;                      ///< the last ring the host answered
+    void** d_zslots_ = nullptr;                   ///< d_slots_ with zero_slot_ for every expert outside VRAM
+    uint8_t* zero_slot_ = nullptr;                ///< an expert of zeros: a miss's products are 0 on the card
+    void* ev_bell_ = nullptr;
+    int32_t* d_use_ = nullptr;                    ///< per (layer, expert): picks of calls routed on the card
+    std::vector<int32_t> h_use_;
+    bool bell_ = false;                           ///< this call rings (run())
+    int bell_counts_ = 0;                         ///< doorbell calls since last follow() read
+    bool bell_on(int n) const;
+    void bell_serve();
+    void bell_job();
     uint8_t* stage_ = nullptr;                    ///< experts that are not cached, on their way through VRAM
     uint8_t* h_stage_[2] = {};                    ///< pinned; filled in turn
     void* ev_stage_[2] = {};                      ///< marks the upload out of each

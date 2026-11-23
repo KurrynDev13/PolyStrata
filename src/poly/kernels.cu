@@ -4152,4 +4152,75 @@ void coreset_mask(float* logits, int n_expert, int n_used, int rows, float share
                                                                                          rows, share);
 }
 
+__global__ void count_picks_kernel(const int32_t* __restrict__ ids, int rr, int n_expert, int32_t* uses) {
+    const int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k < rr && ids[k] >= 0 && ids[k] < n_expert) atomicAdd(&uses[ids[k]], 1);
+}
+
+void count_picks(const int32_t* ids, int rr, int n_expert, int32_t* uses, void* stream) {
+    if (rr > 0) count_picks_kernel<<<(rr + 255) / 256, 256, 0, cs(stream)>>>(ids, rr, n_expert, uses);
+}
+
+__global__ void bell_ring_kernel(const void* const* __restrict__ slots, const int32_t* __restrict__ ids,
+                                 const float* __restrict__ w, int n_used, int skip_from, int layer,
+                                 const float* __restrict__ x, float* hx, int n, ExpertBell* bell, uint32_t* seq) {
+    __shared__ int jobs;
+    if (threadIdx.x == 0) {
+        int j = 0;
+        for (int k = 0; k < n_used && j < kBellJobs; ++k)
+            if (!slots[ids[k]] && k < skip_from) {
+                bell->e[j] = ids[k];
+                bell->w[j] = w[k];
+                ++j;
+            }
+        jobs = j;
+    }
+    __syncthreads();
+    if (jobs == 0) {
+        if (threadIdx.x == 0) seq[1] = 0;
+        return;
+    }
+    for (int i = threadIdx.x; i < n; i += blockDim.x) hx[i] = x[i];
+    __threadfence_system();   // the input and the jobs are the host's before the ring
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        bell->layer = layer;
+        bell->n = jobs;
+        __threadfence_system();
+        const uint32_t s = ++seq[0];
+        bell->ring = s;
+        __threadfence_system();
+        seq[1] = s;
+    }
+}
+
+// One block: one thread asks the bell every half microsecond or so, the others sleep at the barrier
+__global__ void bell_add_kernel(const ExpertBell* bell, const uint32_t* __restrict__ seq, const float* hy,
+                                float* __restrict__ acc, int n) {
+    const uint32_t s = seq[1];
+    if (s == 0) return;
+    if (threadIdx.x == 0)
+        while (bell->ack != s && !bell->abort) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+            __nanosleep(500);
+#endif
+        }
+    __syncthreads();
+    __threadfence_system();
+    for (int i = threadIdx.x; i < n; i += blockDim.x) acc[i] += *(volatile const float*) (hy + i);
+}
+
+void bell_ring(const void* const* slots, const int32_t* ids, const float* w, int n_used, int skip_from, int layer,
+               const float* x, float* hx, int n, ExpertBell* bell, uint32_t* seq, void* stream) {
+    bell_ring_kernel<<<1, 256, 0, cs(stream)>>>(slots, ids, w, n_used, skip_from, layer, x, hx, n, bell, seq);
+    if (const cudaError_t e = cudaGetLastError(); e != cudaSuccess)
+        throw std::runtime_error(std::string("bell_ring: ") + cudaGetErrorString(e));
+}
+
+void bell_add(const ExpertBell* bell, const uint32_t* seq, const float* hy, float* acc, int n, void* stream) {
+    bell_add_kernel<<<1, 512, 0, cs(stream)>>>(bell, seq, hy, acc, n);
+    if (const cudaError_t e = cudaGetLastError(); e != cudaSuccess)
+        throw std::runtime_error(std::string("bell_add: ") + cudaGetErrorString(e));
+}
+
 }  // namespace strata::poly
