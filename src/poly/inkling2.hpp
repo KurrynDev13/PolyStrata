@@ -32,6 +32,7 @@ protected:
     void norm_text_embed(float* dst) const override;
     size_t recurrent_floats() const override;
     bool snaps_spread() const override { return true; }
+    bool can_read_groups() const override { return true; }
     void save_layer(int slot, int64_t pos, uint8_t* dst) override;
     size_t extra_bytes() const override;
     void load_extra(const uint8_t* src, int64_t pos) override;
@@ -73,7 +74,7 @@ private:
         Dev wq_fused, wkv_fused;
         int wq_fuse_flags = 0;   ///< bit 0: wq+wqkv_gate, bit 1: +attn_rel, bit 2: +attn_sink_proj
         int wq_rel_off = 0, wq_sink_off = 0;
-        Dev attn_q_clip, attn_sink_proj, attn_rel, attn_rel_bias, attn_rel_clip;
+        Dev attn_q_clip, attn_sink_proj, attn_rel, attn_rel_bias, attn_rel_bias_trans, attn_rel_clip;
         Dev attn_k_conv, attn_v_conv, attn_post_conv, ffn_post_conv;
         Dev q_inp_norm, k_inp_norm, v_inp_norm, k_conv_proj, v_conv_proj;
         Dev attn_res_query, ffn_res_query;
@@ -118,7 +119,8 @@ private:
     uint8_t* slot_v_codes(const SlotCache& sc) const;
     uint8_t* dspark_k_codes(const DsparkLayer& dl) const;
     uint8_t* dspark_v_codes(const DsparkLayer& dl) const;
-    void apply_ctrl(const float* cur, const float* msg, const Block& B, int ctrl, float* out, int n);
+    void apply_ctrl(const float* cur, const float* msg, const Block& B, int ctrl, float* out, int n,
+                    const float* ctrl_r_in = nullptr);
     void store(const float* x, const SlotCache& sc, int64_t pos, int n, bool value);
     void attn(const Step& st, Block& B, SlotCache& sc, int64_t pos, int n);
     template <class F>
@@ -156,6 +158,7 @@ private:
     float* awork_ = nullptr;
     float* q8w_ = nullptr;
     size_t work_halves_ = 0;
+    bool fast_rel_bias_ = false;
 
     bool dspark_ = false;
     int dspark_layers_ = 0, dspark_ff_ = 0, dspark_heads_ = 0, dspark_kv_ = 0, dspark_head_dim_ = 0;

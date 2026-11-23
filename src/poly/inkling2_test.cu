@@ -215,6 +215,63 @@ int test_mix_and_control() {
     return bad;
 }
 
+int test_ctrl_down() {
+    int bad = 0;
+    const int n_embd = 512, rank = 64, rows = 2, count = 2;
+    auto c0 = random_vec((size_t) rows * n_embd, 1.f);
+    auto m0 = random_vec((size_t) rows * n_embd, 1.f);
+    auto w0 = random_vec((size_t) rank * 2 * n_embd, 0.2f);
+    auto c1 = random_vec((size_t) rows * n_embd, 1.f);
+    auto m1 = random_vec((size_t) rows * n_embd, 1.f);
+    auto w1 = random_vec((size_t) rank * 2 * n_embd, 0.2f);
+
+    float *d_c0 = dev(c0), *d_m0 = dev(m0), *d_w0 = dev(w0), *d_y0 = dev(std::vector<float>(rows * rank, 0.f));
+    float *d_c1 = dev(c1), *d_m1 = dev(m1), *d_w1 = dev(w1), *d_y1 = dev(std::vector<float>(rows * rank, 0.f));
+
+    const float* cur[2] = {d_c0, d_c1};
+    const float* msg[2] = {d_m0, d_m1};
+    const float* down[2] = {d_w0, d_w1};
+    float* ch[2] = {d_y0, d_y1};
+
+    bool ok = ink_ctrl_down(cur, msg, down, ch, count, n_embd, rank, rows, nullptr);
+    if (!ok) {
+        printf("ink_ctrl_down returned false!\n");
+        return 1;
+    }
+
+    auto got0 = host(d_y0, (size_t) rows * rank);
+    auto got1 = host(d_y1, (size_t) rows * rank);
+
+    auto ref_down = [&](const std::vector<float>& c, const std::vector<float>& m, const std::vector<float>& w) {
+        std::vector<float> want((size_t) rows * rank);
+        for (int t = 0; t < rows; ++t) {
+            double sq_c = 0.0, sq_m = 0.0;
+            for (int i = 0; i < n_embd; ++i) {
+                sq_c += (double) c[(size_t) t * n_embd + i] * c[(size_t) t * n_embd + i];
+                sq_m += (double) m[(size_t) t * n_embd + i] * m[(size_t) t * n_embd + i];
+            }
+            float ic = (float) (1.0 / std::sqrt(sq_c / n_embd + 1e-6));
+            float im = (float) (1.0 / std::sqrt(sq_m / n_embd + 1e-6));
+            for (int o = 0; o < rank; ++o) {
+                double acc = 0.0;
+                for (int i = 0; i < n_embd; ++i) {
+                    acc += (double) w[(size_t) o * 2 * n_embd + i] * (c[(size_t) t * n_embd + i] * ic);
+                    acc += (double) w[(size_t) o * 2 * n_embd + n_embd + i] * (m[(size_t) t * n_embd + i] * im);
+                }
+                want[(size_t) t * rank + o] = (float) acc;
+            }
+        }
+        return want;
+    };
+
+    bad += report("ink_ctrl_down (controller 0)", got0, ref_down(c0, m0, w0), 1e-5);
+    bad += report("ink_ctrl_down (controller 1)", got1, ref_down(c1, m1, w1), 1e-5);
+
+    cudaFree(d_c0); cudaFree(d_m0); cudaFree(d_w0); cudaFree(d_y0);
+    cudaFree(d_c1); cudaFree(d_m1); cudaFree(d_w1); cudaFree(d_y1);
+    return bad;
+}
+
 int test_conv4() {
     int bad = 0;
     const int head_dim = 64, n_heads = 4, channels = head_dim * n_heads, rows = 20;
@@ -223,10 +280,11 @@ int test_conv4() {
     auto x = random_vec((size_t) rows * channels, 1.f);
     auto dyn = random_vec((size_t) rows * n_heads * 4, 0.2f);
 
-    auto ref_conv = [&](bool use_dyn) {
-        std::vector<float> st = st0, out((size_t) rows * channels);
+    auto ref_conv = [&](bool use_dyn, int num_rows = 0) {
+        const int nr = num_rows > 0 ? num_rows : rows;
+        std::vector<float> st = st0, out((size_t) nr * channels);
         const double scale = 1.0 / std::sqrt(use_dyn ? 9.0 : 5.0);
-        for (int t = 0; t < rows; ++t) {
+        for (int t = 0; t < nr; ++t) {
             for (int c = 0; c < channels; ++c) {
                 const float* wc = w.data() + 4 * c;
                 double s0 = st[3 * c + 0], s1 = st[3 * c + 1], s2 = st[3 * c + 2], v = x[(size_t) t * channels + c];
@@ -265,6 +323,46 @@ int test_conv4() {
     inkling_conv4(d_x, d_st2, d_w, nullptr, 0, d_out, channels, 2, nullptr);
     bad += report("inkling_conv4 snap rollback tok 1", host(d_snap, st0.size()), host(d_st2, st0.size()), 1e-6);
 
+    // 3. Fused dual-job ink_conv_few (e.g. K and V)
+    const int few_rows = 4;
+    float* d_st_few0 = dev(st0);
+    float* d_st_few1 = dev(st0);
+    float* d_out_few0 = dev(std::vector<float>((size_t) few_rows * channels, 0.f));
+    float* d_out_few1 = dev(std::vector<float>((size_t) few_rows * channels, 0.f));
+
+    InkConv j0, j1;
+    j0.x = d_x; j0.state = d_st_few0; j0.w = d_w; j0.dyn = nullptr; j0.out = d_out_few0;
+    j1.x = d_x; j1.state = d_st_few1; j1.w = d_w; j1.dyn = d_dyn; j1.out = d_out_few1;
+
+    ink_conv_few(j0, j1, channels, head_dim, few_rows, nullptr);
+
+    auto [want_few0, want_st_few0] = ref_conv(false, few_rows);
+    auto [want_few1, want_st_few1] = ref_conv(true, few_rows);
+
+    bad += report("ink_conv_few dual job 0 (static out)", host(d_out_few0, (size_t) few_rows * channels), want_few0, 1e-5);
+    bad += report("ink_conv_few dual job 1 (dynamic out)", host(d_out_few1, (size_t) few_rows * channels), want_few1, 1e-5);
+    bad += report("ink_conv_few dual job 0 (state)", host(d_st_few0, st0.size()), want_st_few0, 1e-6);
+    bad += report("ink_conv_few dual job 1 (state)", host(d_st_few1, st0.size()), want_st_few1, 1e-6);
+
+    // 4. Strided dual-job ink_conv_few (x_stride = 2 * channels, rows = 4)
+    std::vector<float> x_strided((size_t) few_rows * 2 * channels);
+    for (int t = 0; t < few_rows; ++t) {
+        std::copy_n(x.data() + (size_t) t * channels, channels, x_strided.data() + (size_t) t * 2 * channels);
+        std::copy_n(x.data() + (size_t) t * channels, channels, x_strided.data() + (size_t) t * 2 * channels + channels);
+    }
+    float* d_xs = dev(x_strided);
+    cudaMemcpy(d_st_few0, st0.data(), st0.size() * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_st_few1, st0.data(), st0.size() * sizeof(float), cudaMemcpyHostToDevice);
+    j0.x = d_xs; j0.x_stride = 2 * channels;
+    j1.x = d_xs + channels; j1.x_stride = 2 * channels; j1.dyn = nullptr;
+    ink_conv_few(j0, j1, channels, head_dim, few_rows, nullptr);
+    bad += report("ink_conv_few strided job 0", host(d_out_few0, (size_t) few_rows * channels), want_few0, 1e-5);
+    bad += report("ink_conv_few strided job 1", host(d_out_few1, (size_t) few_rows * channels), want_few0, 1e-5);
+    bad += report("ink_conv_few strided state 0", host(d_st_few0, st0.size()), want_st_few0, 1e-6);
+    bad += report("ink_conv_few strided state 1", host(d_st_few1, st0.size()), want_st_few0, 1e-6);
+    cudaFree(d_xs);
+
+    cudaFree(d_st_few0); cudaFree(d_st_few1); cudaFree(d_out_few0); cudaFree(d_out_few1);
     cudaFree(d_x); cudaFree(d_w); cudaFree(d_dyn); cudaFree(d_st); cudaFree(d_out); cudaFree(d_snap); cudaFree(d_st2);
     return bad;
 }
@@ -395,8 +493,27 @@ int test_rel_and_attend() {
                         dot += (double) r_cur[((size_t) t * n_head + h) * n_rel + k] * rel_bias[(size_t) d * n_rel + k];
                     want_tbl[((size_t) t * n_head + h) * n_extent + d] = (float) (dot - sinks[(size_t) t * n_head + h]);
                 }
-        if (total_keys == 1500 && mode == Mode::kFp16 && n_head == 24)
+        if (total_keys == 1500 && mode == Mode::kFp16 && n_head == 24) {
             bad += report("inkling_rel_table", host(d_tbl, want_tbl.size()), want_tbl, 1e-5);
+            if (n_rel == 16) {
+                std::vector<float> transposed_bias(rel_bias.size());
+                for (int d = 0; d < n_extent; ++d) {
+                    for (int k = 0; k < n_rel; ++k) {
+                        transposed_bias[(size_t) k * (size_t) n_extent + d] = rel_bias[(size_t) d * (size_t) n_rel + k];
+                    }
+                }
+                float* d_rb_tr = dev(transposed_bias);
+                float* d_tbl_tr = dev(std::vector<float>((size_t) q_rows * n_head * n_extent, 0.f));
+                inkling_rel_table(d_rcur, d_rb_tr, d_snk, d_tbl_tr, n_rel, n_extent, n_head, q_rows, nullptr, true);
+                bad += report("inkling_rel_table (transposed term-major)", host(d_tbl_tr, want_tbl.size()), want_tbl, 1e-5);
+                std::vector<float> got_orig = host(d_tbl, want_tbl.size());
+                std::vector<float> got_tr = host(d_tbl_tr, want_tbl.size());
+                if (std::memcmp(got_orig.data(), got_tr.data(), got_orig.size() * sizeof(float)) != 0) {
+                    std::fprintf(stderr, "FAIL: inkling_rel_table bitwise divergence between regular and transposed\n");
+                    bad++;
+                }
+            }
+        }
 
         uint16_t *d_kf16 = dev(kf16), *d_vf16 = dev(vf16);
         int8_t *d_kc = dev(kc), *d_vc = dev(vc);
@@ -545,10 +662,43 @@ int test_rel_and_attend() {
         std::snprintf(buf, sizeof(buf), "%s attend_batch vs attend", label);
         bad += report(buf, got_bat, got_dec, 5e-3);
 
+        float* d_out_flash = nullptr;
+        if (!use_at && dim == 128 && n_rel == 16) {
+            d_out_flash = dev(std::vector<float>(q.size(), 0.f));
+            InkAttn ia;
+            ia.q = d_q;
+            ia.r = d_rcur;
+            ia.sink = d_snk;
+            ia.keys = quant ? nullptr : d_kf16;
+            ia.vals = quant ? nullptr : d_vf16;
+            ia.rel_bias = d_rb;
+            ia.out = d_out_flash;
+            ia.pos = total_keys;
+            ia.rows = q_rows;
+            ia.n_head = n_head;
+            ia.n_kv = kv_heads;
+            ia.dim = dim;
+            ia.n_rel = n_rel;
+            ia.extent = n_extent;
+            ia.window = window;
+            ia.ring = ring;
+            ia.scale = scale;
+            ia.kq8 = kq;
+            ia.vq8 = vq;
+            ia.kq4 = kq4;
+            ia.vq4 = vq4;
+            if (ink_attend_batch(ia, nullptr)) {
+                auto got_flash = host(d_out_flash, q.size());
+                std::snprintf(buf, sizeof(buf), "%s flash vs attend", label);
+                bad += report(buf, got_flash, got_dec, 5e-3);
+            }
+        }
+
         cudaFree(d_q); cudaFree(d_rcur); cudaFree(d_rb); cudaFree(d_snk); cudaFree(d_tbl);
         cudaFree(d_kf16); cudaFree(d_vf16); cudaFree(d_kc); cudaFree(d_vc); cudaFree(d_k4); cudaFree(d_v4);
         cudaFree(d_ks); cudaFree(d_vs); cudaFree(d_ks4); cudaFree(d_vs4);
         cudaFree(d_score); cudaFree(d_out_dec); cudaFree(d_out_bat); cudaFree(d_work);
+        if (d_out_flash) cudaFree(d_out_flash);
         if (d_kw) cudaFree(d_kw);
         if (d_vw) cudaFree(d_vw);
         if (d_at) cudaFree(d_at);
@@ -1027,8 +1177,18 @@ int test_fused_and_predequant() {
         auto k_all = random_vec((size_t) (pos + q_rows) * width, 0.5f);
         auto v_all = random_vec((size_t) (pos + q_rows) * width, 0.5f);
         auto q_h = random_vec((size_t) q_rows * nh * dim, 0.5f);
-        auto tbl = random_vec((size_t) q_rows * nh * n_extent, 0.3f);
+        auto r_h = random_vec((size_t) q_rows * nh * 16, 0.3f);
+        auto rb_h = random_vec((size_t) n_extent * 16, 0.25f);
         auto snk = random_vec((size_t) q_rows * nh, 0.3f);
+        std::vector<float> tbl((size_t) q_rows * nh * n_extent);
+        for (int t = 0; t < q_rows; ++t)
+            for (int h = 0; h < nh; ++h)
+                for (int d = 0; d < n_extent; ++d) {
+                    double dot = 0.0;
+                    for (int k = 0; k < 16; ++k)
+                        dot += (double) r_h[((size_t) t * nh + h) * 16 + k] * rb_h[(size_t) d * 16 + k];
+                    tbl[((size_t) t * nh + h) * n_extent + d] = (float) (dot - snk[(size_t) t * nh + h]);
+                }
 
         std::vector<int8_t> k8c((size_t) ring * width, 0), v8c((size_t) ring * width, 0);
         std::vector<uint8_t> k4c((size_t) ring * (width / 2), 0), v4c((size_t) ring * (width / 2), 0);
@@ -1066,7 +1226,7 @@ int test_fused_and_predequant() {
                 }
             }
         }
-        float *d_q = dev(q_h), *d_tbl = dev(tbl), *d_snk = dev(snk);
+        float *d_q = dev(q_h), *d_r = dev(r_h), *d_rb = dev(rb_h), *d_tbl = dev(tbl), *d_snk = dev(snk);
         int8_t *d_k8 = dev(k8c), *d_v8 = dev(v8c);
         uint8_t *d_k4 = dev(k4c), *d_v4 = dev(v4c);
         uint16_t *d_ks8 = dev(ks8), *d_vs8 = dev(vs8), *d_ks4 = dev(ks4), *d_vs4 = dev(vs4);
@@ -1074,7 +1234,8 @@ int test_fused_and_predequant() {
         float *d_sc = dev(std::vector<float>(score_n, 0.f)),
               *d_wrk = dev(std::vector<float>((size_t) q_rows * nh * (dim + dim / 2 + 3) + 1, 0.f)),
               *d_dec = dev(std::vector<float>(q_h.size(), 0.f)),
-              *d_bat = dev(std::vector<float>(q_h.size(), 0.f));
+              *d_bat = dev(std::vector<float>(q_h.size(), 0.f)),
+              *d_fls = dev(std::vector<float>(q_h.size(), 0.f));
         const int64_t lo_all = pos >= win ? (pos - win + 1) : 0;
         const int count_all = (int) ((pos + q_rows) - lo_all);
         uint16_t *d_kw = dev(std::vector<uint16_t>((size_t) count_all * width, 0)),
@@ -1088,16 +1249,56 @@ int test_fused_and_predequant() {
                                  d_sc, score_n, d_wrk, d_bat, dim, nh, nkv, scale, nullptr, win, 0);
             cudaDeviceSynchronize();
             bad += report(label, host(d_bat, q_h.size()), host(d_dec, q_h.size()), 5e-3);
+            InkAttn ia;
+            ia.q = d_q; ia.r = d_r; ia.sink = d_snk; ia.rel_bias = d_rb; ia.out = d_fls;
+            ia.pos = pos; ia.rows = q_rows; ia.n_head = nh; ia.n_kv = nkv; ia.dim = dim;
+            ia.n_rel = 16; ia.extent = n_extent; ia.window = win; ia.ring = ring; ia.scale = scale;
+            ia.kq8 = kq8; ia.vq8 = vq8; ia.kq4 = kq4; ia.vq4 = vq4;
+            if (ink_attend_batch(ia, nullptr)) {
+                cudaDeviceSynchronize();
+                char flabel[96];
+                std::snprintf(flabel, sizeof(flabel), "%s flash", label);
+                bad += report(flabel, host(d_fls, q_h.size()), host(d_dec, q_h.size()), 5e-3);
+            }
         };
         run_pre("Pre-dequant ring SWA Q8_0", {d_k8, d_ks8}, {d_v8, d_vs8}, {}, {});
         run_pre("Pre-dequant ring SWA Q4_0", {}, {}, {d_k4, d_ks4}, {d_v4, d_vs4});
         run_pre("Pre-dequant ring SWA K8V4", {d_k8, d_ks8}, {}, {}, {d_v4, d_vs4});
         blas_destroy(blas);
-        cudaFree(d_q); cudaFree(d_tbl); cudaFree(d_snk);
+        cudaFree(d_q); cudaFree(d_r); cudaFree(d_rb); cudaFree(d_tbl); cudaFree(d_snk);
         cudaFree(d_k8); cudaFree(d_v8); cudaFree(d_k4); cudaFree(d_v4);
         cudaFree(d_ks8); cudaFree(d_vs8); cudaFree(d_ks4); cudaFree(d_vs4);
-        cudaFree(d_sc); cudaFree(d_wrk); cudaFree(d_dec); cudaFree(d_bat);
+        cudaFree(d_sc); cudaFree(d_wrk); cudaFree(d_dec); cudaFree(d_bat); cudaFree(d_fls);
         cudaFree(d_kw); cudaFree(d_vw);
+    }
+
+    // 5. inkling_unpack_q_fused (rows = 4)
+    {
+        const int rows = 4, q_dim = 128, rel_dim = 64, n_head = 8;
+        const int rel_off = 2 * q_dim, sink_off = rel_off + rel_dim, stride = sink_off + n_head;
+        auto src = random_vec((size_t) rows * stride, 1.0f);
+        float *d_src = dev(src),
+              *d_qraw = dev(std::vector<float>((size_t) rows * q_dim, 0.f)),
+              *d_gate = dev(std::vector<float>((size_t) rows * q_dim, 0.f)),
+              *d_r = dev(std::vector<float>((size_t) rows * rel_dim, 0.f)),
+              *d_s = dev(std::vector<float>((size_t) rows * n_head, 0.f));
+        inkling_unpack_q_fused(d_src, d_qraw, d_gate, d_r, d_s, q_dim, rel_dim, n_head, rel_off, sink_off, stride, rows,
+                               nullptr);
+        cudaDeviceSynchronize();
+        std::vector<float> w_q((size_t) rows * q_dim), w_g((size_t) rows * q_dim),
+            w_r((size_t) rows * rel_dim), w_s((size_t) rows * n_head);
+        for (int t = 0; t < rows; ++t) {
+            const float* row = src.data() + (size_t) t * stride;
+            std::copy_n(row, q_dim, w_q.data() + (size_t) t * q_dim);
+            std::copy_n(row + q_dim, q_dim, w_g.data() + (size_t) t * q_dim);
+            std::copy_n(row + rel_off, rel_dim, w_r.data() + (size_t) t * rel_dim);
+            std::copy_n(row + sink_off, n_head, w_s.data() + (size_t) t * n_head);
+        }
+        bad += report("inkling_unpack_q_fused qraw", host(d_qraw, w_q.size()), w_q, 1e-6);
+        bad += report("inkling_unpack_q_fused gate", host(d_gate, w_g.size()), w_g, 1e-6);
+        bad += report("inkling_unpack_q_fused r_raw", host(d_r, w_r.size()), w_r, 1e-6);
+        bad += report("inkling_unpack_q_fused sinks", host(d_s, w_s.size()), w_s, 1e-6);
+        cudaFree(d_src); cudaFree(d_qraw); cudaFree(d_gate); cudaFree(d_r); cudaFree(d_s);
     }
     return bad;
 }
@@ -1108,6 +1309,7 @@ int main() {
     int bad = 0;
     bad += test_situ_gpu_and_cpu();
     bad += test_mix_and_control();
+    bad += test_ctrl_down();
     bad += test_conv4();
     bad += test_l2_clip();
     bad += test_rel_and_attend();

@@ -115,6 +115,14 @@ void Inkling2::load_geometry() {
     need(block_size_ > 0, "bad attn_res.block_size");
     need(log_floor_ > 0 && log_alpha_ >= 0.f, "bad log scale params");
 
+    const char* env_fb = std::getenv("STRATA_FAST_REL_BIAS");
+    fast_rel_bias_ = n_rel_ == 16 && env_fb &&
+                     (std::strcmp(env_fb, "1") == 0 || std::strcmp(env_fb, "true") == 0 ||
+                      std::strcmp(env_fb, "on") == 0);
+    if (fast_rel_bias_) {
+        std::fprintf(stderr, "strata-poly: Inkling2 fast transposed relative bias enabled\n");
+    }
+
     const MetaValue* unpad = find("vocab_size_unpadded");
     need(unpad != nullptr, "vocab_size_unpadded");
     const int unpadded = (int) val_u(*unpad);
@@ -367,6 +375,24 @@ void Inkling2::load_layer(int il) {
     B.wo = mat("attn_output.weight", q_dim, n_embd_);
     B.attn_q_clip = f32("attn_q_clip.weight", head_dim_, n_head_);
     B.attn_rel_bias = f32("attn_rel_bias.weight", n_rel_, n_extent);
+    if (fast_rel_bias_ && dense_ && B.attn_rel_bias.p && n_rel_ == 16) {
+        const TensorInfo* tb = tensor(il, "attn_rel_bias.weight");
+        if (tb && tb->type == kTypeF32) {
+            std::vector<float> tr((size_t) n_rel_ * (size_t) n_extent);
+            const float* src = (const float*) home(*tb).data(*tb);
+            for (int d = 0; d < n_extent; ++d) {
+                for (int k = 0; k < n_rel_; ++k) {
+                    tr[(size_t) k * (size_t) n_extent + d] = src[(size_t) d * (size_t) n_rel_ + k];
+                }
+            }
+            void* p = nullptr;
+            ck(cudaMalloc(&p, tr.size() * sizeof(float)), "attn_rel_bias_trans");
+            dev_allocs_.push_back(p);
+            B.attn_rel_bias_trans.p = p;
+            B.attn_rel_bias_trans.type = kTypeF32;
+            h2d(p, tr.data(), tr.size() * sizeof(float));
+        }
+    }
     B.attn_rel_clip = f32("attn_rel_clip.weight", n_rel_, n_head_);
     B.attn_k_conv = f32("attn_k_conv.weight", l_conv_, kv_dim);
     B.attn_v_conv = f32("attn_v_conv.weight", l_conv_, kv_dim);
@@ -625,16 +651,17 @@ void Inkling2::assign_scratch() {
     const size_t kv = n_d * n_kv_ * head_dim_;
     inputs_buf_ = fbuf(3 * n * n_embd_);
     msg_ = fbuf(4 * n * n_embd_);
+    const size_t max_fused = std::min<size_t>(n, (size_t) kStageRows - 1);
     const size_t qf_cols = 2 * (size_t) n_head_ * head_dim_ + (size_t) n_rel_ * n_head_ + (size_t) n_head_;
     const size_t qf_stride = (qf_cols + 63) & ~size_t(63);
-    const size_t ctrl_n = std::max(4 * n * n_embd_, qf_stride + 2 * (size_t) n_kv_ * head_dim_);
+    const size_t ctrl_n = std::max(4 * n * n_embd_, max_fused * (qf_stride + 2 * (size_t) n_kv_ * head_dim_));
     float* ctrl_arena = fbuf(ctrl_n);
     ctrl_cat_ = ctrl_arena;
     ctrl_g_ = ctrl_arena + n * 2 * n_embd_;
-    ctrl_r_ = fbuf(n * gate_rank_);
+    ctrl_r_ = fbuf(3 * n * gate_rank_);
     ctrl_f_ = fbuf(n * n_embd_);
     q_fused_buf_ = ctrl_arena;
-    kv_fused_buf_ = ctrl_arena + qf_stride;
+    kv_fused_buf_ = ctrl_arena + max_fused * qf_stride;
 
     qraw_ = fbuf(heads);
     q_ = fbuf(heads);
@@ -958,16 +985,31 @@ int Inkling2::head_key(int slot, int n) const {
     return slots_[(size_t) slot].swa ? 0 : room_key(n);
 }
 
-void Inkling2::apply_ctrl(const float* cur, const float* msg, const Block& B, int ctrl, float* out, int n) {
-    inkling_control_prep(cur, msg, ctrl_cat_, n_embd_, n, 1e-6f, st_);
-    lin(B.ctrl_down[ctrl], ctrl_cat_, ctrl_r_, n);
+void Inkling2::apply_ctrl(const float* cur, const float* msg, const Block& B, int ctrl, float* out, int n,
+                          const float* ctrl_r_in) {
+    const float* r_ptr = ctrl_r_in;
+    if (!r_ptr) {
+        bool fused = false;
+        if (n < kStageRows && B.ctrl_down[ctrl].type == kTypeF32 && B.ctrl_down[ctrl].scale == 1.0f) {
+            const float* c = cur;
+            const float* m = msg;
+            const float* w = fp(B.ctrl_down[ctrl]);
+            float* y = ctrl_r_;
+            fused = ink_ctrl_down(&c, &m, &w, &y, 1, n_embd_, gate_rank_, n, st_);
+        }
+        if (!fused) {
+            inkling_control_prep(cur, msg, ctrl_cat_, n_embd_, n, 1e-6f, st_);
+            lin(B.ctrl_down[ctrl], ctrl_cat_, ctrl_r_, n);
+        }
+        r_ptr = ctrl_r_;
+    }
     if (B.ctrl_gf[ctrl].p) {
-        lin(B.ctrl_gf[ctrl], ctrl_r_, ctrl_g_, n);
+        lin(B.ctrl_gf[ctrl], r_ptr, ctrl_g_, n);
         inkling_control_apply(cur, msg, ctrl_g_, ctrl_g_ + n_embd_, out, n_embd_, n, st_, 2 * n_embd_);
         return;
     }
-    lin(B.ctrl_gain[ctrl], ctrl_r_, ctrl_g_, n);
-    lin(B.ctrl_forget[ctrl], ctrl_r_, ctrl_f_, n);
+    lin(B.ctrl_gain[ctrl], r_ptr, ctrl_g_, n);
+    lin(B.ctrl_forget[ctrl], r_ptr, ctrl_f_, n);
     inkling_control_apply(cur, msg, ctrl_g_, ctrl_f_, out, n_embd_, n, st_);
 }
 
@@ -1042,9 +1084,19 @@ void Inkling2::attn(const Step& st, Block& B, SlotCache& sc, int64_t pos, int n)
     // 2. Cross-pass loop controls (pass > 0)
     const bool share_swa = B.swa && pass == 0;
     if (pass > 0) {
-        apply_ctrl(B.swa ? in0 : in1, msg_ + 1 * (size_t) n * n_embd_, B, 1, in1, n);
-        apply_ctrl(B.swa ? in0 : in2, msg_ + 2 * (size_t) n * n_embd_, B, 2, in2, n);
-        apply_ctrl(in0, msg_ + 0 * (size_t) n * n_embd_, B, 0, in0, n);
+        const float* c3[3] = {B.swa ? in0 : in1, B.swa ? in0 : in2, in0};
+        const float* m3[3] = {msg_ + 1 * (size_t) n * n_embd_, msg_ + 2 * (size_t) n * n_embd_, msg_};
+        const float* w3[3] = {
+            B.ctrl_down[1].type == kTypeF32 && B.ctrl_down[1].scale == 1.0f ? fp(B.ctrl_down[1]) : nullptr,
+            B.ctrl_down[2].type == kTypeF32 && B.ctrl_down[2].scale == 1.0f ? fp(B.ctrl_down[2]) : nullptr,
+            B.ctrl_down[0].type == kTypeF32 && B.ctrl_down[0].scale == 1.0f ? fp(B.ctrl_down[0]) : nullptr,
+        };
+        float* y3[3] = {ctrl_r_, ctrl_r_ + (size_t) n * gate_rank_, ctrl_r_ + 2 * (size_t) n * gate_rank_};
+        float* o3[3] = {in1, in2, in0};
+        const int idx3[3] = {1, 2, 0};
+        const bool all_fused =
+            n < kStageRows && w3[0] && w3[1] && w3[2] && ink_ctrl_down(c3, m3, w3, y3, 3, n_embd_, gate_rank_, n, st_);
+        for (int k = 0; k < 3; ++k) apply_ctrl(c3[k], m3[k], B, idx3[k], o3[k], n, all_fused ? y3[k] : nullptr);
     }
 
     // 3. Input norm + linear projections -> Q, K, V, R, sinks, gate
@@ -1053,15 +1105,24 @@ void Inkling2::attn(const Step& st, Block& B, SlotCache& sc, int64_t pos, int n)
     const Dev& nv = B.swa ? L.attn_norm : B.v_inp_norm;
 
     kernels::native_add_rms_norm_q8_1(in0, nullptr, fp(nq), xn_, xq_, n_embd_, n, rms_eps_, threads, st_);
+
     const float *qraw_p = qraw_, *gate_p = gate_, *r_raw_p = r_raw_, *sinks_p = sinks_;
-    if (n == 1 && B.wq_fused.p) {
-        lin(B.wq_fused, xn_, q_fused_buf_, 1, xq_);
-        qraw_p = q_fused_buf_;
-        gate_p = q_fused_buf_ + (size_t) n_head_ * head_dim_;
-        if (B.wq_fuse_flags & 2) r_raw_p = q_fused_buf_ + B.wq_rel_off;
-        else lin(B.attn_rel, xn_, r_raw_, 1, xq_);
-        if (B.wq_fuse_flags & 4) sinks_p = q_fused_buf_ + B.wq_sink_off;
-        else lin(B.attn_sink_proj, xn_, sinks_, 1, xq_);
+    if (n < kStageRows && B.wq_fused.p) {
+        lin(B.wq_fused, xn_, q_fused_buf_, n, xq_);
+        if (n == 1) {
+            qraw_p = q_fused_buf_;
+            gate_p = q_fused_buf_ + (size_t) n_head_ * head_dim_;
+            if (B.wq_fuse_flags & 2) r_raw_p = q_fused_buf_ + B.wq_rel_off;
+            else lin(B.attn_rel, xn_, r_raw_, 1, xq_);
+            if (B.wq_fuse_flags & 4) sinks_p = q_fused_buf_ + B.wq_sink_off;
+            else lin(B.attn_sink_proj, xn_, sinks_, 1, xq_);
+        } else {
+            inkling_unpack_q_fused(q_fused_buf_, qraw_, gate_, (B.wq_fuse_flags & 2) ? r_raw_ : nullptr,
+                                   (B.wq_fuse_flags & 4) ? sinks_ : nullptr, n_head_ * head_dim_, n_head_ * n_rel_,
+                                   n_head_, B.wq_rel_off, B.wq_sink_off, B.wq_fused.n_out, n, st_);
+            if (!(B.wq_fuse_flags & 2)) lin(B.attn_rel, xn_, r_raw_, n, xq_);
+            if (!(B.wq_fuse_flags & 4)) lin(B.attn_sink_proj, xn_, sinks_, n, xq_);
+        }
     } else {
         lin(B.wq, xn_, qraw_, n, xq_);
         lin(B.attn_rel, xn_, r_raw_, n, xq_);
@@ -1069,14 +1130,26 @@ void Inkling2::attn(const Step& st, Block& B, SlotCache& sc, int64_t pos, int n)
         lin(B.wqkv_gate, xn_, gate_, n, xq_);
     }
 
-    if (share_swa && n == 1 && B.wkv_fused.p) {
-        lin(B.wkv_fused, xn_, kv_fused_buf_, 1, xq_);
-        inkling_conv4(kv_fused_buf_, state_ + sc.state_off + off_k_conv_, fp(B.attn_k_conv), nullptr, head_dim_,
-                      k_, n_kv_ * head_dim_, 1, st_, snap_bits_ ? snap_at_ + sc.state_off + off_k_conv_ : nullptr,
-                      rec_n_, snap_bits_);
-        inkling_conv4(kv_fused_buf_ + (size_t) n_kv_ * head_dim_, state_ + sc.state_off + off_v_conv_,
-                      fp(B.attn_v_conv), nullptr, head_dim_, v_, n_kv_ * head_dim_, 1, st_,
-                      snap_bits_ ? snap_at_ + sc.state_off + off_v_conv_ : nullptr, rec_n_, snap_bits_);
+    if (share_swa && n < kStageRows && B.wkv_fused.p) {
+        lin(B.wkv_fused, xn_, kv_fused_buf_, n, xq_);
+        InkConv ck, cv;
+        ck.x = kv_fused_buf_;
+        ck.x_stride = 2 * n_kv_ * head_dim_;
+        ck.state = state_ + sc.state_off + off_k_conv_;
+        ck.w = fp(B.attn_k_conv);
+        ck.dyn = nullptr;
+        ck.out = k_;
+        ck.snap = snap_bits_ ? snap_at_ + sc.state_off + off_k_conv_ : nullptr;
+
+        cv.x = kv_fused_buf_ + (size_t) n_kv_ * head_dim_;
+        cv.x_stride = 2 * n_kv_ * head_dim_;
+        cv.state = state_ + sc.state_off + off_v_conv_;
+        cv.w = fp(B.attn_v_conv);
+        cv.dyn = nullptr;
+        cv.out = v_;
+        cv.snap = snap_bits_ ? snap_at_ + sc.state_off + off_v_conv_ : nullptr;
+
+        ink_conv_few(ck, cv, n_kv_ * head_dim_, head_dim_, n, st_, nullptr, rec_n_, snap_bits_);
     } else {
         if (!share_swa) {
             kernels::native_add_rms_norm_q8_1(in1, nullptr, fp(nk), xn_, xq_, n_embd_, n, rms_eps_, threads, st_);
@@ -1130,39 +1203,69 @@ void Inkling2::attn(const Step& st, Block& B, SlotCache& sc, int64_t pos, int n)
     const bool pre_dq = n >= kStageRows && quant && keys_all_64 > 0 && keys_all_64 <= work_rows;
     uint16_t* kw = quant ? (uint16_t*) q8w_ : nullptr;
     uint16_t* vw = quant ? kw + work_halves_ : nullptr;
-    if (pre_dq) {
-        inkling_dequant_kv_span(lo_all, (int) keys_all_64, kv_width, ring, kq, vq, kq4, vq4, kw, vw, st_);
+    bool flash_done = false;
+    if (n >= kStageRows) {
+        InkAttn ia;
+        ia.q = q_;
+        ia.r = r_cur_;
+        ia.sink = sinks_p;
+        ia.keys = quant ? nullptr : sc.keys;
+        ia.vals = quant ? nullptr : sc.vals;
+        ia.rel_bias = fp(B.attn_rel_bias);
+        ia.gate = gate_p;
+        ia.out = att_;
+        ia.pos = pos;
+        ia.rows = n;
+        ia.n_head = n_head_;
+        ia.n_kv = n_kv_;
+        ia.dim = head_dim_;
+        ia.n_rel = n_rel_;
+        ia.extent = n_extent;
+        ia.window = window;
+        ia.ring = ring;
+        ia.scale = scale;
+        ia.kq8 = kq;
+        ia.vq8 = vq;
+        ia.kq4 = kq4;
+        ia.vq4 = vq4;
+        flash_done = ink_attend_batch(ia, st_);
     }
-    const int c_step = n >= kStageRows ? chunk_batch_ : chunk_dec_;
-    for (int first = 0; first < n; first += c_step) {
-        const int c = std::min(c_step, n - first);
-        const float* r_sub = r_cur_ + (size_t) first * n_head_ * n_rel_;
-        const float* s_sub = sinks_p + (size_t) first * n_head_;
-        const float* q_sub = q_ + (size_t) first * n_head_ * head_dim_;
-        float* att_sub = att_ + (size_t) first * n_head_ * head_dim_;
-        inkling_rel_table(r_sub, fp(B.attn_rel_bias), s_sub, table_, n_rel_, n_extent, n_head_, c, st_);
-        if (n >= kStageRows) {
-            if (pre_dq) {
-                inkling_attend_batch(blas_, q_sub, kw, vw, table_, s_sub, n_extent, (pos - lo_all) + first, c,
-                                     score_, score_n_, awork_, att_sub, head_dim_, n_head_, n_kv_, scale, st_,
-                                     window, 0, Kvq8{}, Kvq8{}, nullptr, nullptr, 0, Kvq4{}, Kvq4{});
-            } else {
-                inkling_attend_batch(blas_, q_sub, quant ? nullptr : sc.keys, quant ? nullptr : sc.vals, table_,
-                                     s_sub, n_extent, pos + first, c, score_, score_n_, awork_, att_sub, head_dim_,
-                                     n_head_, n_kv_, scale, st_, window, ring, kq, vq, kw, vw,
-                                     quant ? work_halves_ : 0, kq4, vq4);
-            }
-        } else {
-            const long long* at_sub = at ? at + 2 * first : nullptr;
-            const int rm = !at ? 0 : B.swa ? std::min(window_ + n - 1, opt_.max_context) : room(n);
-            inkling_attend(q_sub, quant ? nullptr : sc.keys, quant ? nullptr : sc.vals, table_, s_sub, n_extent,
-                           pos + first, c, score_, chunk_dec_, att_sub, head_dim_, n_head_, n_kv_, scale, st_,
-                           window, ring, at_sub, rm, kq, vq, kq4, vq4);
+    if (!flash_done) {
+        if (pre_dq) {
+            inkling_dequant_kv_span(lo_all, (int) keys_all_64, kv_width, ring, kq, vq, kq4, vq4, kw, vw, st_);
         }
+        const int c_step = n >= kStageRows ? chunk_batch_ : chunk_dec_;
+        for (int first = 0; first < n; first += c_step) {
+            const int c = std::min(c_step, n - first);
+            const float* r_sub = r_cur_ + (size_t) first * n_head_ * n_rel_;
+            const float* s_sub = sinks_p + (size_t) first * n_head_;
+            const float* q_sub = q_ + (size_t) first * n_head_ * head_dim_;
+            float* att_sub = att_ + (size_t) first * n_head_ * head_dim_;
+            inkling_rel_table(r_sub, fp(B.attn_rel_bias_trans.p ? B.attn_rel_bias_trans : B.attn_rel_bias), s_sub, table_,
+                              n_rel_, n_extent, n_head_, c, st_, fast_rel_bias_);
+            if (n >= kStageRows) {
+                if (pre_dq) {
+                    inkling_attend_batch(blas_, q_sub, kw, vw, table_, s_sub, n_extent, (pos - lo_all) + first, c,
+                                         score_, score_n_, awork_, att_sub, head_dim_, n_head_, n_kv_, scale, st_,
+                                         window, 0, Kvq8{}, Kvq8{}, nullptr, nullptr, 0, Kvq4{}, Kvq4{});
+                } else {
+                    inkling_attend_batch(blas_, q_sub, quant ? nullptr : sc.keys, quant ? nullptr : sc.vals, table_,
+                                         s_sub, n_extent, pos + first, c, score_, score_n_, awork_, att_sub, head_dim_,
+                                         n_head_, n_kv_, scale, st_, window, ring, kq, vq, kw, vw,
+                                         quant ? work_halves_ : 0, kq4, vq4);
+                }
+            } else {
+                const long long* at_sub = at ? at + 2 * first : nullptr;
+                const int rm = !at ? 0 : B.swa ? std::min(window_ + n - 1, opt_.max_context) : room(n);
+                inkling_attend(q_sub, quant ? nullptr : sc.keys, quant ? nullptr : sc.vals, table_, s_sub, n_extent,
+                               pos + first, c, score_, chunk_dec_, att_sub, head_dim_, n_head_, n_kv_, scale, st_,
+                               window, ring, at_sub, rm, kq, vq, kq4, vq4);
+            }
+        }
+        // 7. Sigmoid gate -> wo -> post-conv4
+        mul_sigmoid(att_, gate_p, n_head_ * head_dim_, n, n_head_ * head_dim_, false, st_);
     }
 
-    // 7. Sigmoid gate -> wo -> post-conv4
-    mul_sigmoid(att_, gate_p, n_head_ * head_dim_, n, n_head_ * head_dim_, false, st_);
     lin(B.wo, att_, cur_, n);
     inkling_conv4(cur_, state_ + sc.state_off + off_attn_post_, fp(B.attn_post_conv), nullptr, 0, ao_, n_embd_, n, st_,
                   snap_bits_ ? snap_at_ + sc.state_off + off_attn_post_ : nullptr, rec_n_, snap_bits_);
@@ -1651,18 +1754,19 @@ void Inkling2::draft_block(int32_t token) {
 
     const int n_cand = B - 1;
     const int dv = draft_rows();
-    kernels::native_add_rms_norm_q8_1(d_blk_x_ + n_embd_, d_blk_attn_ + n_embd_, fp(dspark_norm_), d_blk_h_,
-                                      d_blk_xq_, n_embd_, n_cand, dspark_eps_, threads, st_);
-    Dev head = output_;
-    head.n_out = dv;
-    lin(head, d_blk_h_, d_base_logits_, n_cand, d_blk_xq_);
-    lin(dspark_rnn_h_, d_blk_h_, d_rnn_h_gates_, n_cand, d_blk_xq_);
-
-    const int n_steps = std::min({n_cand, opt_.window - 1, (int) std::max<int64_t>(0, opt_.max_context - pos_ - 1)});
+    const int steady_steps = std::min(n_cand, opt_.window - 1);
+    const int n_steps = std::min(steady_steps, (int) std::max<int64_t>(0, opt_.max_context - pos_ - 1));
     if (n_steps <= 0) {
         block_n_ = 0;
         return;
     }
+
+    kernels::native_add_rms_norm_q8_1(d_blk_x_ + n_embd_, d_blk_attn_ + n_embd_, fp(dspark_norm_), d_blk_h_,
+                                      d_blk_xq_, n_embd_, n_steps, dspark_eps_, threads, st_);
+    Dev head = output_;
+    head.n_out = dv;
+    lin(head, d_blk_h_, d_base_logits_, n_steps, d_blk_xq_);
+    lin(dspark_rnn_h_, d_blk_h_, d_rnn_h_gates_, n_steps, d_blk_xq_);
 
     h_dspark_anchor_pick_ = {token, 1.0f};
     ck(cudaMemcpyAsync(d_block_picks_ + (B - 1), &h_dspark_anchor_pick_, sizeof(Likeliest), cudaMemcpyHostToDevice,
@@ -1686,8 +1790,8 @@ void Inkling2::draft_block(int32_t token) {
         }
     };
 
-    if (opt_.graphs && !opt_.dump && n_steps == n_cand) {
-        if (!dspark_markov_graph_) dspark_markov_graph_ = record_fn([&] { run_markov(n_cand); });
+    if (opt_.graphs && !opt_.dump && n_steps == steady_steps) {
+        if (!dspark_markov_graph_) dspark_markov_graph_ = record_fn([&] { run_markov(steady_steps); });
         ck(cudaGraphLaunch((cudaGraphExec_t) dspark_markov_graph_, cs(st_)), "dspark markov graph");
     } else {
         run_markov(n_steps);

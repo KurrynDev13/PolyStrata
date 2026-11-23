@@ -34,6 +34,11 @@ public:
     static void quantize(const float* x, const int32_t* ids, void* xq, int ggml_type, int64_t cols, int64_t ld,
                          int64_t rows, void* stream);
 
+    /// Quantizes n_tokens unique tokens once linearly into xq_tokens, then gathers into xq according to ids (for rows destination rows).
+    static void quantize_dedup(const float* x, const int32_t* ids, void* xq, void* xq_tokens,
+                               int ggml_type, int64_t cols, int64_t ld, int64_t n_tokens,
+                               int64_t rows, void* stream);
+
     /// One launch over n matrices of [w_rows, w_cols], `stride` bytes apart from w: matrix e times the rows
     /// [bounds[e], bounds[e + 1]) of xq, which quantize() wrote with total_rows rows.  Row i's product goes to row
     /// ids[i] of dst, ld_dst floats a row.  bounds (n + 1 values) and ids are on the device.  max_rows is the most

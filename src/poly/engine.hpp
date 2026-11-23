@@ -279,6 +279,7 @@ public:
     /// buffer.  window() and step() do it too, if the caller has not.
     void end_read() {
         if (stage_lent_) narrow_stage();
+        if (carry_lent_) carry_give();
     }
 
     /// Whether the architecture reads pictures.
@@ -538,6 +539,13 @@ protected:
     };
     virtual int exec_steps() const { return n_layer_; }
     virtual ExecStep exec_step(int step) const { return {step, step}; }
+    /// Whether read() takes calls through each layer run in groups held on the card (read_groups()).
+    virtual bool can_read_groups() const { return false; }
+    /// Rows a token keeps of its own from one layer run to the next beside its rows of r_.
+    virtual int carry_rows() const { return 0; }
+    virtual void carry_at(float* at) { (void) at; }
+    /// What save_layer() writes of layer il that its run under way changes.
+    virtual void save_run(int step, int64_t pos, uint8_t* dst) { save_layer(step, pos, dst); }
     /// Text-only embedding normalization applied inside input() when the row is not an image.
     virtual void norm_text_embed(float* dst) const { (void) dst; }
 
@@ -883,6 +891,8 @@ protected:
     float* hf_ = nullptr;   ///< the power of two a row was divided by for its half sums (guard_half_sums())
     void *mq_ = nullptr, *mq2_ = nullptr;                   ///< the rows quantized for the two products
     void* mqu_ = nullptr;   ///< the rows quantized for up's product, in a layer whose up is not gate's type
+    void *mq_tokens_ = nullptr, *mqu_tokens_ = nullptr;     ///< scratch for unique token quantization deduplication
+    bool opt_moe_dedup_ = false;                            ///< deduplicate activation quantization across routed experts
     void* mqx_ = nullptr;                                   ///< lin()'s tokens quantized for a product
     int32_t *tab_ = nullptr, *h_tab_ = nullptr;   ///< a layer's row tables, in VRAM and pinned
     int32_t* iota_ = nullptr;                     ///< 0, 1, 2, ...
@@ -923,6 +933,13 @@ protected:
     bool stage_lent_ = false;                     ///< the expert cache has lent the buffer VRAM (widen_stage())
     size_t stage_cut_ = 0;                        ///< what the cache gave up for it, which it takes back
     int stage_turn_ = 0;
+    Mapped carry_map_;                            ///< read_groups()'s calls' rows: VRAM the expert cache lends a read (carry_take())
+    size_t carry_cut_ = 0;                        ///< what the cache gave up for it, which it takes back (carry_give())
+    bool carry_lent_ = false;
+    float* carry_take(size_t bytes, size_t most);
+    void carry_give();
+    bool read_groups(const Mark* marks, int n_marks, const std::function<bool(int, int)>* turn, int n, const int32_t* tokens);
+    void embed_rows(const int32_t* tokens, int64_t pos, int m, float* dst);
     std::vector<int32_t> ids_, count_, first_, group_, round_, round_row_;
     std::vector<int> staged_tiles_;   ///< STRATA_POLY_STAGED_TILES: the rows that end a size class of staged experts
     std::vector<float> route_tmp_;   ///< route()'s scratch, a share for each host thread

@@ -13,8 +13,11 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 namespace strata::poly {
 namespace {
@@ -154,6 +157,145 @@ __global__ void inkling_mix_kernel(const float* __restrict__ r, int streams, Mix
     }
 }
 
+constexpr int kMixThreads = 768;
+constexpr int kMixHeld = 3;
+
+template <int NS, int NQ>
+__global__ void __launch_bounds__(kMixThreads) inkling_mix_held_kernel(
+    const float* __restrict__ r, int streams, MixSlots slots,
+    const float* __restrict__ query, float* __restrict__ out,
+    int n_embd, int rows, float eps) {
+
+    constexpr int kSums = 1 + NQ;
+    __shared__ float part[NS * kSums][kMixThreads / WARP];
+    __shared__ float whole[NS * kSums];
+    __shared__ float inv_rms[NS];
+    __shared__ float probs[NQ][NS];
+
+    const int t = blockIdx.x;
+    const size_t row_offset = size_t(t) * streams * n_embd;
+    const float* tok_r = r + row_offset;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+
+    float x[kMixHeld][NS];
+    float sum[NS][kSums];
+
+#pragma unroll
+    for (int s = 0; s < NS; ++s) {
+#pragma unroll
+        for (int k = 0; k < kSums; ++k) sum[s][k] = 0.0f;
+    }
+
+#pragma unroll
+    for (int h = 0; h < kMixHeld; ++h) {
+        const int i = tid + h * kMixThreads;
+        if (i < n_embd) {
+            float q[NQ];
+#pragma unroll
+            for (int j = 0; j < NQ; ++j) q[j] = query[size_t(j) * n_embd + i];
+#pragma unroll
+            for (int s = 0; s < NS; ++s) {
+                const float v = tok_r[size_t(slots.s[s]) * n_embd + i];
+                x[h][s] = v;
+                sum[s][0] += v * v;
+#pragma unroll
+                for (int j = 0; j < NQ; ++j) sum[s][1 + j] += v * q[j];
+            }
+        }
+    }
+
+#pragma unroll
+    for (int s = 0; s < NS; ++s) {
+#pragma unroll
+        for (int k = 0; k < kSums; ++k) {
+            const float w = warp_sum(sum[s][k]);
+            if (lane == 0) part[s * kSums + k][warp] = w;
+        }
+    }
+    __syncthreads();
+
+    if (tid < NS * kSums) {
+        float val = 0.0f;
+#pragma unroll
+        for (int w = 0; w < kMixThreads / WARP; ++w) val += part[tid][w];
+        whole[tid] = val;
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        const float score_scale = rsqrtf((float) n_embd);
+        for (int s = 0; s < NS; ++s) {
+            const float mean_sq = whole[s * kSums] / (float) n_embd;
+            inv_rms[s] = rsqrtf(mean_sq + eps);
+        }
+        for (int q = 0; q < NQ; ++q) {
+            float logits[NS];
+            float mx = -1e30f;
+            for (int s = 0; s < NS; ++s) {
+                const float dot = whole[s * kSums + 1 + q];
+                logits[s] = dot * inv_rms[s] * score_scale;
+                mx = fmaxf(mx, logits[s]);
+            }
+            float exps[NS];
+            float sum_exp = 0.0f;
+            for (int s = 0; s < NS; ++s) {
+                exps[s] = expf(logits[s] - mx);
+                sum_exp += exps[s];
+            }
+            const float inv_s = 1.0f / sum_exp;
+            for (int s = 0; s < NS; ++s) {
+                probs[q][s] = exps[s] * inv_s;
+            }
+        }
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (int h = 0; h < kMixHeld; ++h) {
+        const int i = tid + h * kMixThreads;
+        if (i < n_embd) {
+#pragma unroll
+            for (int q = 0; q < NQ; ++q) {
+                float acc = 0.0f;
+#pragma unroll
+                for (int s = 0; s < NS; ++s) {
+                    acc += probs[q][s] * (x[h][s] * inv_rms[s]);
+                }
+                out[(size_t(q) * rows + t) * n_embd + i] = acc;
+            }
+        }
+    }
+}
+
+template <int NS, int NQ>
+struct MixHeldLauncher {
+    static void launch(dim3 grid, cudaStream_t s, const float* r, int streams, MixSlots slots,
+                       const float* query, float* out, int n_embd, int rows, float eps) {
+        inkling_mix_held_kernel<NS, NQ><<<grid, kMixThreads, 0, s>>>(r, streams, slots, query, out, n_embd, rows, eps);
+    }
+};
+
+template <template <int, int> class K, class... Args>
+void launch_mix_held(int n_slots, int n_queries, dim3 grid, cudaStream_t s, Args... args) {
+    const auto go = [&](auto ns_c) {
+        constexpr int NS = decltype(ns_c)::value;
+        switch (n_queries) {
+            case 1: K<NS, 1>::launch(grid, s, args...); break;
+            case 2: K<NS, 2>::launch(grid, s, args...); break;
+            case 3: K<NS, 3>::launch(grid, s, args...); break;
+            default: K<NS, 4>::launch(grid, s, args...); break;
+        }
+    };
+    switch (n_slots) {
+        case 1: go(std::integral_constant<int, 1>{}); break;
+        case 2: go(std::integral_constant<int, 2>{}); break;
+        case 3: go(std::integral_constant<int, 3>{}); break;
+        case 4: go(std::integral_constant<int, 4>{}); break;
+        case 5: go(std::integral_constant<int, 5>{}); break;
+        default: go(std::integral_constant<int, 6>{}); break;
+    }
+}
+
 // ---- 3. Cross-pass loop controllers ----
 
 __global__ void inkling_control_prep_kernel(const float* __restrict__ cur, const float* __restrict__ msg,
@@ -187,6 +329,72 @@ __global__ void inkling_control_apply_kernel(const float* __restrict__ cur, cons
     const size_t gidx = size_t(blockIdx.y) * gf_stride + i;
     const float c = cur[idx], m = msg[idx];
     out[idx] = c * (1.0f - tanhf(forget_raw[gidx])) + m * tanhf(gain_raw[gidx]);
+}
+
+constexpr int kCatThreads = 256;
+constexpr int kDownThreads = 512;
+constexpr int kCtrlSet = 3;
+
+struct CtrlDown {
+    const float* cur[kCtrlSet];
+    const float* msg[kCtrlSet];
+    const float* w[kCtrlSet];
+    float* y[kCtrlSet];
+};
+
+__device__ __forceinline__ void cat_squares(const float* __restrict__ cur, const float* __restrict__ msg, int n_embd,
+                                            int tid, float& a, float& b) {
+    a = 0.0f;
+    b = 0.0f;
+    for (int i = tid; i < n_embd; i += kCatThreads) {
+        a += cur[i] * cur[i];
+        b += msg[i] * msg[i];
+    }
+}
+
+__device__ __forceinline__ float cat_scale(float sum, int n_embd) {
+    return rsqrtf(sum / (float) n_embd + 1e-6f);
+}
+
+__global__ void __launch_bounds__(kDownThreads) ink_ctrl_down_kernel(CtrlDown d, int n_embd, int rank) {
+    __shared__ float pa[kCatThreads / WARP], pb[kCatThreads / WARP], part[32];
+    const int j = blockIdx.x / rank, o = blockIdx.x % rank, tid = threadIdx.x;
+    const size_t row = size_t(blockIdx.y) * n_embd;
+    const float* __restrict__ cur = d.cur[j] + row;
+    const float* __restrict__ msg = d.msg[j] + row;
+    if (tid < kCatThreads) {
+        float a, b;
+        cat_squares(cur, msg, n_embd, tid, a, b);
+        a = warp_sum(a);
+        b = warp_sum(b);
+        if ((tid & 31) == 0) pa[tid >> 5] = a, pb[tid >> 5] = b;
+    }
+    __syncthreads();
+    float sa = 0.0f, sb = 0.0f;
+    for (int k = 0; k < kCatThreads / WARP; ++k) sa += pa[k];
+    for (int k = 0; k < kCatThreads / WARP; ++k) sb += pb[k];
+    const float ia = cat_scale(sa, n_embd), ib = cat_scale(sb, n_embd);
+    const float* __restrict__ wr = d.w[j] + size_t(o) * 2 * n_embd;
+    const int n_in = 2 * n_embd;
+    float acc0 = 0.0f, acc1 = 0.0f;
+    for (int i = tid; i < n_in; i += 2 * kDownThreads) {
+        const float x0 = i < n_embd ? cur[i] * ia : msg[i - n_embd] * ib;
+        acc0 += wr[i] * x0;
+        const int i1 = i + kDownThreads;
+        if (i1 < n_in) {
+            const float x1 = i1 < n_embd ? cur[i1] * ia : msg[i1 - n_embd] * ib;
+            acc1 += wr[i1] * x1;
+        }
+    }
+    acc0 = warp_sum(acc0);
+    acc1 = warp_sum(acc1);
+    if ((tid & 31) == 0) part[tid >> 5] = acc0, part[(tid >> 5) + kDownThreads / WARP] = acc1;
+    __syncthreads();
+    if (tid == 0) {
+        float sum = 0.0f;
+        for (int k = 0; k < 2 * kDownThreads / WARP; ++k) sum += part[k];
+        d.y[j][size_t(blockIdx.y) * rank + o] = sum;
+    }
 }
 
 // ---- 4. Causal 4-tap short convolution (static + optional dynamic per-head reversed-lag taps) ----
@@ -258,6 +466,56 @@ __global__ void inkling_conv4_advance_kernel(const float* __restrict__ x, float*
     st[2] = x[size_t(rows - 1) * channels + c];
 }
 
+__global__ void ink_conv_few_kernel(InkConv j0, InkConv j1, size_t stride, unsigned snaps, int channels, int head_dim,
+                                    int rows) {
+    const InkConv& j = blockIdx.y ? j1 : j0;
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= channels) return;
+    const float* wc = j.w + 4 * size_t(c);
+    float* st = j.state + size_t(c) * 3;
+    float s0 = st[0], s1 = st[1], s2 = st[2];
+    const int n_heads = j.dyn ? channels / head_dim : 0;
+    const int h = j.dyn ? c / head_dim : 0;
+    const float scale = j.norm > 0.0f ? j.norm : (j.dyn ? (1.0f / 3.0f) : rsqrtf(5.0f));
+    const int x_stride = j.x_stride > 0 ? j.x_stride : channels;
+
+    for (int row = 0; row < rows; ++row) {
+        const size_t at = size_t(row) * channels + c;
+        const float v = j.x[size_t(row) * x_stride + c];
+        float y = s0 * wc[0] + s1 * wc[1] + s2 * wc[2] + v * wc[3];
+        if (j.dyn) {
+            const float* d = j.dyn + (size_t(row) * n_heads + h) * 4;
+            y += d[0] * v + d[1] * s2 + d[2] * s1 + d[3] * s0;
+        }
+        s0 = s1;
+        s1 = s2;
+        s2 = v;
+        const float out_val = (v + y) * scale;
+        j.out[at] = out_val;
+        if (j.acc) {
+            if (j.mode == 0) {
+                j.acc[at] += out_val * j.a;
+            } else if (j.mode == 1) {
+                if (j.keep) j.keep[at] = j.acc[at];
+                j.acc[at] = out_val;
+            } else if (j.mode == 2) {
+                j.acc[at] = out_val;
+            }
+        }
+        if (j.snap) {
+            if (float* m = snap_of(j.snap, stride, snaps, row)) {
+                float* dst = m + size_t(c) * 3;
+                dst[0] = s0;
+                dst[1] = s1;
+                dst[2] = s2;
+            }
+        }
+    }
+    st[0] = s0;
+    st[1] = s1;
+    st[2] = s2;
+}
+
 // ---- 5. L2 norm clip + optional global log-scale tau(pos) ----
 
 __global__ void inkling_l2_clip_kernel(const float* __restrict__ x, const float* __restrict__ scale,
@@ -287,6 +545,26 @@ __global__ void inkling_l2_clip_kernel(const float* __restrict__ x, const float*
 }
 
 // ---- 6. Per-query relative-position bias table ----
+
+template <bool TermMajor>
+__global__ void fixed_relative_bias(const float* __restrict__ query, const float* __restrict__ bias,
+                                    const float* __restrict__ sinks, float* __restrict__ out,
+                                    int n_extent, int n_head) {
+    const size_t row = size_t(blockIdx.y) * n_head + blockIdx.x;
+    const float* r = query + row * 16;
+    float coef[16];
+#pragma unroll
+    for (int k = 0; k < 16; ++k) coef[k] = r[k];
+    for (int d = threadIdx.x; d < n_extent; d += blockDim.x) {
+        float dot = 0.0f;
+#pragma unroll
+        for (int k = 0; k < 16; ++k) {
+            const size_t at = TermMajor ? size_t(k) * n_extent + d : size_t(d) * 16 + k;
+            dot += coef[k] * bias[at];
+        }
+        out[row * n_extent + d] = dot - sinks[row];
+    }
+}
 
 __global__ void inkling_rel_table_kernel(const float* __restrict__ r_cur, const float* __restrict__ rel_bias,
                                          const float* __restrict__ sinks, float* __restrict__ table, int n_rel,
@@ -1015,7 +1293,21 @@ void inkling_mix(const float* r, int streams, MixSlots slots, int n_slots, const
     if (rows <= 0) return;
     if (n_slots < 1 || n_slots > 6 || n_queries < 1 || n_queries > 4)
         throw std::invalid_argument("inkling_mix: n_slots must be in 1..6 and n_queries in 1..4");
-    inkling_mix_kernel<<<rows, 256, 0, cs(stream)>>>(r, streams, slots, n_slots, query, n_queries, out, n_embd, eps);
+
+    static const bool s_mix_held = []{
+        const char* e = std::getenv("STRATA_MIX_HELD");
+        if (e) return std::strcmp(e, "1") == 0 || std::strcmp(e, "true") == 0 || std::strcmp(e, "on") == 0;
+        const char* no = std::getenv("STRATA_NO_MIX_HELD");
+        if (no && (std::strcmp(no, "1") == 0 || std::strcmp(no, "true") == 0)) return false;
+        return true;
+    }();
+
+    if (s_mix_held && n_embd <= kMixHeld * kMixThreads) {
+        launch_mix_held<MixHeldLauncher>(n_slots, n_queries, dim3(rows), cs(stream), r, streams, slots, query, out,
+                                         n_embd, rows, eps);
+    } else {
+        inkling_mix_kernel<<<rows, 256, 0, cs(stream)>>>(r, streams, slots, n_slots, query, n_queries, out, n_embd, eps);
+    }
     ck("inkling_mix");
 }
 
@@ -1036,6 +1328,24 @@ void inkling_control_apply(const float* cur, const float* msg, const float* gain
     ck("inkling_control_apply");
 }
 
+bool ink_ctrl_down(const float* const* cur, const float* const* msg, const float* const* down, float* const* ch,
+                   int count, int n_embd, int rank, int rows, void* stream) {
+    if (count < 1 || count > kCtrlSet) throw std::invalid_argument("ink_ctrl_down: 1 to 3 controllers");
+    if (2 * n_embd < 1024) return false;
+    if (rows <= 0) return true;
+    if (rows >= 16) return false;
+    CtrlDown d{};
+    for (int j = 0; j < count; ++j) {
+        d.cur[j] = cur[j];
+        d.msg[j] = msg[j];
+        d.w[j] = down[j];
+        d.y[j] = ch[j];
+    }
+    ink_ctrl_down_kernel<<<dim3(count * rank, rows), kDownThreads, 0, cs(stream)>>>(d, n_embd, rank);
+    ck("ink_ctrl_down");
+    return true;
+}
+
 void inkling_conv4(const float* x, float* state, const float* w, const float* dyn, int head_dim, float* out,
                    int channels, int rows, void* stream, float* snap, size_t stride, unsigned snaps) {
     if (rows <= 0) return;
@@ -1051,6 +1361,47 @@ void inkling_conv4(const float* x, float* state, const float* w, const float* dy
     ck("inkling_conv4");
 }
 
+__global__ void inkling_unpack_q_fused_kernel(const float* __restrict__ src, float* __restrict__ qraw,
+                                              float* __restrict__ gate, float* __restrict__ r_raw,
+                                              float* __restrict__ sinks, int q_dim, int rel_dim, int n_head,
+                                              int rel_off, int sink_off, int stride) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= stride) return;
+    const int t = blockIdx.y;
+    const float v = src[size_t(t) * stride + i];
+    if (i < q_dim) {
+        qraw[size_t(t) * q_dim + i] = v;
+    } else if (i < 2 * q_dim) {
+        gate[size_t(t) * q_dim + (i - q_dim)] = v;
+    } else if (r_raw && i >= rel_off && i < rel_off + rel_dim) {
+        r_raw[size_t(t) * rel_dim + (i - rel_off)] = v;
+    } else if (sinks && i >= sink_off && i < sink_off + n_head) {
+        sinks[size_t(t) * n_head + (i - sink_off)] = v;
+    }
+}
+
+void inkling_unpack_q_fused(const float* src, float* qraw, float* gate, float* r_raw, float* sinks, int q_dim,
+                            int rel_dim, int n_head, int rel_off, int sink_off, int stride, int rows, void* stream) {
+    if (rows <= 0 || stride <= 0) return;
+    inkling_unpack_q_fused_kernel<<<dim3(grid(stride, 256), rows), 256, 0, cs(stream)>>>(
+        src, qraw, gate, r_raw, sinks, q_dim, rel_dim, n_head, rel_off, sink_off, stride);
+    ck("inkling_unpack_q_fused");
+}
+
+void ink_conv_few(const InkConv& j0, const InkConv& j1, int channels, int head_dim, int rows, void* stream,
+                  float* snap, size_t stride, unsigned snaps) {
+    if (rows <= 0) return;
+    const int num_jobs = j1.x ? 2 : 1;
+    InkConv a0 = j0, a1 = j1;
+    if (snap && snaps) {
+        if (!a0.snap) a0.snap = snap;
+        if (num_jobs == 2 && !a1.snap) a1.snap = snap;
+    }
+    ink_conv_few_kernel<<<dim3(grid(channels, 256), num_jobs), 256, 0, cs(stream)>>>(
+        a0, a1, stride, snaps, channels, head_dim, rows);
+    ck("ink_conv_few");
+}
+
 void inkling_l2_clip(const float* x, const float* scale, float* out, int dim, int heads, float threshold,
                      int64_t pos, bool is_global, float log_floor, float log_alpha, int rows,
                      const long long* at, void* stream) {
@@ -1062,10 +1413,20 @@ void inkling_l2_clip(const float* x, const float* scale, float* out, int dim, in
 }
 
 void inkling_rel_table(const float* r_cur, const float* rel_bias, const float* sinks, float* table, int n_rel,
-                       int n_extent, int n_head, int rows, void* stream) {
+                       int n_extent, int n_head, int rows, void* stream, bool term_major) {
     if (rows <= 0) return;
-    inkling_rel_table_kernel<<<dim3(n_head, rows), 256, 0, cs(stream)>>>(r_cur, rel_bias, sinks, table, n_rel, n_extent,
-                                                                        n_head);
+    if (n_rel == 16) {
+        if (term_major) {
+            fixed_relative_bias<true><<<dim3(n_head, rows), 256, 0, cs(stream)>>>(
+                r_cur, rel_bias, sinks, table, n_extent, n_head);
+        } else {
+            fixed_relative_bias<false><<<dim3(n_head, rows), 256, 0, cs(stream)>>>(
+                r_cur, rel_bias, sinks, table, n_extent, n_head);
+        }
+    } else {
+        inkling_rel_table_kernel<<<dim3(n_head, rows), 256, 0, cs(stream)>>>(r_cur, rel_bias, sinks, table, n_rel, n_extent,
+                                                                            n_head);
+    }
     ck("inkling_rel_table");
 }
 
@@ -1132,6 +1493,312 @@ void inkling_dspark_attend(const float* q, const uint16_t* kcache, const uint16_
     inkling_attend_join_kernel<false, true><<<dim3(n_head, rows), dim, 0, cs(stream)>>>(
         score, out, n_splits, dim, n_head, (long long) pos, window, at);
     ck("inkling_dspark_attend");
+}
+
+// The tensor cores' m16n8k16 step, ldmatrix and the copies into shared memory, as kernels.cu has them for its
+// attn_flash kernels: from Ampere on (ink_attend_batch() asks the kernel's PTX version).
+#if defined(__HIPCC__) || (defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800)
+#define INK_FLASH 0
+#else
+#define INK_FLASH 1
+#endif
+#if INK_FLASH
+__device__ __forceinline__ void ink_mma(float* c, const uint32_t* a, const uint32_t* b) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+                 "{%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+
+__device__ __forceinline__ void ink_ldsm4(uint32_t* r, const __half* p, bool trans) {
+    const unsigned a = (unsigned) __cvta_generic_to_shared(p);
+    if (trans)
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                     : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+    else
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                     : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+}
+
+__device__ __forceinline__ uint32_t ink_h2(float lo, float hi) {
+    const __half2 h = __floats2half2_rn(lo, hi);
+    return *reinterpret_cast<const uint32_t*>(&h);
+}
+
+// 16 bytes from global to shared memory, or zeros where `whole` is false, a thread's copies a group until
+// ink_cp_wait() (cp.async)
+__device__ __forceinline__ void ink_cp16(__half* dst, const __half* src, bool whole) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
+                 :: "r"((unsigned) __cvta_generic_to_shared(dst)), "l"(src), "r"(whole ? 16 : 0));
+}
+
+__device__ __forceinline__ void ink_cp_commit() { asm volatile("cp.async.commit_group;\n" ::); }
+
+template <int ahead> __device__ __forceinline__ void ink_cp_wait() {
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(ahead));
+}
+#endif
+
+constexpr int kMaxPer = 4;
+constexpr int kFlashTokens = 64, kFlashKeys = 64, kFlashRow = 128 + 8, kFlashRel = 16;
+constexpr size_t kFlashKv = size_t(4) * kFlashKeys * kFlashRow * sizeof(__half);
+constexpr size_t kFlashKvQ = size_t(2) * kFlashKeys * kFlashRow * sizeof(__half);
+
+template <int G, bool QUANT = false>
+__global__ void __launch_bounds__(kFlashTokens / 16 * G * 32, 1) ink_flash_kernel(InkAttn a) {
+#if INK_FLASH
+    constexpr int DIM = 128, KEYS = kFlashKeys, ROW = kFlashRow, NR = kFlashRel, THREADS = kFlashTokens / 16 * G * 32;
+    constexpr int BUFS = QUANT ? 1 : 2;
+    extern __shared__ __align__(16) __half ink_flash_sm[];
+    __half(*ks)[KEYS][ROW] = reinterpret_cast<__half(*)[KEYS][ROW]>(ink_flash_sm);
+    __half(*vs)[KEYS][ROW] = reinterpret_cast<__half(*)[KEYS][ROW]>(ink_flash_sm + BUFS * KEYS * ROW);
+    float* rs = reinterpret_cast<float*>(ink_flash_sm + 2 * BUFS * KEYS * ROW);   // [token of the block][head of G][NR]
+    const int g = blockIdx.y, t0 = blockIdx.x * kFlashTokens, lane = threadIdx.x % 32, w = threadIdx.x / 32;
+    const int gid = lane / 4, tig = lane % 4, hg = w % G, sub = w / G, head = g * G + hg;
+    const int tok[2] = {t0 + 16 * sub + gid, t0 + 16 * sub + gid + 8};
+    for (int i = threadIdx.x; i < kFlashTokens * G * NR; i += THREADS) {
+        const int t = t0 + i / (G * NR);
+        rs[i] = t < a.rows ? a.r[(size_t(t) * a.n_head + g * G + i / NR % G) * NR + i % NR] : 0.0f;
+    }
+    uint32_t qa[8][4];   // a block of 16 values a step
+#pragma unroll
+    for (int k = 0; k < 8; ++k)
+#pragma unroll
+        for (int i = 0; i < 2; ++i)
+#pragma unroll
+            for (int hi = 0; hi < 2; ++hi) {
+                float2 x = make_float2(0.0f, 0.0f);
+                if (tok[i] < a.rows)
+                    x = *reinterpret_cast<const float2*>(a.q + (size_t(tok[i]) * a.n_head + head) * DIM + 16 * k +
+                                                         8 * hi + 2 * tig);
+                qa[k][i + 2 * hi] = ink_h2(x.x, x.y);
+            }
+    float sink[2];
+    for (int i = 0; i < 2; ++i) sink[i] = tok[i] < a.rows ? a.sink[size_t(tok[i]) * a.n_head + head] : 0.0f;
+    float o[16][4], m[2] = {-INFINITY, -INFINITY}, l[2] = {0.0f, 0.0f};
+    for (int n = 0; n < 16; ++n) o[n][0] = o[n][1] = o[n][2] = o[n][3] = 0.0f;
+    // the block's tokens attend positions [lo, hi): from the first one's window to the last one
+    const long long hi = a.pos + min(t0 + kFlashTokens, a.rows);
+    const long long lo = a.window > 0 ? max(0LL, a.pos + t0 - a.window + 1) : 0;
+    const __half* kc = reinterpret_cast<const __half*>(a.keys);
+    const __half* vc = reinterpret_cast<const __half*>(a.vals);
+    const auto fetch = [&](int buf, long long k0) {
+        for (int i = threadIdx.x; i < KEYS * DIM / 8; i += THREADS) {
+            const int r = i / (DIM / 8), c = 8 * (i % (DIM / 8));
+            const long long key = k0 + r;
+            const bool whole = key >= lo && key < hi;   // the others are zeros, which no weight reads
+            const size_t at = whole ? (size_t(a.ring > 0 ? key % a.ring : key) * a.n_kv + g) * DIM + c : 0;
+            ink_cp16(&ks[buf][r][c], kc + at, whole);
+            ink_cp16(&vs[buf][r][c], vc + at, whole);
+        }
+        ink_cp_commit();
+    };
+    const auto fetch_quant = [&](long long k0) {
+        for (int i = threadIdx.x; i < KEYS * (DIM / 8); i += THREADS) {
+            const int r = i / (DIM / 8), s = i % (DIM / 8);
+            const int blk = s >> 2, off_in_blk = (s & 3) * 4;
+            const long long key = k0 + r;
+            const bool whole = key >= lo && key < hi;
+            const size_t row_idx = whole ? size_t(a.ring > 0 ? key % a.ring : key) : 0;
+            const size_t head_row = row_idx * a.n_kv + g;
+            const size_t scale_idx = head_row * (DIM >> 5) + blk;
+            const auto load_q = [&](__half* dst_row, const __half* fp16_cache, Kvq8 q8, Kvq4 q4) {
+                if (!whole) {
+                    *reinterpret_cast<uint4*>(dst_row + s * 8) = make_uint4(0, 0, 0, 0);
+                    return;
+                }
+                if (q8.codes) {
+                    const float sc = __half2float(__ushort_as_half(q8.scales[scale_idx]));
+                    const char4 c0 = *reinterpret_cast<const char4*>(q8.codes + head_row * DIM + s * 8);
+                    const char4 c1 = *reinterpret_cast<const char4*>(q8.codes + head_row * DIM + s * 8 + 4);
+                    half2* h2 = reinterpret_cast<half2*>(dst_row + s * 8);
+                    h2[0] = __floats2half2_rn(float(c0.x) * sc, float(c0.y) * sc);
+                    h2[1] = __floats2half2_rn(float(c0.z) * sc, float(c0.w) * sc);
+                    h2[2] = __floats2half2_rn(float(c1.x) * sc, float(c1.y) * sc);
+                    h2[3] = __floats2half2_rn(float(c1.z) * sc, float(c1.w) * sc);
+                    return;
+                }
+                if (q4.codes) {
+                    const float sc = __half2float(__ushort_as_half(q4.scales[scale_idx]));
+                    const uint32_t p4 = *reinterpret_cast<const uint32_t*>(q4.codes + head_row * (DIM >> 1) + blk * 16 + off_in_blk);
+                    const int b0 = int(p4 & 0xffu);
+                    const int b1 = int((p4 >> 8) & 0xffu);
+                    const int b2 = int((p4 >> 16) & 0xffu);
+                    const int b3 = int(p4 >> 24);
+                    half2* lo_h2 = reinterpret_cast<half2*>(dst_row + blk * 32 + off_in_blk);
+                    half2* hi_h2 = reinterpret_cast<half2*>(dst_row + blk * 32 + off_in_blk + 16);
+                    lo_h2[0] = __floats2half2_rn(float((b0 & 0x0f) - 8) * sc, float((b1 & 0x0f) - 8) * sc);
+                    lo_h2[1] = __floats2half2_rn(float((b2 & 0x0f) - 8) * sc, float((b3 & 0x0f) - 8) * sc);
+                    hi_h2[0] = __floats2half2_rn(float((b0 >> 4) - 8) * sc, float((b1 >> 4) - 8) * sc);
+                    hi_h2[1] = __floats2half2_rn(float((b2 >> 4) - 8) * sc, float((b3 >> 4) - 8) * sc);
+                    return;
+                }
+                *reinterpret_cast<uint4*>(dst_row + s * 8) =
+                    *reinterpret_cast<const uint4*>(fp16_cache + head_row * DIM + s * 8);
+            };
+            load_q(ks[0][r], kc, a.kq8, a.kq4);
+            load_q(vs[0][r], vc, a.vq8, a.vq4);
+        }
+    };
+    const long long first = lo / KEYS * KEYS;
+    int buf = 0;
+    if constexpr (!QUANT) fetch(0, first);
+    for (long long k0 = first; k0 < hi; k0 += KEYS, buf = QUANT ? 0 : (buf ^ 1)) {
+        __syncthreads();   // the buffer the last block was worked on in is free (and rs is written)
+        if constexpr (QUANT) {
+            fetch_quant(k0);
+            __syncthreads();
+        } else {
+            if (k0 + KEYS < hi) {
+                fetch(buf ^ 1, k0 + KEYS);
+                ink_cp_wait<1>();
+            } else {
+                ink_cp_wait<0>();
+            }
+            __syncthreads();
+        }
+        float s[8][4];
+#pragma unroll
+        for (int n = 0; n < 8; ++n) {
+            s[n][0] = s[n][1] = s[n][2] = s[n][3] = 0.0f;
+#pragma unroll
+            for (int k = 0; k < 8; k += 2) {
+                uint32_t b[4];   // keys 8 n.., values 16 k.. and 16 (k + 1)..
+                ink_ldsm4(b, &ks[buf][8 * n + lane % 8][16 * k + 8 * (lane / 8)], false);
+                ink_mma(s[n], qa[k], b);
+                ink_mma(s[n], qa[k + 1], b + 2);
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const long long own = a.pos + tok[i];   // the row's token attends positions (own - window, own]
+            float rr[NR];
+            const float* rp = rs + ((16 * sub + gid + 8 * i) * G + hg) * NR;
+#pragma unroll
+            for (int q = 0; q < NR; ++q) rr[q] = rp[q];
+            float mx = -INFINITY;
+#pragma unroll
+            for (int n = 0; n < 8; ++n)
+#pragma unroll
+                for (int j = 2 * i; j < 2 * i + 2; ++j) {
+                    const long long key = k0 + 8 * n + 2 * tig + j % 2;
+                    float v = -INFINITY;
+                    if (tok[i] < a.rows && key <= own && (a.window <= 0 || key > own - a.window)) {
+                        const long long d = own - key;
+                        float add = 0.0f;
+                        if (d < a.extent) {
+                            const float4* col = reinterpret_cast<const float4*>(a.rel_bias + size_t(d) * NR);
+#pragma unroll
+                            for (int q = 0; q < NR / 4; ++q) {
+                                const float4 c = __ldg(col + q);
+                                add += c.x * rr[4 * q];
+                                add += c.y * rr[4 * q + 1];
+                                add += c.z * rr[4 * q + 2];
+                                add += c.w * rr[4 * q + 3];
+                            }
+                        }
+                        v = s[n][j] * a.scale;
+                        v += add - sink[i];
+                    }
+                    s[n][j] = v;
+                    mx = fmaxf(mx, v);
+                }
+            mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 1));
+            mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 2));
+            const float now = fmaxf(m[i], mx), base = now == -INFINITY ? 0.0f : now;
+            const float f = expf(m[i] - base);
+            m[i] = now;
+            l[i] *= f;
+#pragma unroll
+            for (int n = 0; n < 16; ++n) {
+                o[n][2 * i] *= f;
+                o[n][2 * i + 1] *= f;
+            }
+#pragma unroll
+            for (int n = 0; n < 8; ++n)
+#pragma unroll
+                for (int j = 2 * i; j < 2 * i + 2; ++j) {
+                    s[n][j] = __half2float(__float2half(expf(s[n][j] - base)));   // the weight the values get
+                    l[i] += s[n][j];
+                }
+        }
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {   // keys 16 k..: the weights as an A fragment
+            const uint32_t pa[4] = {ink_h2(s[2 * k][0], s[2 * k][1]), ink_h2(s[2 * k][2], s[2 * k][3]),
+                                    ink_h2(s[2 * k + 1][0], s[2 * k + 1][1]), ink_h2(s[2 * k + 1][2], s[2 * k + 1][3])};
+#pragma unroll
+            for (int n = 0; n < 16; n += 2) {
+                uint32_t b[4];   // keys 16 k.., values 8 n.. and 8 (n + 1)..
+                ink_ldsm4(b, &vs[buf][16 * k + lane % 8 + 8 * (lane / 8 % 2)][8 * n + 8 * (lane / 16)], true);
+                ink_mma(o[n], pa, b);
+                ink_mma(o[n + 1], pa, b + 2);
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        l[i] += __shfl_xor_sync(0xffffffffu, l[i], 1);
+        l[i] += __shfl_xor_sync(0xffffffffu, l[i], 2);
+        if (tok[i] >= a.rows) continue;
+        const float inv = 1.0f / (l[i] + expf(0.0f - m[i]));   // the term of score 0, against the row's top
+        const size_t at = (size_t(tok[i]) * a.n_head + head) * DIM + 2 * tig;
+#pragma unroll
+        for (int n = 0; n < 16; ++n)
+#pragma unroll
+            for (int e = 0; e < 2; ++e) {
+                float v = o[n][2 * i + e] * inv;
+                if (a.gate) v *= 1.0f / (1.0f + expf(-a.gate[at + 8 * n + e]));   // ink_mul_sigmoid_kernel's
+                a.out[at + 8 * n + e] = v;
+            }
+    }
+#else
+    (void) a;   // ink_attend_batch() launches it only where the PTX has the steps
+#endif
+}
+
+bool ink_attend_batch(const InkAttn& a, void* stream) {
+#if defined(__HIPCC__)
+    (void) a, (void) stream;
+    return false;   // the kernel is NVIDIA's tensor cores' (INK_FLASH)
+#else
+    if (a.rows <= 0) return true;
+    static const bool off = [] {   // STRATA_INK_FLASH=0: attend_batch()'s path
+        const char* v = std::getenv("STRATA_INK_FLASH");
+        return v && v[0] == '0';
+    }();
+    const int per = a.n_kv > 0 && a.n_head % a.n_kv == 0 ? a.n_head / a.n_kv : 0;
+    if (off) return false;
+    if (a.dim != 128 || a.n_rel != kFlashRel || per < 1 || per > kMaxPer || a.at || a.q8 || a.kv8) return false;
+    static const int ptx = [] {
+        cudaFuncAttributes f{};
+        return cudaFuncGetAttributes(&f, ink_flash_kernel<1, false>) == cudaSuccess ? f.ptxVersion : 0;
+    }();
+    if (ptx < 80) return false;
+    const bool has_quant = a.kq8.codes || a.vq8.codes || a.kq4.codes || a.vq4.codes;
+    const auto launch = [&](auto kernel, int g) {
+        const size_t smem = (has_quant ? kFlashKvQ : kFlashKv) + (size_t) kFlashTokens * g * kFlashRel * sizeof(float);
+        const cudaError_t e = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
+        if (e != cudaSuccess) throw std::runtime_error(std::string("ink_attend_batch: shared memory: ") + cudaGetErrorString(e));
+        kernel<<<dim3(grid((size_t) a.rows, kFlashTokens), a.n_kv), kFlashTokens / 16 * g * 32, smem, cs(stream)>>>(a);
+    };
+    if (has_quant) {
+        switch (per) {
+            case 1: launch(ink_flash_kernel<1, true>, 1); break;
+            case 2: launch(ink_flash_kernel<2, true>, 2); break;
+            case 3: launch(ink_flash_kernel<3, true>, 3); break;
+            default: launch(ink_flash_kernel<4, true>, 4); break;
+        }
+    } else {
+        switch (per) {
+            case 1: launch(ink_flash_kernel<1, false>, 1); break;
+            case 2: launch(ink_flash_kernel<2, false>, 2); break;
+            case 3: launch(ink_flash_kernel<3, false>, 3); break;
+            default: launch(ink_flash_kernel<4, false>, 4); break;
+        }
+    }
+    ck("ink_flash");
+    return true;
+#endif
 }
 
 void inkling_attend_batch(void* blas, const float* q, const uint16_t* kcache, const uint16_t* vcache,

@@ -131,6 +131,56 @@ int run_case(const Quant& q, const std::vector<int>& rows, const std::vector<int
     return bad;
 }
 
+int test_quantize_dedup(std::mt19937& rng) {
+    constexpr int n_tokens = 64;
+    constexpr int n_rows = 512;
+    constexpr int cols = 2304;   // Inkling 2 embedding dimension
+    std::uniform_real_distribution<float> fdist(-1.0f, 1.0f);
+    std::uniform_int_distribution<int32_t> idist(0, n_tokens - 1);
+
+    std::vector<float> h_x(n_tokens * cols);
+    for (float& v : h_x) v = fdist(rng);
+
+    std::vector<int32_t> h_ids(n_rows);
+    for (int32_t& id : h_ids) id = idist(rng);
+
+    float* d_x = upload(h_x);
+    int32_t* d_ids = upload(h_ids);
+
+    const size_t bytes_rows = Mmq::q8_bytes(n_rows, cols);
+    const size_t bytes_tokens = Mmq::q8_bytes(n_tokens, cols);
+
+    void *d_xq_base = nullptr, *d_xq_dedup = nullptr, *d_xq_tokens = nullptr;
+    cudaMalloc(&d_xq_base, bytes_rows);
+    cudaMalloc(&d_xq_dedup, bytes_rows);
+    cudaMalloc(&d_xq_tokens, bytes_tokens);
+    cudaMemset(d_xq_base, 0, bytes_rows);
+    cudaMemset(d_xq_dedup, 0, bytes_rows);
+    cudaMemset(d_xq_tokens, 0, bytes_tokens);
+
+    // Q8_0 matrix quant (type 8)
+    Mmq::quantize(d_x, d_ids, d_xq_base, 8, cols, cols, n_rows, nullptr);
+    Mmq::quantize_dedup(d_x, d_ids, d_xq_dedup, d_xq_tokens, 8, cols, cols, n_tokens, n_rows, nullptr);
+    cudaDeviceSynchronize();
+
+    std::vector<uint8_t> h_base(bytes_rows), h_dedup(bytes_rows);
+    cudaMemcpy(h_base.data(), d_xq_base, bytes_rows, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_dedup.data(), d_xq_dedup, bytes_rows, cudaMemcpyDeviceToHost);
+
+    cudaFree(d_x);
+    cudaFree(d_ids);
+    cudaFree(d_xq_base);
+    cudaFree(d_xq_dedup);
+    cudaFree(d_xq_tokens);
+
+    if (std::memcmp(h_base.data(), h_dedup.data(), bytes_rows) != 0) {
+        std::printf("FAIL: quantize_dedup bitwise divergence from quantize baseline (%zu bytes checked)\n", bytes_rows);
+        return 1;
+    }
+    std::printf("PASS: quantize_dedup matches quantize baseline byte-for-byte (%zu bytes checked)\n", bytes_rows);
+    return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -140,6 +190,7 @@ int main() {
         return 77;
     }
     std::mt19937 rng(7);
+    if (test_quantize_dedup(rng) != 0) return 1;
     struct Dist { const char* name; std::vector<int> rows; };
     std::vector<Dist> dists;
     {   // many small experts and a few large, as a prompt batch's staged experts are

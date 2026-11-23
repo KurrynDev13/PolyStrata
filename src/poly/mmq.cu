@@ -136,6 +136,50 @@ void Mmq::quantize(const float* x, const int32_t* ids, void* xq, int type, int64
     ck("mmq quantize");
 }
 
+__global__ void gather_mmq_q8_1_kernel(const void* __restrict__ src_tokens,
+                                       const int32_t* __restrict__ ids,
+                                       void* __restrict__ dst_rows,
+                                       int64_t n_tokens, int64_t n_rows, int64_t n_blocks) {
+    const int64_t r = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t k = (int64_t) blockIdx.y * blockDim.y + threadIdx.y;
+    if (r >= n_rows || k >= n_blocks) return;
+    const int32_t tok = ids[r];
+    constexpr size_t kBlockBytes = sizeof(block_q8_1_mmq);
+    const uint4* src = (const uint4*) ((const char*) src_tokens + (k * n_tokens + tok) * kBlockBytes);
+    uint4* dst = (uint4*) ((char*) dst_rows + (k * n_rows + r) * kBlockBytes);
+#pragma unroll
+    for (int i = 0; i < 9; ++i) {
+        dst[i] = src[i];
+    }
+}
+
+void Mmq::quantize_dedup(const float* x, const int32_t* ids, void* xq, void* xq_tokens,
+                         int type, int64_t cols, int64_t ld, int64_t n_tokens,
+                         int64_t rows, void* stream) {
+    if (rows <= 0 || n_tokens <= 0) return;
+    if (!ids || !xq_tokens) {
+        quantize(x, ids, xq, type, cols, ld, rows, stream);
+        return;
+    }
+    const ggml_type t = (ggml_type) type;
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const bool nv = t == GGML_TYPE_NVFP4 && nvfp4_fp4(cc);
+    if ((t == GGML_TYPE_MXFP4 && blackwell_mma_available(cc)) || nv) {
+        quantize(x, ids, xq, type, cols, ld, rows, stream);
+        return;
+    }
+
+    quantize(x, nullptr, xq_tokens, type, cols, ld, n_tokens, stream);
+
+    const int64_t n_blocks = pad512(cols) / QK8_1_MMQ;
+    const dim3 block_dim(32, 4);
+    const dim3 grid_dim((int) ((rows + block_dim.x - 1) / block_dim.x),
+                        (int) ((n_blocks + block_dim.y - 1) / block_dim.y));
+    gather_mmq_q8_1_kernel<<<grid_dim, block_dim, 0, (cudaStream_t) stream>>>(
+        xq_tokens, ids, xq, n_tokens, rows, n_blocks);
+    ck("mmq quantize dedup gather");
+}
+
 void Mmq::mul(const void* w, int type, int64_t w_rows, int64_t w_cols, size_t stride, int n, const void* xq,
               const int32_t* bounds, const int32_t* ids, int64_t total_rows, int64_t max_rows, float* dst,
               int64_t ld_dst, void* stream) {

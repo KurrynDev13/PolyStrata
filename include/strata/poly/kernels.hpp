@@ -443,12 +443,41 @@ void inkling_control_prep(const float* cur, const float* msg, float* out_concat,
 void inkling_control_apply(const float* cur, const float* msg, const float* gain_raw, const float* forget_raw,
                            float* out, int n_embd, int rows, void* stream, int gf_stride = 0);
 
+/// Fuses cross-pass [rms_norm(cur) | rms_norm(msg)] and GEMV down-projection into one wave.
+/// `count` is 1 to 3 controllers, `down` points to weight matrices [rank, 2 * n_embd],
+/// and writes outputs to `ch` [rows, rank].
+bool ink_ctrl_down(const float* const* cur, const float* const* msg, const float* const* down, float* const* ch,
+                   int count, int n_embd, int rank, int rows, void* stream);
+
 /// Causal 4-tap short convolution + residual + 1/sqrt(5) (static) or 1/3 (dynamic) scaling.
 /// `state` holds 3 past inputs per channel, oldest first. When `dyn` is non-null ([rows, n_heads, 4]),
 /// dynamic taps apply in reverse lag order: lag 0 multiplies x[t], lag 3 multiplies x[t - 3].
 void inkling_conv4(const float* x, float* state, const float* w, const float* dyn, int head_dim, float* out,
                    int channels, int rows, void* stream, float* snap = nullptr, size_t stride = 0,
                    unsigned snaps = 0);
+
+struct InkConv {
+    const float* x = nullptr;
+    int x_stride = 0;   ///< row stride in floats (0 = channels)
+    float* state = nullptr;
+    const float* w = nullptr;
+    const float* dyn = nullptr;
+    float* out = nullptr;
+    float* snap = nullptr;
+    float* acc = nullptr;
+    float* keep = nullptr;
+    float a = 1.0f;
+    float norm = 0.0f;
+    int mode = 0;   // 0: acc += y * a; 1: keep = acc, acc = y; 2: acc = y
+};
+
+/// Fused multi-job causal 4-tap short convolution (up to 2 jobs in parallel, e.g. K and V).
+void ink_conv_few(const InkConv& j0, const InkConv& j1, int channels, int head_dim, int rows, void* stream,
+                  float* snap = nullptr, size_t stride = 0, unsigned snaps = 0);
+
+/// Unpacks strided multi-row output from wq_fused [rows, stride] into contiguous qraw, gate, and optional r_raw/sinks.
+void inkling_unpack_q_fused(const float* src, float* qraw, float* gate, float* r_raw, float* sinks, int q_dim,
+                            int rel_dim, int n_head, int rel_off, int sink_off, int stride, int rows, void* stream);
 
 /// Optional per-channel `scale` multiply, per-head L2 norm clamp `<= threshold`, and (if `is_global`)
 /// log-scale tau(pos) = 1 + log_alpha * ln(max(1, (pos + 1) / log_floor)). Supports `at` for CUDA graphs.
@@ -459,7 +488,7 @@ void inkling_l2_clip(const float* x, const float* scale, float* out, int dim, in
 /// Per-query relative-position distance bias table:
 /// table[(t * n_head + h) * n_extent + d] = dot(r_cur[t, h], rel_bias[d]) - sinks[t, h] for d in [0, n_extent).
 void inkling_rel_table(const float* r_cur, const float* rel_bias, const float* sinks, float* table, int n_rel,
-                       int n_extent, int n_head, int rows, void* stream);
+                       int n_extent, int n_head, int rows, void* stream, bool term_major = false);
 
 /// Block-32 symmetric 4-bit KV cache (`--kv q4_0` for inkling2): `n` values pack into `n / 2` bytes (`elem[b*32+i]`
 /// in the low nibble, `elem[b*32+i+16]` in the high nibble, stored as `clamp(round(x / scale), -8, 7) + 8`), with one
@@ -489,6 +518,35 @@ void inkling_attend_batch(void* blas, const float* q, const uint16_t* kcache, co
                           float scale, void* stream, int window = 0, int ring = 0, Kvq8 kq8 = {}, Kvq8 vq8 = {},
                           uint16_t* kwork = nullptr, uint16_t* vwork = nullptr, size_t work_halves = 0,
                           Kvq4 kq4 = {}, Kvq4 vq4 = {});
+
+/// Parameters for fused FlashAttention-2 prompt-batch and decode attention.
+struct InkAttn {
+    const float* q = nullptr;        ///< rows * n_head * dim
+    const float* r = nullptr;        ///< rows * n_head * n_rel
+    const float* sink = nullptr;     ///< rows * n_head
+    const uint16_t* keys = nullptr;  ///< n_kv * dim halves a cache row
+    const uint16_t* vals = nullptr;
+    const float* rel_bias = nullptr; ///< n_rel values a distance, `extent` distances
+    const float* gate = nullptr;     ///< rows * n_head * dim: out times sigmoid(gate) (ink_mul_sigmoid()); null: none
+    void* q8 = nullptr;              ///< one token: out also quantized here, native_quantize_q8_1()'s bytes
+    float* out = nullptr;            ///< rows * n_head * dim
+    float* score = nullptr;
+    size_t score_n = 0;
+    int64_t pos = 0;
+    const long long* at = nullptr;
+    int room = 0;
+    int rows = 0, n_head = 0, n_kv = 0, dim = 0, n_rel = 0, extent = 0, window = 0, ring = 0;
+    float scale = 1.f;
+    bool kv8 = false;
+    Kvq8 kq8{}, vq8{};
+    Kvq4 kq4{}, vq4{};
+};
+
+/// ink_attend() of a prompt batch on the tensor cores, its scores never written out (FlashAttention-2's way): the
+/// scores attend_batch() with an AttnBias makes, the weights rounded to halves for the values' product, then the gate
+/// when a.gate is set. Heads of 128 values, up to 4 on a key head, 16 relative values, positions on the host, no q8;
+/// a card from Ampere on. False, with nothing launched, where it does not take them.
+bool ink_attend_batch(const InkAttn& a, void* stream);
 
 /// Pick count tracking for experts routed on card.
 void count_picks(const int32_t* ids, int rr, int n_expert, int32_t* uses, void* stream);
