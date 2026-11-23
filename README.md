@@ -10,7 +10,7 @@ It is an independent fork measured carefully on one PC. It is not affiliated wit
 - **Upstream README** (the other models and general multi-model guide) is preserved at [README.upstream.md](README.upstream.md).
 - **Deep-dive documentation:** [docs/INKLING2.md](docs/INKLING2.md) and [Inkling 2 Mini Benchmark.md](Inkling%202%20Mini%20Benchmark.md).
 
-![PolyStrata Inkling 2 Benchmark Card](docs/img/inkling2-card.png)
+![PolyStrata Inkling 2 Benchmark Card](docs/img/inkling2-card-v2.png)
 
 ---
 
@@ -39,7 +39,7 @@ Measured on Windows 11 with Visual Studio 2026 / CUDA 13.5 (`sm_89`), commit `67
 
 ## Memory Architecture
 
-![Memory Layout & Generation Speed](docs/img/inkling2-summary.png)
+![Memory Layout & Generation Speed](docs/img/inkling2-summary-v2.png)
 
 1. **Layer Looping**: 24 physical layers executed across 48 logical steps (prelude layers 0–5, looped core layers 6–17 × 3 passes with rank-64 cross-pass gated residual controllers, epilogue layers 18–23).
 2. **Asymmetric KV Cache (`--kv k8v4`)**:

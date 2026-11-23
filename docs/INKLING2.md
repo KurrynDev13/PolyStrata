@@ -2,7 +2,7 @@
 
 Inkling 2 Mini is a 48-virtual-layer looped Mixture-of-Experts (MoE) model (`26B-A3B`) developed by Thinking Machines Lab. PolyStrata runs Inkling 2 Mini on consumer hardware (12 GB VRAM + 32 GB RAM) with native CUDA acceleration, speculative Multi-Token Prediction (DSpark MTP), asymmetric Q8/Q4 KV caching, pinned-memory doorbell asynchronous offload, and whole-pass CUDA graph capture.
 
-![PolyStrata Inkling 2 Benchmark Card](img/inkling2-card.png)
+![PolyStrata Inkling 2 Benchmark Card](img/inkling2-card-v2.png)
 
 ---
 
@@ -31,7 +31,7 @@ Measured on Windows 11 with Visual Studio 2026 / CUDA 13.5 (`sm_89`), commit `67
 
 ## Memory Architecture
 
-![Memory Layout & Generation Speed](img/inkling2-summary.png)
+![Memory Layout & Generation Speed](img/inkling2-summary-v2.png)
 
 1. **Layer Looping**: 24 physical layers executed across 48 logical steps (prelude layers 0–5, looped core layers 6–17 × 3 passes with rank-64 cross-pass gated residual controllers, epilogue layers 18–23).
 2. **Asymmetric KV Cache (`--kv k8v4`)**:
