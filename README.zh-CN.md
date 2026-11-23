@@ -53,6 +53,7 @@ Ryzen 9 7900X (12 核 24 线程, AVX-512) · RTX 4070 SUPER 12 GB (`sm_89`) · D
 | `--kv k8v4` / `q4_0` 与 GQA-3 分组注意力核 | 8-bit K + 4-bit V 混合 KV（`13 KiB/tok`），24Q/8KV 分组寄存器复用减少 3 倍全局 KV 带宽，支持最高 `1M` 虚拟上下文 | 181K 下比 `q8_0` 省 `~800 MiB` 显存，32K 解码 **+9.1 %** |
 | 路由缓存偏置 `--cache-bias 0.2`（保持无偏 Sigmoid 权重） | Top-8 路由选专家时轻度偏向显存内专家，最终仍按未加偏置的原始 logits 计算 Sigmoid 权重 | 12 GB 显卡显存专家命中率提升至 `94–96 %` |
 | `647ae64e` 精选内核快速路径 | 原地 `inkling_add_to_stream` 减少 88 次内核启动、移除 40 次 SWA `cudaMemcpyAsync`、向量化 KV 反量化预热及 DSpark FFN 融合 | 冻结 `--window 1` **+13.1 %** (`52.8 -> 59.7 tok/s`) |
+| 官方 Doorbell 与整图 CUDA Graph 优化 (`202c1ad8`) | 锁页内存异步 `ExpertBell` 卸载、整趟 48 层单 CUDA Graph 捕获、模板化 `<bool KV8>` 内核与 `--loop-bf16` | **纯解码速度提升 3.53 倍** (`15.4 -> 54.3 tok/s`)，路由器等待由 33.3 ms 降至 **0.1 ms/tok** |
 
 ## 启用与不启用 DSpark MTP 的运行模式
 

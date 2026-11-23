@@ -53,6 +53,7 @@ All Inkling-2-Mini engine work lives in `src/poly/inkling2.*`, `src/poly/kernels
 | `--kv k8v4` & `--kv q4_0` + GQA-3 grouped kernel (`inkling_attend_split_gqa_kernel<3>`) | `Q8_0` keys + `Q4_0` values (`13 KiB/tok`) or 4-bit KV (`9 KiB/tok`), 3x global KV bandwidth cut across 24Q/8KV heads, CUDA VMM `--kv-grow` to `1M` `max_context` | Saves `~800 MiB` at 181K over `q8_0`; `+9.1 %` @ 32K |
 | `--cache-bias 0.2` with unbiased sigmoid weights | Gently favors VRAM-resident experts during router top-8 selection while recomputing final weights from unbiased logits | `94–96 %` VRAM expert hit rate on 12 GB |
 | Tuned `647ae64e` kernel fast path | In-place `inkling_add_to_stream`, 40 fewer SWA `cudaMemcpyAsync` calls, `ctrl_arena` aliasing, vectorized `dequant_q8/q4` + SWA pre-dequantization, DSpark `gate_up_proj` SwiGLU fusion | **+13.1 %** frozen `--window 1` (`52.8 -> 59.7 tok/s`), **+9.1 %** 32K decode, **+5.2 %** 120K prefill |
+| Official PolyStrata Doorbell & Graph optimizations (`202c1ad8`) | Pinned-memory async `ExpertBell` offload, whole-pass CUDA Graph capture, templated `<bool KV8>` kernels, `--loop-bf16` | **3.53x faster pure decode** (`15.4 -> 54.3 tok/s`), router wait cut from 33.3 ms to **0.1 ms/tok** |
 
 ## Running with or without DSpark MTP
 

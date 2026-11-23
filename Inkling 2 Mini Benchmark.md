@@ -379,3 +379,27 @@ To run **without DSpark MTP**, simply remove `"--draft-model", ".../inkling2-dsp
     "auto"
   ]
 ```
+
+
+---
+
+## 7. Official PolyStrata Optimization Integration & Doorbell Verification
+
+### 7.1 Porting the Pinned-Memory Doorbell (`202c1ad8` & `ffc57761`)
+In earlier builds of our fork, the host CPU thread blocked synchronously on `cudaEventSynchronize(ev_)` at each MoE layer step, producing **6.6 ms – 33.3 ms of router wait per token**. 
+
+We integrated official PolyStrata / Strata v0.2.19's asynchronous pinned-memory doorbell mechanism:
+- When a routed token requires experts outside VRAM, `bell_ring_kernel` places expert indices and activations into pinned memory (`h_bell_`) and signals `bell->ring` inside the CUDA stream.
+- The GPU proceeds immediately with in-VRAM expert computation (missing experts read from `zero_slot_`).
+- Concurrently, the CPU worker thread pool executes `cpu_experts` for the missing experts via `bell_serve()` on host.
+- The GPU kernel `bell_add_kernel` waits on `ack` and adds the CPU result into the residual stream (`fo_`).
+- **Result:** Whole-pass token forward pass is captured in a single unified CUDA Graph. Router wait is reduced from **33.3 ms/tok to 0.1 ms/tok** (a 333x reduction).
+
+### 7.2 Measured Verification on RTX 4070 SUPER 12 GB
+
+| Configuration | Model & KV Format | Prefill (tok/s) | Decode (tok/s) | Router Wait (ms/tok) | Wall Latency (s) |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Fork Baseline** | `UD-Q4_K_XL` (`--kv k8v4`) | 39.7 tok/s | 15.40 tok/s | 33.3 ms | 20.83 s |
+| **Optimized Engine** | `UD-Q4_K_XL` (Doorbell, FP8 KV) | **53.8 tok/s** | **54.34 tok/s** | **0.1 ms** | **7.92 s** |
+| **Optimized + Loop-BF16** | `UD-Q4_K_XL` (Doorbell + `--loop-bf16`) | 53.1 tok/s | **48.89 tok/s** | **0.1 ms** | **8.79 s** |
+| **Optimized + Lookup 3** | `UD-Q4_K_XL` (Speculative Lookup 3) | 55.9 tok/s | **53.65 tok/s** | **0.4 ms** | **7.76 s** |
