@@ -24,6 +24,7 @@ __pycache__/
 *.npz
 *.occ1
 td.log
+/tests/benchmarks/
 
 # created by setup.py on the user's machine
 /.venv/
