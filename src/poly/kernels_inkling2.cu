@@ -1317,7 +1317,7 @@ __global__ void inkling_attend_split_gqa_kernel(const float* __restrict__ q, con
     }
 }
 
-template <bool ZERO_SINK = true, bool WHOLE = false>
+template <bool ZERO_SINK = true, bool WHOLE = false, bool SCAN_ALL = false>
 __global__ void inkling_attend_join_kernel(const float* __restrict__ partials, float* __restrict__ out, int n_splits,
                                            int dim, int n_head, long long pos, int window,
                                            const long long* __restrict__ at, const float* __restrict__ gate,
@@ -1327,15 +1327,17 @@ __global__ void inkling_attend_join_kernel(const float* __restrict__ partials, f
     const int d = threadIdx.x;
     if (d >= dim) return;
 
-    const long long q_pos = at ? at[2 * t] : pos + t;
-    const long long p0 = at ? at[0] : pos;
-    long long lo;
-    const int total = WHOLE ? [&]() {
-        lo = window > 0 && q_pos >= window ? q_pos - window + 1 : 0;
-        return int((p0 + gridDim.y - 1) - lo) + 1;
-    }() : attn_rows_span(q_pos, window, &lo);
-    const int per_split = max(SPLIT_KEYS, (total + n_splits - 1) / n_splits);
-    const int active = min(n_splits, (total + per_split - 1) / per_split);
+    const int active = SCAN_ALL ? n_splits : [&]() {
+        const long long q_pos = at ? at[2 * t] : pos + t;
+        const long long p0 = at ? at[0] : pos;
+        long long lo;
+        const int total = WHOLE ? [&]() {
+            lo = window > 0 && q_pos >= window ? q_pos - window + 1 : 0;
+            return int((p0 + gridDim.y - 1) - lo) + 1;
+        }() : attn_rows_span(q_pos, window, &lo);
+        const int per_split = max(SPLIT_KEYS, (total + n_splits - 1) / n_splits);
+        return min(n_splits, (total + per_split - 1) / per_split);
+    }();
     const int pstride = dim + 2;
     const float* base = partials + (size_t(t) * n_head + h) * n_splits * pstride;
 
@@ -1942,6 +1944,13 @@ void store_q4_at(const float* x, uint8_t* codes, uint16_t* scales, int n, const 
     ck("store_q4_at");
 }
 
+static bool ink_mma_dec_enabled();
+static void launch_inkling_attend_mma(bool whole, const float* q, const uint16_t* kcache, const uint16_t* vcache,
+                                      const float* sinks, int n_extent, long long pos, int rows, float* partials,
+                                      int n_splits, int dim, int n_head, int kv_heads, float scale, int window,
+                                      int ring, const long long* at, Kvq8 kq8, Kvq8 vq8, Kvq4 kq4, Kvq4 vq4,
+                                      const float* r_cur, const float* rel_bias, void* stream);
+
 void inkling_attend(const float* q, const uint16_t* kcache, const uint16_t* vcache, const float* table,
                     const float* sinks, int n_extent, int64_t pos, int rows, float* score, int chunk, float* out,
                     int dim, int n_head, int kv_heads, float scale, void* stream, int window, int ring,
@@ -1952,6 +1961,20 @@ void inkling_attend(const float* q, const uint16_t* kcache, const uint16_t* vcac
     if (dim > 128) throw std::invalid_argument("inkling_attend: head dim must be <= 128");
     if (out_q8 && (dim & 31) != 0) throw std::invalid_argument("inkling_attend: out_q8 requires dim % 32 == 0");
     const long long max_pos = at ? (long long) room : (long long) pos + rows - 1;
+    const int span_mma = window > 0 ? std::min<int>((int) (max_pos + 1), window + rows - 1) : (int) (max_pos + 1);
+    if (!table && rows >= 2 && span_mma >= 64 && dim == 128 && n_head == kv_heads * 3 && n_rel == 16 &&
+        ink_mma_dec_enabled()) {
+        if (!r_cur || !rel_bias)
+            throw std::invalid_argument("inkling_attend: direct relative bias requires dim=128, n_head=3*kv_heads, n_rel=16");
+        const int n_splits_mma = std::clamp((span_mma + 63) / 64, 1, MAX_SPLITS);
+        launch_inkling_attend_mma(false, q, kcache, vcache, sinks, n_extent, (long long) pos, rows, score,
+                                  n_splits_mma, dim, n_head, kv_heads, scale, window, ring, at, kq8, vq8, kq4, vq4,
+                                  r_cur, rel_bias, stream);
+        inkling_attend_join_kernel<true, false, true><<<dim3(n_head, rows), dim, 0, cs(stream)>>>(
+            score, out, n_splits_mma, dim, n_head, (long long) pos, window, at, gate, (Q81Block*) out_q8);
+        ck("inkling_attend");
+        return;
+    }
     const int span = window > 0 ? std::min<int>((int) (max_pos + 1), window) : (int) (max_pos + 1);
     const int n_splits = std::clamp((span + SPLIT_KEYS - 1) / SPLIT_KEYS, 1, MAX_SPLITS);
     if (!table) {
@@ -1983,6 +2006,16 @@ void inkling_dspark_attend(const float* q, const uint16_t* kcache, const uint16_
     if (dim > 128) throw std::invalid_argument("inkling_dspark_attend: head dim must be <= 128");
     const long long max_pos = at ? (long long) room : (long long) pos + rows - 1;
     const int span = window > 0 ? std::min<int>((int) (max_pos + 1), window + rows - 1) : (int) (max_pos + 1);
+    if (rows >= 2 && span >= 64 && dim == 128 && n_head == kv_heads * 3 && ink_mma_dec_enabled()) {
+        const int n_splits_mma = std::clamp((span + 63) / 64, 1, MAX_SPLITS);
+        launch_inkling_attend_mma(true, q, kcache, vcache, nullptr, 0, (long long) pos, rows, score,
+                                  n_splits_mma, dim, n_head, kv_heads, scale, window, ring, at, kq8, vq8, kq4, vq4,
+                                  nullptr, nullptr, stream);
+        inkling_attend_join_kernel<false, true, true><<<dim3(n_head, rows), dim, 0, cs(stream)>>>(
+            score, out, n_splits_mma, dim, n_head, (long long) pos, window, at, nullptr, nullptr);
+        ck("inkling_dspark_attend");
+        return;
+    }
     const int n_splits = std::clamp((span + SPLIT_KEYS - 1) / SPLIT_KEYS, 1, MAX_SPLITS);
     if (dim == 128 && n_head == kv_heads * 3) {
         inkling_attend_split_gqa_kernel<3, true, false><<<dim3(n_splits, kv_heads, rows), 128, 0, cs(stream)>>>(
@@ -2041,6 +2074,340 @@ template <int ahead> __device__ __forceinline__ void ink_cp_wait() {
     asm volatile("cp.async.wait_group %0;\n" :: "n"(ahead));
 }
 #endif
+
+template <bool WHOLE>
+__global__ void __launch_bounds__(128, 3) inkling_attend_split_mma_kernel(
+    const float* __restrict__ q, const uint16_t* __restrict__ kcache, const uint16_t* __restrict__ vcache,
+    const float* __restrict__ sinks, int n_extent, long long pos, int rows, float* __restrict__ partials,
+    int n_splits, int dim, int n_head, int kv_heads, float scale, int window, int ring,
+    const long long* __restrict__ at, Kvq8 kq8, Kvq8 vq8, Kvq4 kq4, Kvq4 vq4,
+    const float* __restrict__ r_cur, const float* __restrict__ rel_bias) {
+#if INK_FLASH
+    constexpr int DIM = 128;
+    constexpr int CHUNK = 64;
+    constexpr int LD = DIM + 8;
+    constexpr int BM = 16;
+    const int s = blockIdx.x;
+    const int kv_h = blockIdx.y;
+    const int m0 = blockIdx.z * BM;
+    const int M = rows * 3;
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int gid = lane >> 2;
+    const int tig = lane & 3;
+
+    const long long p0 = at ? at[0] : pos;
+    long long p_min = pos;
+    long long p_max = pos + rows - 1;
+    if (at) {
+        p_min = at[0];
+        p_max = at[0];
+        for (int t = 1; t < rows; ++t) {
+            const long long qp = at[2 * t];
+            p_min = min(p_min, qp);
+            p_max = max(p_max, qp);
+        }
+    }
+    const long long lo_all = (window > 0 && p_min >= window) ? p_min - window + 1 : 0;
+    const long long hi_all = WHOLE ? (p0 + rows - 1) : p_max;
+    const int total_all = int(hi_all - lo_all) + 1;
+    const int per_split = max(CHUNK, (total_all + n_splits - 1) / n_splits);
+    const int k_begin = s * per_split;
+    const int k_end = min(total_all, k_begin + per_split);
+
+    if (k_begin >= total_all) {
+        if (tid < BM) {
+            const int m = m0 + tid;
+            if (m < M) {
+                const int t = m / 3;
+                const int h = kv_h * 3 + (m % 3);
+                float* dst = partials + (((size_t(t) * n_head + h) * n_splits + s) * (DIM + 2));
+                dst[DIM] = -INFINITY;
+                dst[DIM + 1] = 0.0f;
+            }
+        }
+        return;
+    }
+
+    __shared__ __align__(16) __half kvs[CHUNK][LD];
+    __shared__ float sm_m[4][BM];
+    __shared__ float sm_l[4][BM];
+    __shared__ float sm_r[BM][16];
+
+    if constexpr (!WHOLE) {
+        for (int i = tid; i < BM * 16; i += 128) {
+            const int rm = m0 + (i >> 4);
+            const int col = i & 15;
+            float val = 0.0f;
+            if (rm < M) {
+                const int t = rm / 3;
+                const int h = kv_h * 3 + (rm % 3);
+                val = r_cur[(size_t(t) * n_head + h) * 16 + col];
+            }
+            sm_r[i >> 4][col] = val;
+        }
+    }
+
+    const int m_row[2] = {m0 + gid, m0 + gid + 8};
+    long long q_pos_i[2] = {0, 0};
+    long long lo_row[2] = {0, 0};
+    long long hi_row[2] = {-1, -1};
+    float neg_sink[2] = {0.0f, 0.0f};
+    uint32_t qa[8][4];
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int mr = m_row[i];
+        const float* qp = nullptr;
+        if (mr < M) {
+            const int t = mr / 3;
+            const int h = kv_h * 3 + (mr % 3);
+            q_pos_i[i] = at ? at[2 * t] : pos + t;
+            lo_row[i] = (window > 0 && q_pos_i[i] >= window) ? q_pos_i[i] - window + 1 : 0;
+            hi_row[i] = WHOLE ? (p0 + rows - 1) : q_pos_i[i];
+            if constexpr (!WHOLE) neg_sink[i] = -sinks[size_t(t) * n_head + h];
+            qp = q + (size_t(t) * n_head + h) * DIM;
+        }
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+#pragma unroll
+            for (int hi = 0; hi < 2; ++hi) {
+                const float2 x = qp ? *reinterpret_cast<const float2*>(qp + 16 * k + 8 * hi + 2 * tig)
+                                    : make_float2(0.0f, 0.0f);
+                qa[k][i + 2 * hi] = ink_h2(x.x, x.y);
+            }
+        }
+    }
+
+    float o[16][4];
+    float m[2] = {-INFINITY, -INFINITY};
+    float l[2] = {0.0f, 0.0f};
+#pragma unroll
+    for (int n = 0; n < 16; ++n) o[n][0] = o[n][1] = o[n][2] = o[n][3] = 0.0f;
+
+    const __half* kc = reinterpret_cast<const __half*>(kcache);
+    const __half* vc = reinterpret_cast<const __half*>(vcache);
+    auto load_kv = [&](int off, const __half* fp16_cache, Kvq8 q8, Kvq4 q4) {
+        for (int i = tid; i < CHUNK * (DIM / 8); i += 128) {
+            const int r = i >> 4;
+            const int s_blk = i & 15;
+            const int blk = s_blk >> 2;
+            const int off_in_blk = (s_blk & 3) * 4;
+            const int off_key = off + r;
+            const bool valid_key = off_key < k_end;
+            const long long key = lo_all + off_key;
+            const size_t row_idx = valid_key ? (size_t) (ring > 0 ? key % ring : key) : 0;
+            const size_t head_row = row_idx * (size_t) kv_heads + (size_t) kv_h;
+            const size_t scale_idx = head_row * (DIM >> 5) + blk;
+            __half* dst_row = kvs[r];
+            if (!valid_key) {
+                *reinterpret_cast<uint4*>(dst_row + s_blk * 8) = make_uint4(0, 0, 0, 0);
+            } else if (q8.codes) {
+                const float sc = __half2float(__ushort_as_half(q8.scales[scale_idx]));
+                const char4 c0 = *reinterpret_cast<const char4*>(q8.codes + head_row * DIM + s_blk * 8);
+                const char4 c1 = *reinterpret_cast<const char4*>(q8.codes + head_row * DIM + s_blk * 8 + 4);
+                half2* h2 = reinterpret_cast<half2*>(dst_row + s_blk * 8);
+                h2[0] = __floats2half2_rn(float(c0.x) * sc, float(c0.y) * sc);
+                h2[1] = __floats2half2_rn(float(c0.z) * sc, float(c0.w) * sc);
+                h2[2] = __floats2half2_rn(float(c1.x) * sc, float(c1.y) * sc);
+                h2[3] = __floats2half2_rn(float(c1.z) * sc, float(c1.w) * sc);
+            } else if (q4.codes) {
+                const float sc = __half2float(__ushort_as_half(q4.scales[scale_idx]));
+                const uint32_t p4 =
+                    *reinterpret_cast<const uint32_t*>(q4.codes + head_row * (DIM >> 1) + blk * 16 + off_in_blk);
+                const int b0 = int(p4 & 0xffu);
+                const int b1 = int((p4 >> 8) & 0xffu);
+                const int b2 = int((p4 >> 16) & 0xffu);
+                const int b3 = int(p4 >> 24);
+                half2* lo_h2 = reinterpret_cast<half2*>(dst_row + blk * 32 + off_in_blk);
+                half2* hi_h2 = reinterpret_cast<half2*>(dst_row + blk * 32 + off_in_blk + 16);
+                lo_h2[0] = __floats2half2_rn(float((b0 & 0x0f) - 8) * sc, float((b1 & 0x0f) - 8) * sc);
+                lo_h2[1] = __floats2half2_rn(float((b2 & 0x0f) - 8) * sc, float((b3 & 0x0f) - 8) * sc);
+                hi_h2[0] = __floats2half2_rn(float((b0 >> 4) - 8) * sc, float((b1 >> 4) - 8) * sc);
+                hi_h2[1] = __floats2half2_rn(float((b2 >> 4) - 8) * sc, float((b3 >> 4) - 8) * sc);
+            } else {
+                *reinterpret_cast<uint4*>(dst_row + s_blk * 8) =
+                    *reinterpret_cast<const uint4*>(fp16_cache + head_row * DIM + s_blk * 8);
+            }
+        }
+    };
+
+    for (int off = k_begin; off < k_end; off += CHUNK) {
+        load_kv(off, kc, kq8, kq4);
+        __syncthreads();
+
+        float s_reg[2][4];
+#pragma unroll
+        for (int n = 0; n < 2; ++n) {
+            s_reg[n][0] = s_reg[n][1] = s_reg[n][2] = s_reg[n][3] = 0.0f;
+#pragma unroll
+            for (int k = 0; k < 8; k += 2) {
+                uint32_t b[4];
+                ink_ldsm4(b, &kvs[warp * 16 + 8 * n + (lane & 7)][16 * k + 8 * (lane >> 3)], false);
+                ink_mma(s_reg[n], qa[k], b);
+                ink_mma(s_reg[n], qa[k + 1], b + 2);
+            }
+        }
+
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const bool row_live = m_row[i] < M;
+            float mx = -INFINITY;
+#pragma unroll
+            for (int n = 0; n < 2; ++n) {
+#pragma unroll
+                for (int j = 2 * i; j < 2 * i + 2; ++j) {
+                    const int off_key = off + warp * 16 + 8 * n + 2 * tig + (j & 1);
+                    const long long key = lo_all + off_key;
+                    float v = -INFINITY;
+                    if (row_live && off_key < k_end && key >= lo_row[i] && key <= hi_row[i]) {
+                        v = s_reg[n][j] * scale;
+                        if constexpr (!WHOLE) {
+                            const long long dist = q_pos_i[i] - key;
+                            float add = 0.0f;
+                            if (dist < n_extent) {
+                                const float4* col = reinterpret_cast<const float4*>(rel_bias + size_t(dist) * 16);
+#pragma unroll
+                                for (int q4i = 0; q4i < 4; ++q4i) {
+                                    const float4 c4 = __ldg(col + q4i);
+                                    add += c4.x * sm_r[gid + 8 * i][4 * q4i] +
+                                           c4.y * sm_r[gid + 8 * i][4 * q4i + 1] +
+                                           c4.z * sm_r[gid + 8 * i][4 * q4i + 2] +
+                                           c4.w * sm_r[gid + 8 * i][4 * q4i + 3];
+                                }
+                            }
+                            v += add + neg_sink[i];
+                        }
+                    }
+                    s_reg[n][j] = v;
+                    mx = fmaxf(mx, v);
+                }
+            }
+            mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 1));
+            mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 2));
+            const float now = fmaxf(m[i], mx);
+            const float base = now == -INFINITY ? 0.0f : now;
+            const float f = expf(m[i] - base);
+            m[i] = now;
+            l[i] *= f;
+            if (__any_sync(0xffffffffu, f != 1.0f)) {
+#pragma unroll
+                for (int n = 0; n < 16; ++n) {
+                    o[n][2 * i] *= f;
+                    o[n][2 * i + 1] *= f;
+                }
+            }
+#pragma unroll
+            for (int n = 0; n < 2; ++n) {
+#pragma unroll
+                for (int j = 2 * i; j < 2 * i + 2; ++j) {
+                    s_reg[n][j] = __half2float(__float2half(expf(s_reg[n][j] - base)));
+                    l[i] += s_reg[n][j];
+                }
+            }
+        }
+        const uint32_t pa[4] = {ink_h2(s_reg[0][0], s_reg[0][1]), ink_h2(s_reg[0][2], s_reg[0][3]),
+                                ink_h2(s_reg[1][0], s_reg[1][1]), ink_h2(s_reg[1][2], s_reg[1][3])};
+        __syncthreads();
+
+        load_kv(off, vc, vq8, vq4);
+        __syncthreads();
+
+#pragma unroll
+        for (int n = 0; n < 16; n += 2) {
+            uint32_t b[4];
+            ink_ldsm4(b, &kvs[warp * 16 + (lane & 7) + 8 * ((lane >> 3) & 1)][8 * n + 8 * (lane >> 4)], true);
+            ink_mma(o[n], pa, b);
+            ink_mma(o[n + 1], pa, b + 2);
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        l[i] += __shfl_xor_sync(0xffffffffu, l[i], 1);
+        l[i] += __shfl_xor_sync(0xffffffffu, l[i], 2);
+        if (tig == 0) {
+            sm_m[warp][gid + 8 * i] = m[i];
+            sm_l[warp][gid + 8 * i] = l[i];
+        }
+    }
+
+    float (*sm_o)[8][DIM] = reinterpret_cast<float (*)[8][DIM]>(kvs);
+    for (int i = 0; i < 2; ++i) {
+        if (m0 + 8 * i >= M) break;
+#pragma unroll
+        for (int n = 0; n < 16; ++n) {
+            sm_o[warp][gid][8 * n + 2 * tig] = o[n][2 * i];
+            sm_o[warp][gid][8 * n + 2 * tig + 1] = o[n][2 * i + 1];
+        }
+        __syncthreads();
+        const int d = tid;
+        for (int r = 0; r < 8; ++r) {
+            const int mr = m0 + 8 * i + r;
+            if (mr >= M) break;
+            float mb = -INFINITY, lb = 0.0f, ob = 0.0f;
+            for (int w = 0; w < 4; ++w) {
+                const float wl = sm_l[w][8 * i + r];
+                if (wl > 0.0f) {
+                    const float wm = sm_m[w][8 * i + r];
+                    const float mn = fmaxf(mb, wm);
+                    const float a = lb > 0.0f ? expf(mb - mn) : 0.0f;
+                    const float b = expf(wm - mn);
+                    lb = lb * a + wl * b;
+                    ob = ob * a + sm_o[w][r][d] * b;
+                    mb = mn;
+                }
+            }
+            const int t = mr / 3;
+            const int h = kv_h * 3 + (mr % 3);
+            float* dst = partials + (((size_t(t) * n_head + h) * n_splits + s) * (DIM + 2));
+            dst[d] = ob;
+            if (d == 0) {
+                dst[DIM] = mb;
+                dst[DIM + 1] = lb;
+            }
+        }
+        if (i == 0 && m0 + 8 < M) __syncthreads();
+    }
+#else
+    (void) q; (void) kcache; (void) vcache; (void) sinks; (void) n_extent; (void) pos; (void) rows;
+    (void) partials; (void) n_splits; (void) dim; (void) n_head; (void) kv_heads; (void) scale;
+    (void) window; (void) ring; (void) at; (void) kq8; (void) vq8; (void) kq4; (void) vq4;
+    (void) r_cur; (void) rel_bias;
+#endif
+}
+
+static bool ink_mma_dec_enabled() {
+#if defined(__HIPCC__)
+    return false;
+#else
+    static const bool enabled = [] {
+        const char* v = std::getenv("STRATA_INK_MMA_DEC");
+        if (v && v[0] == '0') return false;
+        cudaFuncAttributes f{};
+        return cudaFuncGetAttributes(&f, inkling_attend_split_mma_kernel<false>) == cudaSuccess && f.ptxVersion >= 80;
+    }();
+    return enabled;
+#endif
+}
+
+static void launch_inkling_attend_mma(bool whole, const float* q, const uint16_t* kcache, const uint16_t* vcache,
+                                      const float* sinks, int n_extent, long long pos, int rows, float* partials,
+                                      int n_splits, int dim, int n_head, int kv_heads, float scale, int window,
+                                      int ring, const long long* at, Kvq8 kq8, Kvq8 vq8, Kvq4 kq4, Kvq4 vq4,
+                                      const float* r_cur, const float* rel_bias, void* stream) {
+    const dim3 g(n_splits, kv_heads, (rows * 3 + 15) / 16);
+    if (whole) {
+        inkling_attend_split_mma_kernel<true><<<g, 128, 0, cs(stream)>>>(
+            q, kcache, vcache, nullptr, n_extent, pos, rows, partials, n_splits, dim, n_head, kv_heads, scale, window,
+            ring, at, kq8, vq8, kq4, vq4, nullptr, nullptr);
+    } else {
+        inkling_attend_split_mma_kernel<false><<<g, 128, 0, cs(stream)>>>(
+            q, kcache, vcache, sinks, n_extent, pos, rows, partials, n_splits, dim, n_head, kv_heads, scale, window,
+            ring, at, kq8, vq8, kq4, vq4, r_cur, rel_bias);
+    }
+}
 
 constexpr int kMaxPer = 4;
 constexpr int kFlashKeys = 64, kFlashRow = 128 + 8, kFlashRel = 16;

@@ -1924,6 +1924,83 @@ int test_decode_fusions() {
 
         cudaFree(d_gu); cudaFree(d_sg); cudaFree(d_su); cudaFree(d_out); cudaFree(d_ids); cudaFree(d_q8);
     }
+
+    // F8. Shared-KV MMA multi-row decode attention (inkling_attend table == nullptr vs scalar table != nullptr)
+    {
+        auto run_f8 = [&](const char* label, int rows, int pos, int window, int ring, int n_extent, bool use_at,
+                          int kv_mode) {
+            const int n_head = 24, kv_heads = 8, dim = 128, n_rel = 16;
+            const int width = kv_heads * dim;
+            const float scale = 1.0f / std::sqrt((float) dim);
+            const int kv_len = ring > 0 ? ring : (pos + rows);
+
+            auto q = random_vec((size_t) rows * n_head * dim, 0.7f);
+            auto r_h = random_vec((size_t) rows * n_head * n_rel, 0.5f);
+            auto rb_h = random_vec((size_t) n_extent * n_rel, 0.3f);
+            auto snk = random_vec((size_t) rows * n_head, 0.3f);
+            auto gate = random_vec((size_t) rows * n_head * dim, 1.2f);
+            auto k_raw = random_vec((size_t) kv_len * width, 0.6f);
+            auto v_raw = random_vec((size_t) kv_len * width, 0.6f);
+
+            float *d_q = dev(q), *d_r = dev(r_h), *d_rb = dev(rb_h), *d_snk = dev(snk), *d_g = dev(gate);
+            float *d_kr = dev(k_raw), *d_vr = dev(v_raw);
+            uint16_t *d_k16 = nullptr, *d_v16 = nullptr;
+            int8_t *d_kc = nullptr, *d_vc = nullptr;
+            uint8_t *d_v4 = nullptr;
+            uint16_t *d_ks = nullptr, *d_vs = nullptr;
+            if (kv_mode == 0) {
+                cudaMalloc(&d_k16, (size_t) kv_len * width * sizeof(uint16_t));
+                cudaMalloc(&d_v16, (size_t) kv_len * width * sizeof(uint16_t));
+                store_f16(d_kr, d_k16, width, 0, kv_len, nullptr);
+                store_f16(d_vr, d_v16, width, 0, kv_len, nullptr);
+            } else {
+                cudaMalloc(&d_kc, (size_t) kv_len * width);
+                cudaMalloc(&d_ks, (size_t) kv_len * (width / 32) * sizeof(uint16_t));
+                cudaMalloc(&d_vs, (size_t) kv_len * (width / 32) * sizeof(uint16_t));
+                store_q8(d_kr, d_kc, d_ks, width, 0, kv_len, nullptr);
+                if (kv_mode == 1) {
+                    cudaMalloc(&d_vc, (size_t) kv_len * width);
+                    store_q8(d_vr, d_vc, d_vs, width, 0, kv_len, nullptr);
+                } else {
+                    cudaMalloc(&d_v4, (size_t) kv_len * (width / 2));
+                    store_q4(d_vr, d_v4, d_vs, width, 0, kv_len, nullptr);
+                }
+            }
+            Kvq8 kq8 = kv_mode >= 1 ? Kvq8{d_kc, d_ks} : Kvq8{};
+            Kvq8 vq8 = kv_mode == 1 ? Kvq8{d_vc, d_vs} : Kvq8{};
+            Kvq4 vq4 = kv_mode == 2 ? Kvq4{d_v4, d_vs} : Kvq4{};
+
+            const size_t score_n = (size_t) rows * n_head * 64 * (dim + 2);
+            float* d_tbl = dev(std::vector<float>((size_t) rows * n_head * n_extent, 0.f));
+            float* d_sc = dev(std::vector<float>(score_n, 0.f));
+            float* d_ref = dev(std::vector<float>(q.size(), 0.f));
+            float* d_got = dev(std::vector<float>(q.size(), 0.f));
+            std::vector<long long> at_v((size_t) rows * 2);
+            for (int t = 0; t < rows; ++t) at_v[2 * t] = at_v[2 * t + 1] = pos + t;
+            long long* d_at = use_at ? dev(at_v) : nullptr;
+            const int rm = d_at ? (window > 0 ? std::min(window + rows - 1, pos + rows) : pos + rows) : 0;
+
+            inkling_rel_table(d_r, d_rb, d_snk, d_tbl, n_rel, n_extent, n_head, rows, nullptr, false);
+            inkling_attend(d_q, d_k16, d_v16, d_tbl, d_snk, n_extent, pos, rows, d_sc, rows, d_ref, dim, n_head,
+                           kv_heads, scale, nullptr, window, ring, d_at, rm, kq8, vq8, {}, vq4);
+            mul_sigmoid(d_ref, d_g, n_head * dim, rows, n_head * dim, false, nullptr);
+
+            inkling_attend(d_q, d_k16, d_v16, nullptr, d_snk, n_extent, pos, rows, d_sc, rows, d_got, dim, n_head,
+                           kv_heads, scale, nullptr, window, ring, d_at, rm, kq8, vq8, {}, vq4, d_r, d_rb, n_rel,
+                           d_g);
+            cudaDeviceSynchronize();
+            bad += report(label, host(d_got, q.size()), host(d_ref, q.size()), 2e-4);
+
+            cudaFree(d_q); cudaFree(d_r); cudaFree(d_rb); cudaFree(d_snk); cudaFree(d_g);
+            cudaFree(d_kr); cudaFree(d_vr); cudaFree(d_k16); cudaFree(d_v16);
+            cudaFree(d_kc); cudaFree(d_vc); cudaFree(d_v4); cudaFree(d_ks); cudaFree(d_vs);
+            cudaFree(d_tbl); cudaFree(d_sc); cudaFree(d_ref); cudaFree(d_got); cudaFree(d_at);
+        };
+        run_f8("F8 MMA attend SWA wrap K8V4 at r=4", 4, 1022, 1024, 1024, 1024, true, 2);
+        run_f8("F8 MMA attend Global K8V4 r=4", 4, 2050, 0, 0, 1024, false, 2);
+        run_f8("F8 MMA attend Global FP16 r=5", 5, 1500, 0, 0, 1024, false, 0);
+        run_f8("F8 MMA attend small SWA Q8 r=2", 2, 90, 1024, 1024, 1024, false, 1);
+    }
     return bad;
 }
 
