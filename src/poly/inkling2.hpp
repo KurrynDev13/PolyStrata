@@ -53,11 +53,16 @@ protected:
     void output_rows(int first, int rows, float* h) override;
     void finish_logits(float* logits, int rows) override;
     void route(int il, const float* logits, int32_t token, int* ids, float* w, float* tmp) const override;
-    void route_weights(int il, const float* logits, const int* ids, float* w) const override;
+    void route_cached(const Layer& L, int il, const float* logits, int32_t token, int* ids, float* w,
+                      float* tmp) override;
+    void slots_moved() override;
     bool route_card(int il, int n, int32_t* ids, float* w) override;
     void moe_shared(const Layer& L, int il, int n) override;
     int head_key(int slot, int n) const override;
     bool bells() const override { return true; }
+#if !defined(STRATA_GPU_METAL)
+    bool router_bf16() const override { return true; }
+#endif
     const Names* tensor_alias(const char* name) const override;
     const Names* meta_alias(const char* key) const override;
 
@@ -122,7 +127,7 @@ private:
     void apply_ctrl(const float* cur, const float* msg, const Block& B, int ctrl, float* out, int n,
                     const float* ctrl_r_in = nullptr);
     void store(const float* x, const SlotCache& sc, int64_t pos, int n, bool value);
-    void attn(const Step& st, Block& B, SlotCache& sc, int64_t pos, int n);
+    void attn(const Step& st, Block& B, SlotCache& sc, int64_t pos, int n, bool fuse_post = false);
     template <class F>
     void window_runs(int64_t pos, F&& f) const;
 
@@ -159,6 +164,9 @@ private:
     float* q8w_ = nullptr;
     size_t work_halves_ = 0;
     bool fast_rel_bias_ = false;
+    float* cache_b_ = nullptr;   ///< --cache-bias: each layer's pick bias for the card (slots_moved())
+    void route_by(const float* logits, const float* bias, int* ids, float* w, float* probs) const;
+    void cached_bias(const Layer& L, int il, float* b) const;
 
     bool dspark_ = false;
     int dspark_layers_ = 0, dspark_ff_ = 0, dspark_heads_ = 0, dspark_kv_ = 0, dspark_head_dim_ = 0;

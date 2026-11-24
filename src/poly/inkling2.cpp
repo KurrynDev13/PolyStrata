@@ -137,6 +137,12 @@ void Inkling2::load_geometry() {
     w_scale_ = opt_f("expert_weights_scale", 8.f);
     final_logit_softcapping_ = opt_f("final_logit_softcapping", 0.f);
     half_sum_guard_ = true;
+#if !defined(STRATA_GPU_METAL) && !defined(STRATA_USE_HIP)
+    {
+        const char* v = std::getenv("STRATA_INK_KERNEL_TABLES");
+        kernel_tables_ = !(v && std::string(v) == "0");
+    }
+#endif
 
     core_start_ = (int) must_u("loop.start");
     core_end_ = (int) must_u("loop.end");
@@ -631,7 +637,7 @@ void Inkling2::alloc_caches() {
         }
     }
 
-    const int n_splits_max = std::clamp((opt_.max_context + 511) / 512, 1, 64);
+    const int n_splits_max = std::clamp((opt_.max_context + 127) / 128, 1, 64);
     chunk_batch_ = std::min(rows_, 64);
     chunk_dec_ = (int) std::clamp<size_t>(
         (size_t(8) << 20) / std::max<size_t>(1, (size_t) n_head_ * n_splits_max * (head_dim_ + 2)), 1,
@@ -678,7 +684,7 @@ void Inkling2::assign_scratch() {
     const size_t max_ext = (size_t) std::max(window_, n_rel_extent_);
     table_ = fbuf((size_t) chunk_batch_ * n_head_ * max_ext);
 
-    const size_t n_splits_max = (size_t) std::clamp((opt_.max_context + 511) / 512, 1, 64);
+    const size_t n_splits_max = (size_t) std::clamp((opt_.max_context + 127) / 128, 1, 64);
     score_n_ = std::max((size_t) chunk_dec_ * n_head_ * n_splits_max * (head_dim_ + 2),
                         (size_t) chunk_batch_ * n_head_ * 1536);
     if (dspark_) {
@@ -1004,6 +1010,10 @@ void Inkling2::apply_ctrl(const float* cur, const float* msg, const Block& B, in
         r_ptr = ctrl_r_;
     }
     if (B.ctrl_gf[ctrl].p) {
+        if (n < kStageRows && B.ctrl_gf[ctrl].type == kTypeF32 && B.ctrl_gf[ctrl].scale == 1.0f) {
+            const float* gf = fp(B.ctrl_gf[ctrl]);
+            if (ink_control3_gate(&cur, &msg, &r_ptr, &gf, &out, 1, n_embd_, gate_rank_, n, st_)) return;
+        }
         lin(B.ctrl_gf[ctrl], r_ptr, ctrl_g_, n);
         inkling_control_apply(cur, msg, ctrl_g_, ctrl_g_ + n_embd_, out, n_embd_, n, st_, 2 * n_embd_);
         return;
@@ -1045,7 +1055,7 @@ void Inkling2::store(const float* x, const SlotCache& sc, int64_t pos, int n, bo
     if (head < n) store_f16(x + (size_t) head * width, cache, width, 0, n - head, st_);
 }
 
-void Inkling2::attn(const Step& st, Block& B, SlotCache& sc, int64_t pos, int n) {
+void Inkling2::attn(const Step& st, Block& B, SlotCache& sc, int64_t pos, int n, bool fuse_post) {
     const int ip = st.phys, pass = st.pass;
     const long long* at = recording_ ? at_ : nullptr;
     const int threads = sum_threads(n_embd_);
@@ -1055,6 +1065,8 @@ void Inkling2::attn(const Step& st, Block& B, SlotCache& sc, int64_t pos, int n)
     float* in2 = inputs_buf_ + 2 * (size_t) n * n_embd_;
 
     const int ns_all = streams();
+    const bool share_swa = B.swa && pass == 0;
+    bool normed = false;
     // 1. Attention Residual mix over blocks so far + current stream 0
     if (ip == 0) {
         inkling_read_stream(r_, ns_all, 0, in0, n_embd_, n, st_);
@@ -1074,15 +1086,20 @@ void Inkling2::attn(const Step& st, Block& B, SlotCache& sc, int64_t pos, int n)
             ms = {{0, 1, 2, 3, 4, 0}};
             ns = 5;
         }
-        if (B.swa) {
-            inkling_mix(r_, ns_all, ms, ns, fp(B.attn_res_query), 1, in0, n_embd_, n, 1e-6f, st_);
-        } else {
-            inkling_mix(r_, ns_all, ms, ns, fp(B.attn_res_query), 3, in0, n_embd_, n, 1e-6f, st_);
+        if (share_swa) {
+            normed = inkling_mix_norm_q8(r_, ns_all, ms, ns, fp(B.attn_res_query), fp(L.attn_norm), xn_,
+                                         n < kStageRows ? xq_ : nullptr, n_embd_, n, 1e-6f, rms_eps_, st_);
+        }
+        if (!normed) {
+            if (B.swa) {
+                inkling_mix(r_, ns_all, ms, ns, fp(B.attn_res_query), 1, in0, n_embd_, n, 1e-6f, st_);
+            } else {
+                inkling_mix(r_, ns_all, ms, ns, fp(B.attn_res_query), 3, in0, n_embd_, n, 1e-6f, st_);
+            }
         }
     }
 
     // 2. Cross-pass loop controls (pass > 0)
-    const bool share_swa = B.swa && pass == 0;
     if (pass > 0) {
         const float* c3[3] = {B.swa ? in0 : in1, B.swa ? in0 : in2, in0};
         const float* m3[3] = {msg_ + 1 * (size_t) n * n_embd_, msg_ + 2 * (size_t) n * n_embd_, msg_};
@@ -1096,7 +1113,18 @@ void Inkling2::attn(const Step& st, Block& B, SlotCache& sc, int64_t pos, int n)
         const int idx3[3] = {1, 2, 0};
         const bool all_fused =
             n < kStageRows && w3[0] && w3[1] && w3[2] && ink_ctrl_down(c3, m3, w3, y3, 3, n_embd_, gate_rank_, n, st_);
-        for (int k = 0; k < 3; ++k) apply_ctrl(c3[k], m3[k], B, idx3[k], o3[k], n, all_fused ? y3[k] : nullptr);
+        const float* gf3[3] = {
+            B.ctrl_gf[1].p && B.ctrl_gf[1].type == kTypeF32 && B.ctrl_gf[1].scale == 1.0f ? fp(B.ctrl_gf[1]) : nullptr,
+            B.ctrl_gf[2].p && B.ctrl_gf[2].type == kTypeF32 && B.ctrl_gf[2].scale == 1.0f ? fp(B.ctrl_gf[2]) : nullptr,
+            B.ctrl_gf[0].p && B.ctrl_gf[0].type == kTypeF32 && B.ctrl_gf[0].scale == 1.0f ? fp(B.ctrl_gf[0]) : nullptr,
+        };
+        const float* y3_c[3] = {y3[0], y3[1], y3[2]};
+        if (all_fused && gf3[0] && gf3[1] && gf3[2] &&
+            ink_control3_gate(c3, m3, y3_c, gf3, o3, 3, n_embd_, gate_rank_, n, st_)) {
+            // Fused 3-controller up-projection + gate applied directly into o3
+        } else {
+            for (int k = 0; k < 3; ++k) apply_ctrl(c3[k], m3[k], B, idx3[k], o3[k], n, all_fused ? y3[k] : nullptr);
+        }
     }
 
     // 3. Input norm + linear projections -> Q, K, V, R, sinks, gate
@@ -1104,7 +1132,9 @@ void Inkling2::attn(const Step& st, Block& B, SlotCache& sc, int64_t pos, int n)
     const Dev& nk = B.swa ? L.attn_norm : B.k_inp_norm;
     const Dev& nv = B.swa ? L.attn_norm : B.v_inp_norm;
 
-    kernels::native_add_rms_norm_q8_1(in0, nullptr, fp(nq), xn_, xq_, n_embd_, n, rms_eps_, threads, st_);
+    if (!normed) {
+        kernels::native_add_rms_norm_q8_1(in0, nullptr, fp(nq), xn_, xq_, n_embd_, n, rms_eps_, threads, st_);
+    }
 
     const float *qraw_p = qraw_, *gate_p = gate_, *r_raw_p = r_raw_, *sinks_p = sinks_;
     if (n < kStageRows && B.wq_fused.p) {
@@ -1170,18 +1200,64 @@ void Inkling2::attn(const Step& st, Block& B, SlotCache& sc, int64_t pos, int n)
                       rec_n_, snap_bits_);
     }
 
-    // 4. L2 clip + global tau(pos) on Q & R, L2 clip on K, parameterless RMSNorm on V
-    inkling_l2_clip(qraw_p, fp(B.attn_q_clip), q_, head_dim_, n_head_, qk_clip_, pos, !B.swa, (float) log_floor_,
-                    log_alpha_, n, at, st_);
-    inkling_l2_clip(k_, nullptr, k_, head_dim_, n_kv_, qk_clip_, pos, false, (float) log_floor_, 0.f, n, nullptr,
-                    st_);
-    rms_norm(v_, nullptr, v_, head_dim_, n * n_kv_, rms_eps_, st_);
-    inkling_l2_clip(r_raw_p, fp(B.attn_rel_clip), r_cur_, n_rel_, n_head_, rel_clip_, pos, !B.swa, (float) log_floor_,
-                    log_alpha_, n, at, st_);
+    // 4-5. L2 clip + global tau(pos) on Q & R, L2 clip on K + store K, RMSNorm on V + store V
+    if (head_dim_ == 128 && n_rel_ <= 32) {
+        InkClipsStore cs;
+        cs.q_in = qraw_p;
+        cs.q_scale = fp(B.attn_q_clip);
+        cs.q_out = q_;
+        cs.k_in = k_;
+        cs.v_in = v_;
+        cs.r_in = r_raw_p;
+        cs.r_scale = fp(B.attn_rel_clip);
+        cs.r_out = r_cur_;
+        if (opt_.kv_format == KvFmt::kQ4_0) {
+            cs.k_q4 = sc.k_q4;
+            cs.k_scales = sc.k_scales;
+            cs.v_q4 = sc.v_q4;
+            cs.v_scales = sc.v_scales;
+        } else if (opt_.kv_format == KvFmt::kK8V4) {
+            cs.k_q8 = sc.k_codes;
+            cs.k_scales = sc.k_scales;
+            cs.v_q4 = sc.v_q4;
+            cs.v_scales = sc.v_scales;
+        } else if (opt_.kv_format == KvFmt::kQ8_0) {
+            cs.k_q8 = sc.k_codes;
+            cs.k_scales = sc.k_scales;
+            cs.v_q8 = sc.v_codes;
+            cs.v_scales = sc.v_scales;
+        } else {
+            cs.k_fp16 = sc.keys;
+            cs.v_fp16 = sc.vals;
+        }
+        cs.n_head = n_head_;
+        cs.n_kv = n_kv_;
+        cs.dim = head_dim_;
+        cs.n_rel = n_rel_;
+        cs.rows = n;
+        cs.ring = sc.swa ? ring_ : 0;
+        cs.pos = pos;
+        cs.at = at;
+        cs.qk_clip = qk_clip_;
+        cs.rel_clip = rel_clip_;
+        cs.rms_eps = rms_eps_;
+        cs.is_global = !B.swa;
+        cs.log_floor = (float) log_floor_;
+        cs.log_alpha = log_alpha_;
+        inkling_clips_store(cs, st_);
+    } else {
+        inkling_l2_clip(qraw_p, fp(B.attn_q_clip), q_, head_dim_, n_head_, qk_clip_, pos, !B.swa, (float) log_floor_,
+                        log_alpha_, n, at, st_);
+        inkling_l2_clip(k_, nullptr, k_, head_dim_, n_kv_, qk_clip_, pos, false, (float) log_floor_, 0.f, n, nullptr,
+                        st_);
+        rms_norm(v_, nullptr, v_, head_dim_, n * n_kv_, rms_eps_, st_);
+        inkling_l2_clip(r_raw_p, fp(B.attn_rel_clip), r_cur_, n_rel_, n_head_, rel_clip_, pos, !B.swa,
+                        (float) log_floor_, log_alpha_, n, at, st_);
 
-    // 5. Store K and V into slot cache
-    store(k_, sc, pos, n, false);
-    store(v_, sc, pos, n, true);
+        // 5. Store K and V into slot cache
+        store(k_, sc, pos, n, false);
+        store(v_, sc, pos, n, true);
+    }
 
     // 6. Relative-bias attention + virtual zero sink
     const float scale = 1.f / std::sqrt((float) head_dim_);
@@ -1230,10 +1306,13 @@ void Inkling2::attn(const Step& st, Block& B, SlotCache& sc, int64_t pos, int n)
         ia.vq4 = vq4;
         flash_done = ink_attend_batch(ia, st_);
     }
+    bool quant_wo = false;
     if (!flash_done) {
         if (pre_dq) {
             inkling_dequant_kv_span(lo_all, (int) keys_all_64, kv_width, ring, kq, vq, kq4, vq4, kw, vw, st_);
         }
+        const bool direct_dec = n < kStageRows && head_dim_ == 128 && n_head_ == n_kv_ * 3 && n_rel_ == 16;
+        quant_wo = direct_dec && n <= chunk_dec_ && B.wo.type != kTypeF32 && B.wo.type != kTypeBF16 && B.wo.scale == 1.0f;
         const int c_step = n >= kStageRows ? chunk_batch_ : chunk_dec_;
         for (int first = 0; first < n; first += c_step) {
             const int c = std::min(c_step, n - first);
@@ -1241,8 +1320,10 @@ void Inkling2::attn(const Step& st, Block& B, SlotCache& sc, int64_t pos, int n)
             const float* s_sub = sinks_p + (size_t) first * n_head_;
             const float* q_sub = q_ + (size_t) first * n_head_ * head_dim_;
             float* att_sub = att_ + (size_t) first * n_head_ * head_dim_;
-            inkling_rel_table(r_sub, fp(B.attn_rel_bias_trans.p ? B.attn_rel_bias_trans : B.attn_rel_bias), s_sub, table_,
-                              n_rel_, n_extent, n_head_, c, st_, fast_rel_bias_);
+            if (!direct_dec) {
+                inkling_rel_table(r_sub, fp(B.attn_rel_bias_trans.p ? B.attn_rel_bias_trans : B.attn_rel_bias), s_sub,
+                                  table_, n_rel_, n_extent, n_head_, c, st_, fast_rel_bias_);
+            }
             if (n >= kStageRows) {
                 if (pre_dq) {
                     inkling_attend_batch(blas_, q_sub, kw, vw, table_, s_sub, n_extent, (pos - lo_all) + first, c,
@@ -1257,18 +1338,33 @@ void Inkling2::attn(const Step& st, Block& B, SlotCache& sc, int64_t pos, int n)
             } else {
                 const long long* at_sub = at ? at + 2 * first : nullptr;
                 const int rm = !at ? 0 : B.swa ? std::min(window_ + n - 1, opt_.max_context) : room(n);
-                inkling_attend(q_sub, quant ? nullptr : sc.keys, quant ? nullptr : sc.vals, table_, s_sub, n_extent,
-                               pos + first, c, score_, chunk_dec_, att_sub, head_dim_, n_head_, n_kv_, scale, st_,
-                               window, ring, at_sub, rm, kq, vq, kq4, vq4);
+                if (direct_dec) {
+                    const float* gate_sub = gate_p + (size_t) first * n_head_ * head_dim_;
+                    inkling_attend(q_sub, quant ? nullptr : sc.keys, quant ? nullptr : sc.vals, nullptr, s_sub,
+                                   n_extent, pos + first, c, score_, chunk_dec_, quant_wo ? nullptr : att_sub,
+                                   head_dim_, n_head_, n_kv_, scale, st_, window, ring, at_sub, rm, kq, vq, kq4, vq4,
+                                   r_sub, fp(B.attn_rel_bias), n_rel_, gate_sub, quant_wo ? q8_ : nullptr);
+                } else {
+                    inkling_attend(q_sub, quant ? nullptr : sc.keys, quant ? nullptr : sc.vals, table_, s_sub, n_extent,
+                                   pos + first, c, score_, chunk_dec_, att_sub, head_dim_, n_head_, n_kv_, scale, st_,
+                                   window, ring, at_sub, rm, kq, vq, kq4, vq4);
+                }
             }
         }
         // 7. Sigmoid gate -> wo -> post-conv4
-        mul_sigmoid(att_, gate_p, n_head_ * head_dim_, n, n_head_ * head_dim_, false, st_);
+        if (!direct_dec) mul_sigmoid(att_, gate_p, n_head_ * head_dim_, n, n_head_ * head_dim_, false, st_);
     }
 
-    lin(B.wo, att_, cur_, n);
-    inkling_conv4(cur_, state_ + sc.state_off + off_attn_post_, fp(B.attn_post_conv), nullptr, 0, ao_, n_embd_, n, st_,
-                  snap_bits_ ? snap_at_ + sc.state_off + off_attn_post_ : nullptr, rec_n_, snap_bits_);
+    lin(B.wo, att_, cur_, n, quant_wo ? q8_ : nullptr);
+    if (fuse_post && n < 16) {
+        const int pre_copy = (ip == 12) ? 3 : (ip == core_end_ ? 4 : -1);
+        inkling_conv4_stream(cur_, state_ + sc.state_off + off_attn_post_, fp(B.attn_post_conv), r_, ns_all, n_embd_,
+                             n, pre_copy, ip % block_size_ == 0, 0, st_,
+                             snap_bits_ ? snap_at_ + sc.state_off + off_attn_post_ : nullptr, rec_n_, snap_bits_);
+    } else {
+        inkling_conv4(cur_, state_ + sc.state_off + off_attn_post_, fp(B.attn_post_conv), nullptr, 0, ao_, n_embd_, n,
+                      st_, snap_bits_ ? snap_at_ + sc.state_off + off_attn_post_ : nullptr, rec_n_, snap_bits_);
+    }
 }
 
 void Inkling2::layer_head(Layer& L, int slot, int n) {
@@ -1287,17 +1383,20 @@ void Inkling2::layer_head(Layer& L, int slot, int n) {
         inkling_mix(r_, ns_all, bank_slots, 2, fp(B.loop_msg_query), 4, msg_, n_embd_, n, 1e-6f, st_);
     }
 
-    attn(st, B, sc, pos_, n);
+    const bool fuse_post = !opt_.dump && n < 16;
+    attn(st, B, sc, pos_, n, fuse_post);
     dbg("attn", slot, ao_, n_embd_);
 
     // Block AttnRes update: at ip % block_size_ == 0 push inpSA (stream 0) and replace stream 0 = ao_ (no add).
-    if (ip == 12) inkling_copy_stream(r_, ns_all, 3, 0, n_embd_, n, st_);
-    else if (ip == core_end_) inkling_copy_stream(r_, ns_all, 4, 0, n_embd_, n, st_);
+    if (!fuse_post) {
+        if (ip == 12) inkling_copy_stream(r_, ns_all, 3, 0, n_embd_, n, st_);
+        else if (ip == core_end_) inkling_copy_stream(r_, ns_all, 4, 0, n_embd_, n, st_);
 
-    if (ip % block_size_ == 0) {
-        inkling_write_stream(ao_, r_, ns_all, 0, n_embd_, n, st_);
-    } else {
-        inkling_add_to_stream(nullptr, ao_, r_, ns_all, 0, n_embd_, n, st_);
+        if (ip % block_size_ == 0) {
+            inkling_write_stream(ao_, r_, ns_all, 0, n_embd_, n, st_);
+        } else {
+            inkling_add_to_stream(nullptr, ao_, r_, ns_all, 0, n_embd_, n, st_);
+        }
     }
 
     // FFN Block AttnRes mix + optional loop control + ffn_norm -> xn_, xq_
@@ -1308,11 +1407,15 @@ void Inkling2::layer_head(Layer& L, int slot, int n) {
     else if (ip < core_end_) { ffn_slots = {{0, 1, 2, 3, 0, 0}}; ffn_n = 4; }
     else { ffn_slots = {{0, 1, 2, 3, 4, 0}}; ffn_n = 5; }
 
-    inkling_mix(r_, ns_all, ffn_slots, ffn_n, fp(B.ffn_res_query), 1, cur_, n_embd_, n, 1e-6f, st_);
-    if (pass > 0) apply_ctrl(cur_, msg_ + 3 * (size_t) n * n_embd_, B, 3, cur_, n);
-
     const int threads = sum_threads(n_embd_);
-    kernels::native_add_rms_norm_q8_1(cur_, nullptr, fp(L.ffn_norm), xn_, xq_, n_embd_, n, rms_eps_, threads, st_);
+    const bool ffn_normed =
+        pass == 0 && inkling_mix_norm_q8(r_, ns_all, ffn_slots, ffn_n, fp(B.ffn_res_query), fp(L.ffn_norm), xn_,
+                                         n < kStageRows ? xq_ : nullptr, n_embd_, n, 1e-6f, rms_eps_, st_);
+    if (!ffn_normed) {
+        inkling_mix(r_, ns_all, ffn_slots, ffn_n, fp(B.ffn_res_query), 1, cur_, n_embd_, n, 1e-6f, st_);
+        if (pass > 0) apply_ctrl(cur_, msg_ + 3 * (size_t) n * n_embd_, B, 3, cur_, n);
+        kernels::native_add_rms_norm_q8_1(cur_, nullptr, fp(L.ffn_norm), xn_, xq_, n_embd_, n, rms_eps_, threads, st_);
+    }
     dbg("ffn_in", slot, xn_, n_embd_);
     if (!batched(L, n)) moe_router(L, n);
 }
@@ -1324,6 +1427,13 @@ void Inkling2::layer_tail(Layer&, int slot, int n) {
     SlotCache& sc = slots_[(size_t) slot];
 
     const int ns_all = streams();
+    if (n < 16) {
+        const int post_op = (ip == core_start_ - 1) ? 1 : ((ip == core_end_ - 1 && pass < n_passes_ - 1) ? 2 : 0);
+        inkling_conv4_stream(fo_, state_ + sc.state_off + off_ffn_post_, fp(B.ffn_post_conv), r_, ns_all, n_embd_, n,
+                             -1, false, post_op, st_, snap_bits_ ? snap_at_ + sc.state_off + off_ffn_post_ : nullptr,
+                             rec_n_, snap_bits_);
+        return;
+    }
     inkling_conv4(fo_, state_ + sc.state_off + off_ffn_post_, fp(B.ffn_post_conv), nullptr, 0, cur_, n_embd_, n, st_,
                   snap_bits_ ? snap_at_ + sc.state_off + off_ffn_post_ : nullptr, rec_n_, snap_bits_);
     inkling_add_to_stream(nullptr, cur_, r_, ns_all, 0, n_embd_, n, st_);
@@ -1340,9 +1450,12 @@ void Inkling2::layer_tail(Layer&, int slot, int n) {
 void Inkling2::output_rows(int first, int rows, float* h) {
     const int ns_all = streams();
     const MixSlots out_slots{{0, 1, 2, 3, 4, 0}};
-    inkling_mix(r_ + (size_t) first * ns_all * n_embd_, ns_all, out_slots, 5, fp(output_res_query_), 1, cur_, n_embd_,
-                rows, 1e-6f, st_);
-    rms_norm(cur_, fp(out_norm_), h, n_embd_, rows, rms_eps_, st_);
+    if (!inkling_mix_norm_q8(r_ + (size_t) first * ns_all * n_embd_, ns_all, out_slots, 5, fp(output_res_query_),
+                             fp(out_norm_), h, nullptr, n_embd_, rows, 1e-6f, rms_eps_, st_)) {
+        inkling_mix(r_ + (size_t) first * ns_all * n_embd_, ns_all, out_slots, 5, fp(output_res_query_), 1, cur_,
+                    n_embd_, rows, 1e-6f, st_);
+        rms_norm(cur_, fp(out_norm_), h, n_embd_, rows, rms_eps_, st_);
+    }
     if (dspark_) inkling_dspark_extract_taps(r_ + (size_t) first * ns_all * n_embd_, ns_all, 6, d_taps_, n_embd_, rows, st_);
 }
 
@@ -1351,11 +1464,38 @@ void Inkling2::finish_logits(float* logits, int rows) {
 }
 
 void Inkling2::route(int il, const float* logits, int32_t, int* ids, float* w, float* probs) const {
-    const std::vector<float>& bias = blocks_[(size_t) il].probs_b;
+    route_by(logits, blocks_[(size_t) il].probs_b.data(), ids, w, probs);
+}
+
+// --cache-bias: F onto the pick of each expert in VRAM.  The pick is the sigmoid gate plus the layer's bias, so the
+// experts in VRAM keep their order among themselves, as do the others, and only a close call between the two goes the
+// other way.  The weights stay the bare gates'.
+void Inkling2::cached_bias(const Layer& L, int il, float* b) const {
+    const std::vector<float>& pb = blocks_[(size_t) il].probs_b;
+    for (int e = 0; e < n_expert_; ++e) b[e] = pb[(size_t) e] + (L.slot[(size_t) e] ? opt_.cache_bias : 0.f);
+}
+
+void Inkling2::route_cached(const Layer& L, int il, const float* logits, int32_t, int* ids, float* w, float* probs) {
+    cached_bias(L, il, bias_rl_.data());
+    route_by(logits, bias_rl_.data(), ids, w, probs);
+}
+
+// route_card()'s bias for a few tokens, every layer's, from the experts card_moe() has just put on the card.
+void Inkling2::slots_moved() {
+    if (!(opt_.cache_bias > 0.f)) return;
+    const size_t ne = (size_t) n_expert_;
+    std::vector<float> b((size_t) n_layer_ * ne, 0.f);
+    for (int il = 0; il < n_layer_; ++il)
+        if (layers_[(size_t) il].moe) cached_bias(layers_[(size_t) il], il, b.data() + (size_t) il * ne);
+    if (!cache_b_) cache_b_ = (float*) dmalloc(b.size() * sizeof(float), "scratch");
+    ck(cudaMemcpy(cache_b_, b.data(), b.size() * sizeof(float), cudaMemcpyHostToDevice), "cache bias");
+}
+
+void Inkling2::route_by(const float* logits, const float* bias, int* ids, float* w, float* probs) const {
     float* pick = probs + n_expert_;
     for (int e = 0; e < n_expert_; ++e) {
         probs[e] = 1.f / (1.f + std::exp(-logits[e]));
-        pick[e] = probs[e] + bias[(size_t) e];
+        pick[e] = probs[e] + bias[e];
     }
     float sum = 0.f;
     for (int k = 0; k < n_used_; ++k) {
@@ -1374,22 +1514,11 @@ void Inkling2::route(int il, const float* logits, int32_t, int* ids, float* w, f
     }
 }
 
-void Inkling2::route_weights(int, const float* logits, const int* ids, float* w) const {
-    float sum = 0.f;
-    for (int k = 0; k < n_used_; ++k) {
-        w[k] = 1.f / (1.f + std::exp(-logits[ids[k]]));
-        sum += w[k];
-    }
-    const float denom = std::max(sum, kMinWeightSum);
-    for (int k = 0; k < n_used_; ++k) {
-        w[k] /= denom;
-        if (w_scale_ != 0.f) w[k] *= w_scale_;
-    }
-}
-
 bool Inkling2::route_card(int il, int n, int32_t* ids, float* w) {
     const Block& B = blocks_[(size_t) il];
-    route_rows(rl_, n_expert_, n_used_, n, 1, 1.f, fp(B.probs_b_dev), nullptr, true, w_scale_, ids, w, st_);
+    const float* bias = B.probs_b_dev.p ? fp(B.probs_b_dev) : nullptr;
+    if (cache_b_ && n < kStageRows) bias = cache_b_ + (size_t) il * n_expert_;
+    route_rows(rl_, n_expert_, n_used_, n, 1, 1.f, bias, nullptr, true, w_scale_, ids, w, st_);
     return true;
 }
 

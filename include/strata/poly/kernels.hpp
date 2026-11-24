@@ -427,12 +427,21 @@ struct MixSlots {
 /// out[i] = beta * tanh(gate / beta) * sigmoid(gate) * (linear_beta > 0 ? linear_beta * tanh(up / linear_beta) : up).
 void situ_rows(const float* gate_up, float* out, int n, int rows, float beta, float linear_beta, void* stream,
                const ExpertScales* scales = nullptr);
+/// Fused SiTU activation + Q8_1 quantization directly from [rows, 2 * n] gate_up into `out_q8_1` (`n % 32 == 0`).
+void situ_rows_q8_1(const float* gate_up, void* out_q8_1, int n, int rows, float beta, float linear_beta, void* stream,
+                    const ExpertScales* scales = nullptr);
 
 /// Block Attention Residual mixing over `n_slots` (`<= 6`) streams inside `r` ([rows, streams, n_embd]).
 /// Each slot vector is RMS-normed without weights (eps), scored against `query[q]` * rsqrt(n_embd),
 /// softmaxed across slots, and summed into `out[(q * rows + t) * n_embd]`.
 void inkling_mix(const float* r, int streams, MixSlots slots, int n_slots, const float* query, int n_queries,
                  float* out, int n_embd, int rows, float eps, void* stream);
+
+/// Fuses single-query inkling_mix() + RMSNorm (norm_w, rms_eps) + optional Q8_1 quantization (xq_out)
+/// into one launch. Returns false without launching if geometry is unsupported (caller falls back).
+bool inkling_mix_norm_q8(const float* r, int streams, MixSlots slots, int n_slots, const float* query,
+                         const float* norm_w, float* xn_out, void* xq_out, int n_embd, int rows, float mix_eps,
+                         float rms_eps, void* stream);
 
 /// Prep cross-pass control input: out_concat[t] = [rms_norm(cur[t], eps) | rms_norm(msg[t], eps)].
 void inkling_control_prep(const float* cur, const float* msg, float* out_concat, int n_embd, int rows, float eps,
@@ -448,6 +457,12 @@ void inkling_control_apply(const float* cur, const float* msg, const float* gain
 /// and writes outputs to `ch` [rows, rank].
 bool ink_ctrl_down(const float* const* cur, const float* const* msg, const float* const* down, float* const* ch,
                    int count, int n_embd, int rank, int rows, void* stream);
+/// Fuses `count` (1..3) cross-pass loop-controller up-projections (concatenated F32 [2*n_embd, rank] gain|forget)
+/// and `out = cur * (1 - tanh(forget)) + msg * tanh(gain)` into one launch for small `rows` (< 16).
+bool ink_control3_gate(const float* const* cur, const float* const* msg, const float* const* ch, const float* const* gf,
+                       float* const* out, int count, int n_embd, int rank, int rows, void* stream);
+/// ink_ctrl_down()'s one-pass kernel (opt-in, other bits: STRATA_INK_FAST_CTRL=1), CUDA only.
+void ink_set_fast_ctrl(bool on);
 
 /// Causal 4-tap short convolution + residual + 1/sqrt(5) (static) or 1/3 (dynamic) scaling.
 /// `state` holds 3 past inputs per channel, oldest first. When `dyn` is non-null ([rows, n_heads, 4]),
@@ -455,6 +470,15 @@ bool ink_ctrl_down(const float* const* cur, const float* const* msg, const float
 void inkling_conv4(const float* x, float* state, const float* w, const float* dyn, int head_dim, float* out,
                    int channels, int rows, void* stream, float* snap = nullptr, size_t stride = 0,
                    unsigned snaps = 0);
+
+/// Fuses static post-conv4 (rows < 16) with residual stream update in `r` ([rows, n_streams, n_embd]):
+/// - `pre_copy_dst >= 0`: copies stream 0 -> pre_copy_dst before updating stream 0
+/// - `replace_s0`: true writes conv output y to stream 0, false adds y to stream 0
+/// - `post_op`: 0 none; 1 copies updated stream 0 -> stream 2;
+///              2 copies stream 3 -> 4, updated stream 0 -> 5, stream 2 -> 0.
+void inkling_conv4_stream(const float* x, float* state, const float* w, float* r, int n_streams, int n_embd, int rows,
+                          int pre_copy_dst, bool replace_s0, int post_op, void* stream, float* snap = nullptr,
+                          size_t stride = 0, unsigned snaps = 0);
 
 struct InkConv {
     const float* x = nullptr;
@@ -485,6 +509,34 @@ void inkling_l2_clip(const float* x, const float* scale, float* out, int dim, in
                      int64_t pos, bool is_global, float log_floor, float log_alpha, int rows,
                      const long long* at, void* stream);
 
+/// Parameters for inkling_clips_store(): fuses Q/R L2-clip (+ tau on global), K L2-clip + KV store, and
+/// V parameterless RMSNorm + KV store (FP16, Q8_0, Q4_0, or K8V4) into one launch. Requires dim == 128, n_rel <= 32.
+struct InkClipsStore {
+    const float* q_in = nullptr;
+    const float* q_scale = nullptr;
+    float* q_out = nullptr;
+    const float* k_in = nullptr;
+    const float* v_in = nullptr;
+    const float* r_in = nullptr;
+    const float* r_scale = nullptr;
+    float* r_out = nullptr;
+    uint16_t* k_fp16 = nullptr;
+    int8_t* k_q8 = nullptr;
+    uint8_t* k_q4 = nullptr;
+    uint16_t* k_scales = nullptr;
+    uint16_t* v_fp16 = nullptr;
+    int8_t* v_q8 = nullptr;
+    uint8_t* v_q4 = nullptr;
+    uint16_t* v_scales = nullptr;
+    int n_head = 0, n_kv = 0, dim = 0, n_rel = 0, rows = 0, ring = 0;
+    int64_t pos = 0;
+    const long long* at = nullptr;
+    float qk_clip = 0.f, rel_clip = 0.f, rms_eps = 1e-6f;
+    bool is_global = false;
+    float log_floor = 1.f, log_alpha = 0.f;
+};
+void inkling_clips_store(const InkClipsStore& c, void* stream);
+
 /// Per-query relative-position distance bias table:
 /// table[(t * n_head + h) * n_extent + d] = dot(r_cur[t, h], rel_bias[d]) - sinks[t, h] for d in [0, n_extent).
 void inkling_rel_table(const float* r_cur, const float* rel_bias, const float* sinks, float* table, int n_rel,
@@ -502,14 +554,15 @@ void store_q4(const float* x, uint8_t* codes, uint16_t* scales, int n, int64_t p
 void store_q4_at(const float* x, uint8_t* codes, uint16_t* scales, int n, const long long* at, int rows, int ring,
                  void* stream);
 
-/// Inkling 2 decode/window attention with per-query distance bias table (`table`), beyond-extent fallback (`-sinks`),
-/// and virtual zero-value sink (m = 0, l = 1). Supports FP16, --kv q8_0, and --kv q4_0 caches, SWA rings, and CUDA
-/// graph `at`.
+/// Inkling 2 decode/window attention with per-query distance bias table (`table`) or direct `r_cur` + `rel_bias`,
+/// beyond-extent fallback (`-sinks`), virtual zero-value sink (m = 0, l = 1), and optional fused output sigmoid
+/// `gate`. Supports FP16, --kv q8_0, --kv q4_0, and --kv k8v4 caches, SWA rings, and CUDA graph `at`.
 void inkling_attend(const float* q, const uint16_t* kcache, const uint16_t* vcache, const float* table,
                     const float* sinks, int n_extent, int64_t pos, int rows, float* score, int chunk, float* out,
                     int dim, int n_head, int kv_heads, float scale, void* stream, int window = 0, int ring = 0,
                     const long long* at = nullptr, int room = 0, Kvq8 kq8 = {}, Kvq8 vq8 = {}, Kvq4 kq4 = {},
-                    Kvq4 vq4 = {});
+                    Kvq4 vq4 = {}, const float* r_cur = nullptr, const float* rel_bias = nullptr, int n_rel = 0,
+                    const float* gate = nullptr, void* out_q8 = nullptr);
 
 /// Inkling 2 prompt-batch attention using cuBLAS GEMM tiles + online block softmax with distance bias + zero sink.
 void inkling_attend_batch(void* blas, const float* q, const uint16_t* kcache, const uint16_t* vcache,
@@ -562,15 +615,16 @@ struct ExpertBell {
     uint32_t pad1[15];
     volatile uint32_t abort;   ///< the host gave up: every wait ends at once
     uint32_t pad2[15];
-    int32_t layer, n;          ///< the job: layer and how many experts
+    int32_t layer, n, tok_n;   ///< the job: layer, how many misses, and how many tokens (1..4)
     int32_t e[kBellJobs];      ///< their ids
+    int32_t tok[kBellJobs];    ///< which token [0, tok_n) each miss belongs to (non-decreasing)
     float w[kBellJobs];        ///< their router weights
 };
-/// One token's picks ids[0..n_used) with weights w at layer `layer`: the ones whose slots[] entry is null, at a place
-/// under skip_from, go into the bell, x (n floats) into hx, and the bell rings (seq[0] counts the rings; seq[1] is
-/// this one, or 0 when there is none). One block. CUDA only.
-void bell_ring(const void* const* slots, const int32_t* ids, const float* w, int n_used, int skip_from, int layer,
-               const float* x, float* hx, int n, ExpertBell* bell, uint32_t* seq, void* stream);
+/// Up to `n_tokens` tokens' picks ids[0..n_tokens * n_used) with weights w at layer `layer`: the ones whose slots[]
+/// entry is null, at a place under skip_from, go into the bell, x (`n_tokens * n_embd` floats) into hx, and the bell
+/// rings (seq[0] counts the rings; seq[1] is this one, or 0 when there is none). One block. CUDA only.
+void bell_ring(const void* const* slots, const int32_t* ids, const float* w, int n_tokens, int n_used, int skip_from,
+               int layer, const float* x, float* hx, int n_embd, ExpertBell* bell, uint32_t* seq, void* stream);
 /// Where seq[1] is a ring: wait until the bell's ack is that ring (or abort is set), then acc += hy (n floats).
 void bell_add(const ExpertBell* bell, const uint32_t* seq, const float* hy, float* acc, int n, void* stream);
 

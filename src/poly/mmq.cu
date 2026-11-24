@@ -23,7 +23,7 @@ namespace {
 
 // The types with kernels in this build: one template instance each in CMakeLists.txt.
 #define STRATA_POLY_MMQ_TYPES(X)                                                                                \
-    X(Q4_0) X(Q4_1) X(Q5_0) X(Q5_1) X(Q8_0) X(Q2_K) X(Q3_K) X(Q4_K) X(Q5_K) X(Q6_K)                             \
+    X(Q2_0) X(Q4_0) X(Q4_1) X(Q5_0) X(Q5_1) X(Q8_0) X(Q2_K) X(Q3_K) X(Q4_K) X(Q5_K) X(Q6_K)                     \
     X(IQ1_S) X(IQ2_XXS) X(IQ2_XS) X(IQ2_S) X(IQ3_XXS) X(IQ3_S) X(IQ4_NL) X(IQ4_XS) X(MXFP4)
 
 int64_t pad512(int64_t n) { return (n + 511) / 512 * 512; }

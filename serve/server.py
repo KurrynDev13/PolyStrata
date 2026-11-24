@@ -7402,8 +7402,9 @@ def clean_shared_defaults(d) -> dict:
             if not number or not 0 < value <= 1:
                 raise ValueError("top_p: 0 < top_p <= 1")
         elif key == "top_k":
-            if not number or value != int(value) or not 1 <= value <= 64:
-                raise ValueError("top_k: an integer 1..64")
+            # as a request's top_k: 0 is off, and the engine keeps at most 64 candidates
+            if not number or value != int(value) or value < 0:
+                raise ValueError("top_k: a whole number, 0 for off (the engine keeps at most 64)")
             value = int(value)
         elif key in ("seed", "max_tokens"):
             if not number or value != int(value) or value <= 0:
@@ -7536,8 +7537,9 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
                 raise SystemExit(f"[strata] config sampling.min_p={value!r}: expected 0 <= min_p <= 1")
             out[key] = float(value)
         elif key == "top_k":
-            if not number or value != int(value) or not 1 <= value <= 64:
-                raise SystemExit(f"[strata] config sampling.top_k={value!r}: the sampled path takes an integer 1..64")
+            if not number or value != int(value) or value < 0:
+                raise SystemExit(f"[strata] config sampling.top_k={value!r}: a whole number, 0 for off (the engine "
+                                 "keeps at most 64)")
             out[key] = int(value)
         elif key == "presence_penalty":
             if not number or value < 0:

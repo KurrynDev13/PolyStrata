@@ -4162,17 +4162,22 @@ void count_picks(const int32_t* ids, int rr, int n_expert, int32_t* uses, void* 
 }
 
 __global__ void bell_ring_kernel(const void* const* __restrict__ slots, const int32_t* __restrict__ ids,
-                                 const float* __restrict__ w, int n_used, int skip_from, int layer,
-                                 const float* __restrict__ x, float* hx, int n, ExpertBell* bell, uint32_t* seq) {
+                                 const float* __restrict__ w, int n_tokens, int n_used, int skip_from, int layer,
+                                 const float* __restrict__ x, float* hx, int n_embd, ExpertBell* bell, uint32_t* seq) {
     __shared__ int jobs;
     if (threadIdx.x == 0) {
         int j = 0;
-        for (int k = 0; k < n_used && j < kBellJobs; ++k)
-            if (!slots[ids[k]] && k < skip_from) {
-                bell->e[j] = ids[k];
-                bell->w[j] = w[k];
-                ++j;
+        for (int t = 0; t < n_tokens && j < kBellJobs; ++t) {
+            for (int k = 0; k < n_used && j < kBellJobs; ++k) {
+                const int idx = t * n_used + k;
+                if (!slots[ids[idx]] && k < skip_from) {
+                    bell->e[j] = ids[idx];
+                    bell->w[j] = w[idx];
+                    bell->tok[j] = t;
+                    ++j;
+                }
             }
+        }
         jobs = j;
     }
     __syncthreads();
@@ -4180,12 +4185,14 @@ __global__ void bell_ring_kernel(const void* const* __restrict__ slots, const in
         if (threadIdx.x == 0) seq[1] = 0;
         return;
     }
-    for (int i = threadIdx.x; i < n; i += blockDim.x) hx[i] = x[i];
+    const int total = n_tokens * n_embd;
+    for (int i = threadIdx.x; i < total; i += blockDim.x) hx[i] = x[i];
     __threadfence_system();   // the input and the jobs are the host's before the ring
     __syncthreads();
     if (threadIdx.x == 0) {
         bell->layer = layer;
         bell->n = jobs;
+        bell->tok_n = n_tokens;
         __threadfence_system();
         const uint32_t s = ++seq[0];
         bell->ring = s;
@@ -4210,9 +4217,10 @@ __global__ void bell_add_kernel(const ExpertBell* bell, const uint32_t* __restri
     for (int i = threadIdx.x; i < n; i += blockDim.x) acc[i] += *(volatile const float*) (hy + i);
 }
 
-void bell_ring(const void* const* slots, const int32_t* ids, const float* w, int n_used, int skip_from, int layer,
-               const float* x, float* hx, int n, ExpertBell* bell, uint32_t* seq, void* stream) {
-    bell_ring_kernel<<<1, 256, 0, cs(stream)>>>(slots, ids, w, n_used, skip_from, layer, x, hx, n, bell, seq);
+void bell_ring(const void* const* slots, const int32_t* ids, const float* w, int n_tokens, int n_used, int skip_from,
+               int layer, const float* x, float* hx, int n_embd, ExpertBell* bell, uint32_t* seq, void* stream) {
+    bell_ring_kernel<<<1, 256, 0, cs(stream)>>>(slots, ids, w, n_tokens, n_used, skip_from, layer, x, hx, n_embd, bell,
+                                                seq);
     if (const cudaError_t e = cudaGetLastError(); e != cudaSuccess)
         throw std::runtime_error(std::string("bell_ring: ") + cudaGetErrorString(e));
 }

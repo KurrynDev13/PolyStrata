@@ -573,7 +573,7 @@ int test_rel_and_attend() {
         Kvq4 kq4 = q4 ? Kvq4{d_k4, d_ks4} : Kvq4{};
         Kvq4 vq4 = q4 ? Kvq4{d_v4, d_vs4} : Kvq4{};
 
-        const int n_splits = std::clamp((total_keys + q_rows + 511) / 512 + 1, 1, 64);
+        const int n_splits = std::clamp((total_keys + q_rows + 127) / 128 + 1, 1, 64);
         const size_t score_n = std::max((size_t) q_rows * n_head * n_splits * (dim + 2),
                                         (size_t) q_rows * n_head * 2048);
         float* d_score = dev(std::vector<float>(score_n, 0.f));
@@ -1230,7 +1230,7 @@ int test_fused_and_predequant() {
         int8_t *d_k8 = dev(k8c), *d_v8 = dev(v8c);
         uint8_t *d_k4 = dev(k4c), *d_v4 = dev(v4c);
         uint16_t *d_ks8 = dev(ks8), *d_vs8 = dev(vs8), *d_ks4 = dev(ks4), *d_vs4 = dev(vs4);
-        const size_t score_n = (size_t) q_rows * nh * 2048;
+        const size_t score_n = std::max((size_t) q_rows * nh * 64 * (dim + 2), (size_t) q_rows * nh * 2048);
         float *d_sc = dev(std::vector<float>(score_n, 0.f)),
               *d_wrk = dev(std::vector<float>((size_t) q_rows * nh * (dim + dim / 2 + 3) + 1, 0.f)),
               *d_dec = dev(std::vector<float>(q_h.size(), 0.f)),
@@ -1300,6 +1300,630 @@ int test_fused_and_predequant() {
         bad += report("inkling_unpack_q_fused sinks", host(d_s, w_s.size()), w_s, 1e-6);
         cudaFree(d_src); cudaFree(d_qraw); cudaFree(d_gate); cudaFree(d_r); cudaFree(d_s);
     }
+
+    // 6. ink_ctrl_down fast one-pass kernel vs default (count = 3, rows = 4)
+    {
+        const int n_embd = 1024, rank = 64, rows = 4;
+        std::vector<std::vector<float>> cv(3), mv(3), wv(3);
+        float *dc[3] = {}, *dm[3] = {}, *dw[3] = {}, *dy[3] = {};
+        const float *cc[3] = {}, *cm[3] = {}, *cw[3] = {};
+        for (int j = 0; j < 3; ++j) {
+            cv[j] = random_vec((size_t) rows * n_embd, 1.0f);
+            mv[j] = random_vec((size_t) rows * n_embd, 1.0f);
+            wv[j] = random_vec((size_t) rank * 2 * n_embd, 0.25f);
+            cc[j] = dc[j] = dev(cv[j]);
+            cm[j] = dm[j] = dev(mv[j]);
+            cw[j] = dw[j] = dev(wv[j]);
+            dy[j] = dev(std::vector<float>((size_t) rows * rank, 0.f));
+        }
+        ink_set_fast_ctrl(false);
+        if (!ink_ctrl_down(cc, cm, cw, dy, 3, n_embd, rank, rows, nullptr)) ++bad;
+        cudaDeviceSynchronize();
+        std::vector<std::vector<float>> ref(3);
+        for (int j = 0; j < 3; ++j) ref[j] = host(dy[j], (size_t) rows * rank);
+        ink_set_fast_ctrl(true);
+        if (!ink_ctrl_down(cc, cm, cw, dy, 3, n_embd, rank, rows, nullptr)) ++bad;
+        cudaDeviceSynchronize();
+        for (int j = 0; j < 3; ++j) {
+            char lbl[64];
+            std::snprintf(lbl, sizeof(lbl), "ink_ctrl_down_fast[%d]", j);
+            bad += report(lbl, host(dy[j], (size_t) rows * rank), ref[j], 1e-5);
+            cudaFree(dc[j]); cudaFree(dm[j]); cudaFree(dw[j]); cudaFree(dy[j]);
+        }
+        ink_set_fast_ctrl(false);
+    }
+
+    // 7. Multi-token ExpertBell (bell_ring n_tokens=4, skip_from=4 + bell_add + zero-miss short-circuit)
+    {
+        const int n_tokens = 4, n_used = 8, skip_from = 4, n_embd = 64, n_exp = 16;
+        ExpertBell* h_bell = nullptr;
+        if (cudaHostAlloc(&h_bell, sizeof(ExpertBell), cudaHostAllocMapped) != cudaSuccess) ++bad;
+        std::memset(h_bell, 0, sizeof(ExpertBell));
+        std::vector<void*> slots(n_exp, (void*) 0x1000);
+        // token 0: k=0..7 all hit except k=5 (skipped >= skip_from)
+        // token 1: k=1 -> expert 3 miss (miss #0), k=3 -> expert 7 miss (miss #1)
+        // token 2: k=0 -> expert 1 miss (miss #2), k=6 -> expert 3 (skipped >= skip_from)
+        // token 3: all hit
+        slots[3] = nullptr;
+        slots[7] = nullptr;
+        slots[1] = nullptr;
+        void** d_slots = nullptr;
+        cudaMalloc(&d_slots, (size_t) n_exp * sizeof(void*));
+        cudaMemcpy(d_slots, slots.data(), (size_t) n_exp * sizeof(void*), cudaMemcpyHostToDevice);
+        std::vector<int32_t> h_ids(n_tokens * n_used, 0);
+        std::vector<float> h_wts(n_tokens * n_used, 0.1f);
+        h_ids[0 * n_used + 5] = 3;
+        h_ids[1 * n_used + 1] = 3; h_wts[1 * n_used + 1] = 0.25f;
+        h_ids[1 * n_used + 3] = 7; h_wts[1 * n_used + 3] = 0.50f;
+        h_ids[2 * n_used + 0] = 1; h_wts[2 * n_used + 0] = 0.75f;
+        h_ids[2 * n_used + 6] = 3;
+        int32_t* d_ids = dev(h_ids);
+        float* d_wts = dev(h_wts);
+        auto x_h = random_vec((size_t) n_tokens * n_embd, 1.0f);
+        auto acc_h = random_vec((size_t) n_tokens * n_embd, 1.0f);
+        auto hy_h = random_vec((size_t) n_tokens * n_embd, 1.0f);
+        float *d_x = dev(x_h), *d_acc = dev(acc_h), *d_hx = nullptr, *d_hy = nullptr;
+        cudaHostAlloc(&d_hx, (size_t) n_tokens * n_embd * sizeof(float), cudaHostAllocMapped);
+        cudaHostAlloc(&d_hy, (size_t) n_tokens * n_embd * sizeof(float), cudaHostAllocMapped);
+        std::memcpy(d_hy, hy_h.data(), hy_h.size() * sizeof(float));
+        uint32_t* d_seq = nullptr;
+        cudaMalloc(&d_seq, 2 * sizeof(uint32_t));
+        cudaMemset(d_seq, 0, 2 * sizeof(uint32_t));
+
+        // First test zero-miss token-only call (token 3 alone)
+        bell_ring(d_slots, d_ids + 3 * n_used, d_wts + 3 * n_used, 1, n_used, skip_from, 5, d_x, d_hx, n_embd,
+                  h_bell, d_seq, nullptr);
+        uint32_t seq_h[2] = {};
+        cudaMemcpy(seq_h, d_seq, sizeof(seq_h), cudaMemcpyDeviceToHost);
+        if (seq_h[0] != 0 || seq_h[1] != 0) {
+            std::printf("FAIL bell_ring zero-miss seq=(%u,%u)\n", seq_h[0], seq_h[1]);
+            ++bad;
+        }
+
+        // Now test n_tokens = 4
+        bell_ring(d_slots, d_ids, d_wts, n_tokens, n_used, skip_from, 11, d_x, d_hx, n_embd, h_bell, d_seq, nullptr);
+        cudaDeviceSynchronize();
+        const bool ok_meta = h_bell->ring == 1 && h_bell->layer == 11 && h_bell->tok_n == 4 && h_bell->n == 3 &&
+                             h_bell->e[0] == 3 && h_bell->tok[0] == 1 && std::abs(h_bell->w[0] - 0.25f) < 1e-6f &&
+                             h_bell->e[1] == 7 && h_bell->tok[1] == 1 && std::abs(h_bell->w[1] - 0.50f) < 1e-6f &&
+                             h_bell->e[2] == 1 && h_bell->tok[2] == 2 && std::abs(h_bell->w[2] - 0.75f) < 1e-6f;
+        if (!ok_meta) {
+            std::printf("FAIL bell_ring multi-token metadata\n");
+            ++bad;
+        }
+        std::vector<float> got_hx(d_hx, d_hx + (size_t) n_tokens * n_embd);
+        bad += report("bell_ring multi-token hx", got_hx, x_h, 1e-6);
+
+        h_bell->ack = h_bell->ring;
+        bell_add(h_bell, d_seq, d_hy, d_acc, n_tokens * n_embd, nullptr);
+        cudaDeviceSynchronize();
+        std::vector<float> want_acc(acc_h.size());
+        for (size_t i = 0; i < acc_h.size(); ++i) want_acc[i] = acc_h[i] + hy_h[i];
+        bad += report("bell_add multi-token acc", host(d_acc, want_acc.size()), want_acc, 1e-6);
+
+        cudaFree(d_slots); cudaFree(d_ids); cudaFree(d_wts);
+        cudaFree(d_x); cudaFree(d_acc); cudaFree(d_seq);
+        cudaFreeHost(d_hx); cudaFreeHost(d_hy); cudaFreeHost(h_bell);
+    }
+    return bad;
+}
+
+int test_decode_fusions() {
+    int bad = 0;
+
+    // F1. Direct r_cur + rel_bias + fused gate in inkling_attend()
+    {
+        auto run_f1 = [&](const char* label, int rows, int pos, int window, int ring, int n_extent, int kv_mode) {
+            const int n_head = 24, kv_heads = 8, dim = 128, n_rel = 16;
+            const int width = kv_heads * dim;
+            const int total_rows = ring > 0 ? ring : (pos + rows);
+            const float scale = 1.0f / std::sqrt((float) dim);
+            auto q = random_vec((size_t) rows * n_head * dim, 0.7f);
+            auto r_h = random_vec((size_t) rows * n_head * n_rel, 0.5f);
+            auto rb_h = random_vec((size_t) n_extent * n_rel, 0.3f);
+            auto snk = random_vec((size_t) rows * n_head, 0.3f);
+            auto gate = random_vec((size_t) rows * n_head * dim, 1.2f);
+            auto k_raw = random_vec((size_t) total_rows * width, 0.6f);
+            auto v_raw = random_vec((size_t) total_rows * width, 0.6f);
+
+            float *d_q = dev(q), *d_r = dev(r_h), *d_rb = dev(rb_h), *d_snk = dev(snk), *d_g = dev(gate);
+            float *d_kr = dev(k_raw), *d_vr = dev(v_raw);
+            uint16_t *d_k16 = nullptr, *d_v16 = nullptr;
+            int8_t *d_kc = nullptr, *d_vc = nullptr;
+            uint8_t *d_v4 = nullptr;
+            uint16_t *d_ks = nullptr, *d_vs = nullptr;
+            if (kv_mode == 0) {
+                cudaMalloc(&d_k16, (size_t) total_rows * width * sizeof(uint16_t));
+                cudaMalloc(&d_v16, (size_t) total_rows * width * sizeof(uint16_t));
+                store_f16(d_kr, d_k16, width, 0, total_rows, nullptr);
+                store_f16(d_vr, d_v16, width, 0, total_rows, nullptr);
+            } else if (kv_mode == 1) {
+                cudaMalloc(&d_kc, (size_t) total_rows * width);
+                cudaMalloc(&d_vc, (size_t) total_rows * width);
+                cudaMalloc(&d_ks, (size_t) total_rows * (width / 32) * sizeof(uint16_t));
+                cudaMalloc(&d_vs, (size_t) total_rows * (width / 32) * sizeof(uint16_t));
+                store_q8(d_kr, d_kc, d_ks, width, 0, total_rows, nullptr);
+                store_q8(d_vr, d_vc, d_vs, width, 0, total_rows, nullptr);
+            } else {
+                cudaMalloc(&d_kc, (size_t) total_rows * width);
+                cudaMalloc(&d_v4, (size_t) total_rows * (width / 2));
+                cudaMalloc(&d_ks, (size_t) total_rows * (width / 32) * sizeof(uint16_t));
+                cudaMalloc(&d_vs, (size_t) total_rows * (width / 32) * sizeof(uint16_t));
+                store_q8(d_kr, d_kc, d_ks, width, 0, total_rows, nullptr);
+                store_q4(d_vr, d_v4, d_vs, width, 0, total_rows, nullptr);
+            }
+            Kvq8 kq8 = (kv_mode == 1 || kv_mode == 2) ? Kvq8{d_kc, d_ks} : Kvq8{};
+            Kvq8 vq8 = (kv_mode == 1) ? Kvq8{d_vc, d_vs} : Kvq8{};
+            Kvq4 vq4 = (kv_mode == 2) ? Kvq4{d_v4, d_vs} : Kvq4{};
+
+            const size_t score_n = (size_t) rows * n_head * 64 * (dim + 2);
+            float *d_tbl = dev(std::vector<float>((size_t) rows * n_head * n_extent, 0.f));
+            float *d_sc = dev(std::vector<float>(score_n, 0.f));
+            float *d_ref = dev(std::vector<float>(q.size(), 0.f));
+            float *d_got = dev(std::vector<float>(q.size(), 0.f));
+            std::vector<long long> at_v((size_t) rows * 2);
+            for (int t = 0; t < rows; ++t) at_v[2 * t] = at_v[2 * t + 1] = pos + t;
+            long long* d_at = ring > 0 ? dev(at_v) : nullptr;
+            const int rm = d_at ? (window > 0 ? std::min(window + rows - 1, pos + rows) : pos + rows) : 0;
+
+            inkling_rel_table(d_r, d_rb, d_snk, d_tbl, n_rel, n_extent, n_head, rows, nullptr, false);
+            inkling_attend(d_q, d_k16, d_v16, d_tbl, d_snk, n_extent, pos, rows, d_sc, rows, d_ref, dim, n_head,
+                           kv_heads, scale, nullptr, window, ring, d_at, rm, kq8, vq8, {}, vq4);
+            mul_sigmoid(d_ref, d_g, n_head * dim, rows, n_head * dim, false, nullptr);
+
+            inkling_attend(d_q, d_k16, d_v16, nullptr, d_snk, n_extent, pos, rows, d_sc, rows, d_got, dim, n_head,
+                           kv_heads, scale, nullptr, window, ring, d_at, rm, kq8, vq8, {}, vq4, d_r, d_rb, n_rel,
+                           d_g);
+            cudaDeviceSynchronize();
+            bad += report(label, host(d_got, q.size()), host(d_ref, q.size()), 1e-4);
+
+            cudaFree(d_q); cudaFree(d_r); cudaFree(d_rb); cudaFree(d_snk); cudaFree(d_g);
+            cudaFree(d_kr); cudaFree(d_vr);
+            cudaFree(d_k16); cudaFree(d_v16); cudaFree(d_kc); cudaFree(d_vc); cudaFree(d_v4);
+            cudaFree(d_ks); cudaFree(d_vs); cudaFree(d_tbl); cudaFree(d_sc);
+            cudaFree(d_ref); cudaFree(d_got); cudaFree(d_at);
+        };
+        run_f1("F1 attend direct+gate SWA FP16 r=1", 1, 700, 1024, 1024, 1024, 0);
+        run_f1("F1 attend direct+gate SWA K8V4 r=4", 4, 1020, 1024, 1024, 1024, 2);
+        run_f1("F1 attend direct+gate Global Q8_0 r=4", 4, 900, 0, 0, 512, 1);
+    }
+
+    // F2. inkling_clips_store against inkling_l2_clip + rms_norm + store_*
+    {
+        auto run_f2 = [&](const char* label, int rows, int pos, int ring, bool is_global, bool use_at, int mode) {
+            const int n_head = 24, n_kv = 8, dim = 128, n_rel = 16;
+            const int kv_width = n_kv * dim, kv_nb = kv_width / 32;
+            const int cap = ring > 0 ? ring : (pos + rows);
+            const float qk_clip = 2.0f, rel_clip = 1.5f, eps = 1e-6f;
+            const float log_floor = 64.0f, log_alpha = 0.1f;
+
+            auto q_in = random_vec((size_t) rows * n_head * dim, 1.5f);
+            auto q_sc = random_vec((size_t) n_head * dim, 0.8f);
+            auto k_in = random_vec((size_t) rows * kv_width, 1.5f);
+            auto v_in = random_vec((size_t) rows * kv_width, 1.5f);
+            auto r_in = random_vec((size_t) rows * n_head * n_rel, 1.2f);
+            auto r_sc = random_vec((size_t) n_head * n_rel, 0.8f);
+
+            float *d_qin = dev(q_in), *d_qsc = dev(q_sc), *d_kin = dev(k_in), *d_vin = dev(v_in);
+            float *d_rin = dev(r_in), *d_rsc = dev(r_sc);
+            float *d_qref = dev(std::vector<float>(q_in.size(), 0.f));
+            float *d_kref = dev(std::vector<float>(k_in.size(), 0.f));
+            float *d_vref = dev(std::vector<float>(v_in.size(), 0.f));
+            float *d_rref = dev(std::vector<float>(r_in.size(), 0.f));
+            float *d_qgot = dev(std::vector<float>(q_in.size(), 0.f));
+            float *d_rgot = dev(std::vector<float>(r_in.size(), 0.f));
+
+            std::vector<long long> at_v((size_t) rows * 2);
+            for (int t = 0; t < rows; ++t) at_v[2 * t] = at_v[2 * t + 1] = pos + t;
+            long long* d_at = use_at ? dev(at_v) : nullptr;
+
+            // Ref outputs
+            inkling_l2_clip(d_qin, d_qsc, d_qref, dim, n_head, qk_clip, pos, is_global, log_floor, log_alpha, rows,
+                            d_at, nullptr);
+            inkling_l2_clip(d_kin, nullptr, d_kref, dim, n_kv, qk_clip, pos, false, log_floor, 0.f, rows, nullptr,
+                            nullptr);
+            rms_norm(d_vin, nullptr, d_vref, dim, rows * n_kv, eps, nullptr);
+            inkling_l2_clip(d_rin, d_rsc, d_rref, n_rel, n_head, rel_clip, pos, is_global, log_floor, log_alpha, rows,
+                            d_at, nullptr);
+
+            uint16_t *d_k16_r = nullptr, *d_v16_r = nullptr, *d_k16_g = nullptr, *d_v16_g = nullptr;
+            int8_t *d_k8_r = nullptr, *d_v8_r = nullptr, *d_k8_g = nullptr, *d_v8_g = nullptr;
+            uint8_t *d_k4_r = nullptr, *d_v4_r = nullptr, *d_k4_g = nullptr, *d_v4_g = nullptr;
+            uint16_t *d_ks_r = nullptr, *d_vs_r = nullptr, *d_ks_g = nullptr, *d_vs_g = nullptr;
+
+            InkClipsStore cs{};
+            cs.q_in = d_qin; cs.q_scale = d_qsc; cs.q_out = d_qgot;
+            cs.k_in = d_kin; cs.v_in = d_vin;
+            cs.r_in = d_rin; cs.r_scale = d_rsc; cs.r_out = d_rgot;
+            cs.n_head = n_head; cs.n_kv = n_kv; cs.dim = dim; cs.n_rel = n_rel;
+            cs.rows = rows; cs.ring = ring; cs.pos = pos; cs.at = d_at;
+            cs.qk_clip = qk_clip; cs.rel_clip = rel_clip; cs.rms_eps = eps;
+            cs.is_global = is_global; cs.log_floor = log_floor; cs.log_alpha = log_alpha;
+
+            auto store_side = [&](const float* x, bool val, uint16_t* f16, int8_t* c8, uint8_t* c4, uint16_t* sc) {
+                const bool u4 = (mode == 2) || (val && mode == 3);
+                const bool u8 = (mode == 1) || (!val && mode == 3);
+                if (use_at) {
+                    if (u4) store_q4_at(x, c4, sc, kv_width, d_at, rows, ring, nullptr);
+                    else if (u8) store_q8_at(x, c8, sc, kv_width, d_at, rows, ring, nullptr);
+                    else store_f16_at(x, f16, kv_width, d_at, rows, ring, nullptr);
+                } else if (ring > 0) {
+                    const int at = pos % ring, head = std::min(rows, ring - at);
+                    if (u4) {
+                        store_q4(x, c4, sc, kv_width, at, head, nullptr);
+                        if (head < rows) store_q4(x + (size_t) head * kv_width, c4, sc, kv_width, 0, rows - head, nullptr);
+                    } else if (u8) {
+                        store_q8(x, c8, sc, kv_width, at, head, nullptr);
+                        if (head < rows) store_q8(x + (size_t) head * kv_width, c8, sc, kv_width, 0, rows - head, nullptr);
+                    } else {
+                        store_f16(x, f16, kv_width, at, head, nullptr);
+                        if (head < rows) store_f16(x + (size_t) head * kv_width, f16, kv_width, 0, rows - head, nullptr);
+                    }
+                } else {
+                    if (u4) store_q4(x, c4, sc, kv_width, pos, rows, nullptr);
+                    else if (u8) store_q8(x, c8, sc, kv_width, pos, rows, nullptr);
+                    else store_f16(x, f16, kv_width, pos, rows, nullptr);
+                }
+            };
+
+            if (mode == 0) {
+                d_k16_r = dev(std::vector<uint16_t>((size_t) cap * kv_width, 0));
+                d_v16_r = dev(std::vector<uint16_t>((size_t) cap * kv_width, 0));
+                d_k16_g = dev(std::vector<uint16_t>((size_t) cap * kv_width, 0));
+                d_v16_g = dev(std::vector<uint16_t>((size_t) cap * kv_width, 0));
+                cs.k_fp16 = d_k16_g; cs.v_fp16 = d_v16_g;
+            } else {
+                d_ks_r = dev(std::vector<uint16_t>((size_t) cap * kv_nb, 0));
+                d_vs_r = dev(std::vector<uint16_t>((size_t) cap * kv_nb, 0));
+                d_ks_g = dev(std::vector<uint16_t>((size_t) cap * kv_nb, 0));
+                d_vs_g = dev(std::vector<uint16_t>((size_t) cap * kv_nb, 0));
+                if (mode == 1 || mode == 3) {
+                    d_k8_r = dev(std::vector<int8_t>((size_t) cap * kv_width, 0));
+                    d_k8_g = dev(std::vector<int8_t>((size_t) cap * kv_width, 0));
+                    cs.k_q8 = d_k8_g;
+                } else {
+                    d_k4_r = dev(std::vector<uint8_t>((size_t) cap * (kv_width / 2), 0));
+                    d_k4_g = dev(std::vector<uint8_t>((size_t) cap * (kv_width / 2), 0));
+                    cs.k_q4 = d_k4_g;
+                }
+                cs.k_scales = d_ks_g;
+                if (mode == 1) {
+                    d_v8_r = dev(std::vector<int8_t>((size_t) cap * kv_width, 0));
+                    d_v8_g = dev(std::vector<int8_t>((size_t) cap * kv_width, 0));
+                    cs.v_q8 = d_v8_g;
+                } else {
+                    d_v4_r = dev(std::vector<uint8_t>((size_t) cap * (kv_width / 2), 0));
+                    d_v4_g = dev(std::vector<uint8_t>((size_t) cap * (kv_width / 2), 0));
+                    cs.v_q4 = d_v4_g;
+                }
+                cs.v_scales = d_vs_g;
+            }
+            store_side(d_kref, false, d_k16_r, d_k8_r, d_k4_r, d_ks_r);
+            store_side(d_vref, true, d_v16_r, d_v8_r, d_v4_r, d_vs_r);
+            inkling_clips_store(cs, nullptr);
+            cudaDeviceSynchronize();
+
+            bad += report(label, host(d_qgot, q_in.size()), host(d_qref, q_in.size()), 1e-5);
+            bad += report(label, host(d_rgot, r_in.size()), host(d_rref, r_in.size()), 1e-5);
+            auto check_bytes = [&](const char* what, const void* g_ptr, const void* r_ptr, size_t nbytes) {
+                std::vector<uint8_t> hg(nbytes), hr(nbytes);
+                cudaMemcpy(hg.data(), g_ptr, nbytes, cudaMemcpyDeviceToHost);
+                cudaMemcpy(hr.data(), r_ptr, nbytes, cudaMemcpyDeviceToHost);
+                if (hg != hr) {
+                    int diff = 0;
+                    for (size_t i = 0; i < nbytes; ++i) diff += (hg[i] != hr[i]);
+                    std::printf("%-42s MISMATCH %d/%zu bytes  FAIL\n", what, diff, nbytes);
+                    ++bad;
+                }
+            };
+            if (mode == 0) {
+                check_bytes(label, d_k16_g, d_k16_r, (size_t) cap * kv_width * 2);
+                check_bytes(label, d_v16_g, d_v16_r, (size_t) cap * kv_width * 2);
+            } else {
+                check_bytes(label, d_ks_g, d_ks_r, (size_t) cap * kv_nb * 2);
+                check_bytes(label, d_vs_g, d_vs_r, (size_t) cap * kv_nb * 2);
+                if (d_k8_g) check_bytes(label, d_k8_g, d_k8_r, (size_t) cap * kv_width);
+                if (d_v8_g) check_bytes(label, d_v8_g, d_v8_r, (size_t) cap * kv_width);
+                if (d_k4_g) check_bytes(label, d_k4_g, d_k4_r, (size_t) cap * (kv_width / 2));
+                if (d_v4_g) check_bytes(label, d_v4_g, d_v4_r, (size_t) cap * (kv_width / 2));
+            }
+            cudaFree(d_qin); cudaFree(d_qsc); cudaFree(d_kin); cudaFree(d_vin); cudaFree(d_rin); cudaFree(d_rsc);
+            cudaFree(d_qref); cudaFree(d_kref); cudaFree(d_vref); cudaFree(d_rref); cudaFree(d_qgot); cudaFree(d_rgot);
+            cudaFree(d_at); cudaFree(d_k16_r); cudaFree(d_v16_r); cudaFree(d_k16_g); cudaFree(d_v16_g);
+            cudaFree(d_k8_r); cudaFree(d_v8_r); cudaFree(d_k8_g); cudaFree(d_v8_g);
+            cudaFree(d_k4_r); cudaFree(d_v4_r); cudaFree(d_k4_g); cudaFree(d_v4_g);
+            cudaFree(d_ks_r); cudaFree(d_vs_r); cudaFree(d_ks_g); cudaFree(d_vs_g);
+        };
+        run_f2("F2 clips_store SWA wrap FP16 r=4", 4, 62, 64, false, false, 0);
+        run_f2("F2 clips_store Global Q8_0 at r=4", 4, 150, 0, true, true, 1);
+        run_f2("F2 clips_store SWA Q4_0 at r=3", 3, 62, 64, false, true, 2);
+        run_f2("F2 clips_store Global K8V4 r=4", 4, 200, 0, true, false, 3);
+    }
+
+    // F3. ink_control3_gate (count=3 SWA aliasing + count=1)
+    {
+        for (int rows : {1, 4}) {
+            const int n_embd = 512, rank = 64, count = 3;
+            auto in0_h = random_vec((size_t) rows * n_embd, 0.7f);
+            std::vector<float> msg_h[3], ch_h[3], gf_h[3], ref_h[3];
+            float* dm[3], *dch[3], *dgf[3], *dout[3];
+            for (int j = 0; j < count; ++j) {
+                msg_h[j] = random_vec((size_t) rows * n_embd, 0.7f);
+                ch_h[j] = random_vec((size_t) rows * rank, 0.5f);
+                gf_h[j] = random_vec((size_t) 2 * n_embd * rank, 0.25f);
+                dm[j] = dev(msg_h[j]);
+                dch[j] = dev(ch_h[j]);
+                dgf[j] = dev(gf_h[j]);
+                ref_h[j].resize((size_t) rows * n_embd);
+                for (int r = 0; r < rows; ++r) {
+                    for (int i = 0; i < n_embd; ++i) {
+                        double g = 0.0, f = 0.0;
+                        for (int k = 0; k < rank; ++k) {
+                            const double xv = ch_h[j][(size_t) r * rank + k];
+                            g += (double) gf_h[j][(size_t) i * rank + k] * xv;
+                            f += (double) gf_h[j][(size_t) (n_embd + i) * rank + k] * xv;
+                        }
+                        const size_t idx = (size_t) r * n_embd + i;
+                        ref_h[j][idx] = (float) ((double) in0_h[idx] * (1.0 - std::tanh(f)) +
+                                                 (double) msg_h[j][idx] * std::tanh(g));
+                    }
+                }
+            }
+            float* din0 = dev(in0_h);
+            float* d1 = dev(std::vector<float>((size_t) rows * n_embd, 0.f));
+            float* d2 = dev(std::vector<float>((size_t) rows * n_embd, 0.f));
+            // SWA aliasing: cur={in0, in0, in0}, out={d1, d2, in0}
+            const float* c3[3] = {din0, din0, din0};
+            const float* m3[3] = {dm[0], dm[1], dm[2]};
+            const float* ch3[3] = {dch[0], dch[1], dch[2]};
+            const float* gf3[3] = {dgf[0], dgf[1], dgf[2]};
+            dout[0] = d1; dout[1] = d2; dout[2] = din0;
+            ink_control3_gate(c3, m3, ch3, gf3, dout, count, n_embd, rank, rows, nullptr);
+            // Also test count=1 on d1
+            float* ds_out = dev(std::vector<float>((size_t) rows * n_embd, 0.f));
+            float* d_single_c = dev(in0_h);
+            ink_control3_gate(&d_single_c, &dm[0], &dch[0], &dgf[0], &ds_out, 1, n_embd, rank, rows, nullptr);
+            cudaDeviceSynchronize();
+            for (int j = 0; j < count; ++j) {
+                char lbl[64];
+                std::snprintf(lbl, sizeof(lbl), "F3 control3_gate r=%d j=%d", rows, j);
+                bad += report(lbl, host(dout[j], ref_h[j].size()), ref_h[j], 1e-5);
+            }
+            bad += report("F3 control3_gate single", host(ds_out, ref_h[0].size()), ref_h[0], 1e-5);
+            cudaFree(din0); cudaFree(d1); cudaFree(d2); cudaFree(ds_out); cudaFree(d_single_c);
+            for (int j = 0; j < count; ++j) { cudaFree(dm[j]); cudaFree(dch[j]); cudaFree(dgf[j]); }
+        }
+    }
+
+    // F4. inkling_conv4_stream against inkling_conv4 + copy/write/add stream
+    {
+        auto run_f4 = [&](const char* label, int rows, int pre_copy_dst, bool replace_s0, int post_op,
+                          unsigned snaps) {
+            const int n_streams = 6, n_embd = 512;
+            auto x = random_vec((size_t) rows * n_embd, 0.8f);
+            auto st = random_vec((size_t) n_embd * 3, 0.6f);
+            auto w = random_vec((size_t) n_embd * 4, 0.4f);
+            auto r0 = random_vec((size_t) rows * n_streams * n_embd, 0.7f);
+            const int n_snaps = 4;
+            const size_t stride = (size_t) n_embd * 3;
+            std::vector<float> snap_z((size_t) n_snaps * stride, 0.f);
+
+            float *dx = dev(x), *dw = dev(w);
+            float *dst_ref = dev(st), *dst_got = dev(st);
+            float *dr_ref = dev(r0), *dr_got = dev(r0);
+            float *dao = dev(std::vector<float>(x.size(), 0.f));
+            float *dsnap_ref = snaps ? dev(snap_z) : nullptr;
+            float *dsnap_got = snaps ? dev(snap_z) : nullptr;
+
+            inkling_conv4(dx, dst_ref, dw, nullptr, 0, dao, n_embd, rows, nullptr, dsnap_ref, stride, snaps);
+            if (pre_copy_dst >= 0) inkling_copy_stream(dr_ref, n_streams, pre_copy_dst, 0, n_embd, rows, nullptr);
+            if (replace_s0) inkling_write_stream(dao, dr_ref, n_streams, 0, n_embd, rows, nullptr);
+            else inkling_add_to_stream(nullptr, dao, dr_ref, n_streams, 0, n_embd, rows, nullptr);
+            if (post_op == 1) inkling_copy_stream(dr_ref, n_streams, 2, 0, n_embd, rows, nullptr);
+            else if (post_op == 2) {
+                inkling_copy_stream(dr_ref, n_streams, 4, 3, n_embd, rows, nullptr);
+                inkling_copy_stream(dr_ref, n_streams, 5, 0, n_embd, rows, nullptr);
+                inkling_copy_stream(dr_ref, n_streams, 0, 2, n_embd, rows, nullptr);
+            }
+
+            inkling_conv4_stream(dx, dst_got, dw, dr_got, n_streams, n_embd, rows, pre_copy_dst, replace_s0, post_op,
+                                 nullptr, dsnap_got, stride, snaps);
+            cudaDeviceSynchronize();
+            bad += report(label, host(dr_got, r0.size()), host(dr_ref, r0.size()), 1e-6);
+            bad += report(label, host(dst_got, st.size()), host(dst_ref, st.size()), 1e-6);
+            if (snaps) bad += report(label, host(dsnap_got, snap_z.size()), host(dsnap_ref, snap_z.size()), 1e-6);
+
+            cudaFree(dx); cudaFree(dw); cudaFree(dst_ref); cudaFree(dst_got);
+            cudaFree(dr_ref); cudaFree(dr_got); cudaFree(dao); cudaFree(dsnap_ref); cudaFree(dsnap_got);
+        };
+        run_f4("F4 conv4_stream replace pre=3 r=4", 4, 3, true, 0, 0);
+        run_f4("F4 conv4_stream add post=1 r=1", 1, -1, false, 1, 0);
+        run_f4("F4 conv4_stream add post=2 snap r=4", 4, -1, false, 2, 0b1010u);
+    }
+
+    // F5. inkling_mix_norm_q8 against inkling_mix + rms_norm + reference Q8_1
+    {
+        for (int n_slots : {2, 3, 5}) {
+            const int rows = 4, n_streams = 6, n_embd = 2048;
+            const MixSlots slots{{0, 1, 2, 3, 4, 0}};
+            const float mix_eps = 1e-6f, rms_eps = 1e-6f;
+            auto r = random_vec((size_t) rows * n_streams * n_embd, 0.8f);
+            auto q = random_vec((size_t) n_embd, 0.4f);
+            auto nw = random_vec((size_t) n_embd, 1.0f);
+
+            float *dr = dev(r), *dq = dev(q), *dnw = dev(nw);
+            float *dmix = dev(std::vector<float>((size_t) rows * n_embd, 0.f));
+            float *dxn_ref = dev(std::vector<float>((size_t) rows * n_embd, 0.f));
+            float *dxn_got = dev(std::vector<float>((size_t) rows * n_embd, 0.f));
+            const size_t q8_bytes = (size_t) rows * (n_embd / 32) * 36;
+            uint8_t* dxq = dev(std::vector<uint8_t>(q8_bytes, 0));
+
+            inkling_mix(dr, n_streams, slots, n_slots, dq, 1, dmix, n_embd, rows, mix_eps, nullptr);
+            rms_norm(dmix, dnw, dxn_ref, n_embd, rows, rms_eps, nullptr);
+            const bool ok = inkling_mix_norm_q8(dr, n_streams, slots, n_slots, dq, dnw, dxn_got, dxq, n_embd, rows,
+                                                mix_eps, rms_eps, nullptr);
+            cudaDeviceSynchronize();
+            if (!ok) { std::printf("FAIL inkling_mix_norm_q8 returned false\n"); ++bad; }
+
+            auto got_xn = host(dxn_got, (size_t) rows * n_embd);
+            auto ref_xn = host(dxn_ref, (size_t) rows * n_embd);
+            char lbl[64];
+            std::snprintf(lbl, sizeof(lbl), "F5 mix_norm_q8 xn slots=%d", n_slots);
+            bad += report(lbl, got_xn, ref_xn, 1e-5);
+
+            // Verify Q8_1 block codes and (d, sum) scales match dxn_got
+            auto got_xq = host(dxq, q8_bytes);
+            std::vector<float> deq_got((size_t) rows * n_embd), deq_want((size_t) rows * n_embd);
+            const int nb = n_embd / 32;
+            for (int row = 0; row < rows; ++row) {
+                for (int b = 0; b < nb; ++b) {
+                    const uint8_t* blk = got_xq.data() + ((size_t) row * nb + b) * 36;
+                    uint16_t dh, sh;
+                    std::memcpy(&dh, blk, 2);
+                    std::memcpy(&sh, blk + 2, 2);
+                    const float df = __half2float(__ushort_as_half(dh));
+                    const float sf = __half2float(__ushort_as_half(sh));
+                    float amax = 0.f, bsum = 0.f;
+                    for (int j = 0; j < 32; ++j) {
+                        const float v = got_xn[(size_t) row * n_embd + b * 32 + j];
+                        amax = std::max(amax, std::fabs(v));
+                        bsum += v;
+                    }
+                    const float d_want = std::min(65504.f, amax / 127.0f);
+                    const float id = d_want > 0.f ? 1.0f / d_want : 0.f;
+                    for (int j = 0; j < 32; ++j) {
+                        const int8_t qg = (int8_t) blk[4 + j];
+                        const float v = got_xn[(size_t) row * n_embd + b * 32 + j];
+                        const int qw = amax == 0.f ? 0 : std::clamp((int) std::lround(v * id), -127, 127);
+                        deq_got[(size_t) row * n_embd + b * 32 + j] = (float) qg * df;
+                        deq_want[(size_t) row * n_embd + b * 32 + j] = (float) qw * __half2float(__float2half(d_want));
+                    }
+                    if (std::fabs(sf - bsum) > 0.05f * (1.0f + std::fabs(bsum))) {
+                        std::printf("FAIL Q8_1 block sum row=%d b=%d got=%.3f want=%.3f\n", row, b, sf, bsum);
+                        ++bad;
+                    }
+                }
+            }
+            std::snprintf(lbl, sizeof(lbl), "F5 mix_norm_q8 deq slots=%d", n_slots);
+            bad += report(lbl, deq_got, deq_want, 1e-4);
+
+            // Also verify null xq_out (output_rows path)
+            cudaMemset(dxn_got, 0, (size_t) rows * n_embd * sizeof(float));
+            const bool ok_noq = inkling_mix_norm_q8(dr, n_streams, slots, n_slots, dq, dnw, dxn_got, nullptr, n_embd,
+                                                    rows, mix_eps, rms_eps, nullptr);
+            cudaDeviceSynchronize();
+            if (!ok_noq) ++bad;
+            std::snprintf(lbl, sizeof(lbl), "F5 mix_norm_q8 xn(noq) slots=%d", n_slots);
+            bad += report(lbl, host(dxn_got, (size_t) rows * n_embd), ref_xn, 1e-5);
+
+            cudaFree(dr); cudaFree(dq); cudaFree(dnw); cudaFree(dmix);
+            cudaFree(dxn_ref); cudaFree(dxn_got); cudaFree(dxq);
+        }
+    }
+
+    auto verify_q8_1 = [&](const char* label, const uint8_t* q8_bytes, const std::vector<float>& src, int rows,
+                           int cols) {
+        const int nb = cols / 32;
+        std::vector<float> deq_got((size_t) rows * cols), deq_want((size_t) rows * cols);
+        for (int row = 0; row < rows; ++row) {
+            for (int b = 0; b < nb; ++b) {
+                const uint8_t* blk = q8_bytes + ((size_t) row * nb + b) * 36;
+                uint16_t dh, sh;
+                std::memcpy(&dh, blk, 2);
+                std::memcpy(&sh, blk + 2, 2);
+                const float df = __half2float(__ushort_as_half(dh));
+                const float sf = __half2float(__ushort_as_half(sh));
+                float amax = 0.f, bsum = 0.f;
+                for (int j = 0; j < 32; ++j) {
+                    const float v = src[(size_t) row * cols + b * 32 + j];
+                    amax = std::max(amax, std::fabs(v));
+                    bsum += v;
+                }
+                const float d_want = std::min(65504.f, amax / 127.0f);
+                const float id = d_want > 0.f ? 1.0f / d_want : 0.f;
+                for (int j = 0; j < 32; ++j) {
+                    const int8_t qg = (int8_t) blk[4 + j];
+                    const float v = src[(size_t) row * cols + b * 32 + j];
+                    const int qw = amax == 0.f ? 0 : std::clamp((int) std::lround(v * id), -127, 127);
+                    deq_got[(size_t) row * cols + b * 32 + j] = (float) qg * df;
+                    deq_want[(size_t) row * cols + b * 32 + j] = (float) qw * __half2float(__float2half(d_want));
+                }
+                if (std::fabs(sf - bsum) > 0.05f * (1.0f + std::fabs(bsum))) {
+                    std::printf("FAIL %s block sum row=%d b=%d got=%.3f want=%.3f\n", label, row, b, sf, bsum);
+                    ++bad;
+                }
+            }
+        }
+        bad += report(label, deq_got, deq_want, 1e-4);
+    };
+
+    // F6. inkling_attend(..., out = nullptr, out_q8 != nullptr)
+    {
+        const int rows = 4, n_head = 24, kv_heads = 8, dim = 128, n_rel = 16, window = 1024, pos = 700;
+        const int width = kv_heads * dim, cols = n_head * dim;
+        const float scale = 1.0f / std::sqrt((float) dim);
+        auto q = random_vec((size_t) rows * cols, 0.7f);
+        auto r_h = random_vec((size_t) rows * n_head * n_rel, 0.5f);
+        auto rb_h = random_vec((size_t) window * n_rel, 0.3f);
+        auto snk = random_vec((size_t) rows * n_head, 0.3f);
+        auto gate = random_vec((size_t) rows * cols, 1.2f);
+        auto k_raw = random_vec((size_t) window * width, 0.6f);
+        auto v_raw = random_vec((size_t) window * width, 0.6f);
+
+        float *d_q = dev(q), *d_r = dev(r_h), *d_rb = dev(rb_h), *d_snk = dev(snk), *d_g = dev(gate);
+        float *d_kr = dev(k_raw), *d_vr = dev(v_raw);
+        int8_t* d_kc = nullptr; uint8_t* d_v4 = nullptr;
+        uint16_t *d_ks = nullptr, *d_vs = nullptr;
+        cudaMalloc(&d_kc, (size_t) window * width);
+        cudaMalloc(&d_v4, (size_t) window * (width / 2));
+        cudaMalloc(&d_ks, (size_t) window * (width / 32) * sizeof(uint16_t));
+        cudaMalloc(&d_vs, (size_t) window * (width / 32) * sizeof(uint16_t));
+        store_q8(d_kr, d_kc, d_ks, width, 0, window, nullptr);
+        store_q4(d_vr, d_v4, d_vs, width, 0, window, nullptr);
+
+        float* d_sc = dev(std::vector<float>((size_t) rows * n_head * 64 * (dim + 2), 0.f));
+        float* d_ref = dev(std::vector<float>((size_t) rows * cols, 0.f));
+        const size_t q8_bytes = (size_t) rows * (cols / 32) * 36;
+        uint8_t* d_q8 = dev(std::vector<uint8_t>(q8_bytes, 0));
+
+        inkling_attend(d_q, nullptr, nullptr, nullptr, d_snk, window, pos, rows, d_sc, rows, d_ref, dim, n_head,
+                       kv_heads, scale, nullptr, window, window, nullptr, 0, {d_kc, d_ks}, {}, {}, {d_v4, d_vs}, d_r,
+                       d_rb, n_rel, d_g, nullptr);
+        inkling_attend(d_q, nullptr, nullptr, nullptr, d_snk, window, pos, rows, d_sc, rows, nullptr, dim, n_head,
+                       kv_heads, scale, nullptr, window, window, nullptr, 0, {d_kc, d_ks}, {}, {}, {d_v4, d_vs}, d_r,
+                       d_rb, n_rel, d_g, d_q8);
+        cudaDeviceSynchronize();
+        verify_q8_1("F6 attend out=null out_q8 K8V4", host(d_q8, q8_bytes).data(), host(d_ref, (size_t) rows * cols),
+                    rows, cols);
+
+        cudaFree(d_q); cudaFree(d_r); cudaFree(d_rb); cudaFree(d_snk); cudaFree(d_g);
+        cudaFree(d_kr); cudaFree(d_vr); cudaFree(d_kc); cudaFree(d_v4);
+        cudaFree(d_ks); cudaFree(d_vs); cudaFree(d_sc); cudaFree(d_ref); cudaFree(d_q8);
+    }
+
+    // F7. situ_rows_q8_1 with ExpertScales against situ_rows
+    {
+        const int rows = 8, n_ff = 256;
+        const float beta = 4.0f, lbeta = 25.0f;
+        auto gu = random_vec((size_t) rows * 2 * n_ff, 3.0f);
+        auto sg = random_vec(8, 0.5f);
+        auto su = random_vec(8, 0.5f);
+        std::vector<int32_t> h_ids = {2, 0, 5, 1, 7, 3, 4, 6};
+        float *d_gu = dev(gu), *d_sg = dev(sg), *d_su = dev(su),
+              *d_out = dev(std::vector<float>((size_t) rows * n_ff, 0.f));
+        int32_t* d_ids = dev(h_ids);
+        const size_t q8_bytes = (size_t) rows * (n_ff / 32) * 36;
+        uint8_t* d_q8 = dev(std::vector<uint8_t>(q8_bytes, 0));
+        ExpertScales es{d_sg, d_su, d_ids};
+
+        situ_rows(d_gu, d_out, n_ff, rows, beta, lbeta, nullptr, &es);
+        situ_rows_q8_1(d_gu, d_q8, n_ff, rows, beta, lbeta, nullptr, &es);
+        cudaDeviceSynchronize();
+        verify_q8_1("F7 situ_rows_q8_1 with ExpertScales", host(d_q8, q8_bytes).data(),
+                    host(d_out, (size_t) rows * n_ff), rows, n_ff);
+
+        cudaFree(d_gu); cudaFree(d_sg); cudaFree(d_su); cudaFree(d_out); cudaFree(d_ids); cudaFree(d_q8);
+    }
     return bad;
 }
 
@@ -1315,6 +1939,7 @@ int main() {
     bad += test_rel_and_attend();
     bad += test_dspark_kernels();
     bad += test_fused_and_predequant();
+    bad += test_decode_fusions();
     std::printf("\n%s\n", bad ? "FAILED" : "ALL PASSED");
     return bad ? 1 : 0;
 }

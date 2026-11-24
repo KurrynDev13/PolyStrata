@@ -116,8 +116,8 @@ struct Options {
                                   ///< this share of its token's experts' weight, for every token of the call, is left
                                   ///< out (--skip-weight); 0: tail_skip decides
     float cache_bias = 0;         ///< a token's few-at-a-time routing adds this to the score of each expert in VRAM
-                                  ///< before it picks its experts; their weights stay the softmax of the scores the
-                                  ///< router gave (--cache-bias, qwen35moe only); 0: the router's own picks
+                                  ///< before it picks its experts; their weights stay the router's own
+                                  ///< (--cache-bias, qwen35moe and inkling2, route_cached()); 0: the router's own picks
     std::string layer_split;      ///< the layers across the CUDA devices this process sees, in their order: "auto"
                                   ///< (by each card's free VRAM) or the first layer of each later card ("20,30");
                                   ///< empty, or one device: the current card alone
@@ -463,11 +463,16 @@ protected:
     /// for, or -1 where it has none (a picture's row, the draft block).  tmp: 2 * n_expert_ floats of scratch.  A
     /// prompt batch's tokens are routed by several threads at once: it changes nothing of the engine's.
     virtual void route(int il, const float* logits, int32_t token, int* ids, float* w, float* tmp) const = 0;
-    /// Unbiased expert weights for already-chosen expert `ids[0..n_used_)`, called when `--cache-bias` selected
-    /// experts using biased scores. Default: softmax(logits[ids]).
-    virtual void route_weights(int il, const float* logits, const int* ids, float* w) const;
+    /// route() with Options::cache_bias, for a token that comes a few at a time (moe()): the experts in VRAM (L.slot)
+    /// are favored by F, and the weights stay the router's own.  The engine's is qwen35moe's: F on the scores, and the
+    /// picks weighed as a softmax of their own scores.
+    virtual void route_cached(const Layer& L, int il, const float* scores, int32_t token, int* ids, float* w,
+                              float* tmp);
+    /// card_moe() has put a new set of experts in VRAM on the card (d_slots_), before the call's launches.
+    virtual void slots_moved() {}
     /// A prompt batch's routing on the card: n tokens' experts and weights from their scores in rl_, n_used_ a token
     /// into ids and w (on the card), what route() gives them up to the last bits of a weight.  False: the host routes.
+    /// moe_card() routes a few tokens with it too (n < kStageRows), where --cache-bias applies as in route_cached().
     virtual bool route_card(int il, int n, int32_t* ids, float* w) {
         (void) il, (void) n, (void) ids, (void) w;
         return false;
@@ -477,6 +482,10 @@ protected:
     /// The scores of a layer's router for n tokens, into rl_.  The engine's own: the router's matrix times the
     /// experts' input (xn_).
     virtual void router_scores(const Layer& L, int n);
+    /// The router (ffn_gate_inp) goes to VRAM as BF16 when its F32 values are all BF16 ones (upload()'s kExactBF16):
+    /// lin() widens BF16 exactly and sums as for F32, so the same scores from half the bytes.  false (the default):
+    /// as its file has it.
+    virtual bool router_bf16() const { return false; }
     /// What is done to `rows` rows of logits on the card before they are copied out.
     virtual void finish_logits(float* logits, int rows) { (void) logits, (void) rows; }
     /// What a token's embedding is multiplied by on its way in.
@@ -560,7 +569,11 @@ protected:
     float* pass_rows(int n);
     /// kGuessMat: quantized again to Q4_0, for a matrix only guesses are made with: a guess is checked, so a less
     /// exact one costs a wrong guess now and then and no token.
-    enum Want { kF32, kFloatMat, kAnyMat, kGuessMat };
+    /// kExactBF16: an F32 tensor all of whose values are BF16 ones (exact_bf16()) goes to VRAM as BF16, the same
+    /// values in half the bytes; any other as kAnyMat.
+    enum Want { kF32, kFloatMat, kAnyMat, kGuessMat, kExactBF16 };
+    /// The tensor is F32 and every value of it is a BF16 one (its low 16 bits are zero).
+    bool exact_bf16(const TensorInfo* t) const;
     Dev upload(const TensorInfo* t, const std::string& name, int64_t n_in, int64_t n_out, Want want,
                float (*fix)(float) = nullptr, int64_t file_n_out = 0);
     Dev upload_as(const TensorInfo* t, const std::string& name, int64_t n_in, int64_t n_out, Want want,
@@ -598,7 +611,6 @@ protected:
     bool moe(Layer& L, int il, int n, const std::function<void()>* first = nullptr);
     bool card_moe(int n);
     bool moe_card(Layer& L, int il, int n);
-    const float* biased(const Layer& L, const float* scores);
     /// Whether n tokens take layer L's routed experts as a prompt batch, through MMQ (moe_rows()), and not a few at
     /// a time (moe()).
     bool batched(const Layer& L, int n) const;
@@ -729,6 +741,7 @@ protected:
     long long* at_ = nullptr;     ///< on the card: {pos(), turn(pos())}, and the same for a window's later tokens
     long long* h_at_ = nullptr;   ///< pinned
     bool recording_ = false;      ///< a layer's launches are being recorded: positions are read from at_
+    bool whole_rec_ = false;      ///< whole-pass graph capture with card-side routing is active
     bool recorded_ = false;       ///< took_record()
 
     // geometry
@@ -758,6 +771,11 @@ protected:
     /// a prompt batch's products go through guard_half_sums(): the model's activations can sum past a half's range
     /// in a block.  Off for the models whose sums stay in range: it cost LFM2.5 4% of a 30K prompt's read on a 5090.
     bool half_sum_guard_ = false;
+    /// In a read of several calls, moe_rows() hands the card a call's row tables by a kernel that reads them from
+    /// pinned memory (copy2()), not by a copy: the copies to the card go one after the other, and a call's tables
+    /// waited behind the layer's experts on their way to the staging buffer.  Inkling 2's on CUDA unless
+    /// STRATA_INK_KERNEL_TABLES=0, else off.
+    bool kernel_tables_ = false;
 
     std::vector<Layer> layers_;   ///< the model's, and after them the draft block
     std::vector<std::vector<void*>> slot_heads_;

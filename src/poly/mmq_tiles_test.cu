@@ -25,8 +25,8 @@ using strata::poly::Mmq;
 
 namespace {
 
-struct Quant { const char* name; int type; size_t block; };   // ggml_type, bytes of a block of 256 values
-constexpr Quant kQuants[] = {{"Q4_K", 12, 144}, {"Q5_K", 13, 176}, {"Q6_K", 14, 210}};
+struct Quant { const char* name; int type; int qk; size_t block; };   // ggml_type, elements/block, bytes/block
+constexpr Quant kQuants[] = {{"Q2_0", 42, 64, 18}, {"Q4_K", 12, 256, 144}, {"Q5_K", 13, 256, 176}, {"Q6_K", 14, 256, 210}};
 constexpr int kRows = 256, kCols = 512;   // a matrix of the shapes the experts have, 256 rows a multiple of 128
 
 bool ok(cudaError_t e, const char* what) {
@@ -52,12 +52,13 @@ int tile_of(const std::vector<int>& t, int rows) {
 int run_case(const Quant& q, const std::vector<int>& rows, const std::vector<int>& limits, bool exact,
              std::mt19937& rng) {
     const int n = (int) rows.size();
-    const size_t per = (size_t) kRows * (kCols / 256) * q.block;
+    const size_t per = (size_t) kRows * (kCols / q.qk) * q.block;
     std::vector<uint8_t> w(per * n + 4096, 0);   // zero bytes behind the matrices (kTail)
     for (size_t i = 0; i < per * n; ++i) w[i] = (uint8_t) rng();
     for (size_t b = 0; b < per * n / q.block; ++b) {   // finite block scales: a half of 2^-3 where each type keeps its d
         uint8_t* p = &w[b * q.block];
         if (q.type == 14) { p[q.block - 2] = 0; p[q.block - 1] = 0x30; }
+        else if (q.type == 42) { p[0] = 0; p[1] = 0x30; }
         else { p[0] = 0; p[1] = 0x30; p[2] = 0; p[3] = 0x30; }
     }
     const int total = std::accumulate(rows.begin(), rows.end(), 0);
@@ -190,6 +191,10 @@ int main() {
         return 77;
     }
     std::mt19937 rng(7);
+    if (!Mmq::fits(42, 2304, 1152) || !Mmq::fits(42, 1152, 2304) || !Mmq::fits(42, 2304, 2304)) {
+        std::printf("FAIL: Mmq::fits(GGML_TYPE_Q2_0) returned false for Inkling 2 Mini MoE shapes\n");
+        return 1;
+    }
     if (test_quantize_dedup(rng) != 0) return 1;
     struct Dist { const char* name; std::vector<int> rows; };
     std::vector<Dist> dists;

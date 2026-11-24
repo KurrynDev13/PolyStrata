@@ -9,6 +9,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <climits>
 #include <cmath>
 #include <cstddef>
@@ -24,7 +25,7 @@ namespace {
 
 constexpr int WARP = 32;
 constexpr int CONV_ROWS = 16;
-constexpr int SPLIT_KEYS = 512;
+constexpr int SPLIT_KEYS = 128;
 constexpr int MAX_SPLITS = 64;
 constexpr size_t kAttendResults = size_t(8) << 20;
 
@@ -83,6 +84,12 @@ __device__ __forceinline__ float2 row_scales(const ExpertScales& s, int row) {
 
 // ---- 1. SiTU activation ----
 
+struct Q81Block {
+    half2 ds;
+    int8_t qs[32];
+};
+static_assert(sizeof(Q81Block) == 36);
+
 __global__ void situ_rows_kernel(const float* __restrict__ gate_up, float* __restrict__ out, int n, float beta,
                                  float linear_beta, ExpertScales s) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -94,6 +101,27 @@ __global__ void situ_rows_kernel(const float* __restrict__ gate_up, float* __res
     const float act = beta * tanhf(g / beta) * sigmoidf_d(g);
     const float upv = linear_beta > 0.0f ? linear_beta * tanhf(u / linear_beta) : u;
     out[size_t(blockIdx.y) * n + i] = act * upv;
+}
+
+__global__ void situ_rows_q8_1_kernel(const float* __restrict__ gate_up, Q81Block* __restrict__ out_q8_1, int n,
+                                      float beta, float linear_beta, ExpertScales s) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const size_t t = blockIdx.y;
+    const float* row = gate_up + t * 2 * size_t(n);
+    const float2 sc = row_scales(s, (int) t);
+    const float g = row[i] * sc.x;
+    const float u = row[n + i] * sc.y;
+    const float act = beta * tanhf(g / beta) * sigmoidf_d(g);
+    const float upv = linear_beta > 0.0f ? linear_beta * tanhf(u / linear_beta) : u;
+    const float xi = act * upv;
+    const float amax = warp_max(fabsf(xi));
+    const float bsum = warp_sum(xi);
+    const float d = strata::kernels::q8_1_finite(amax / 127.0f);
+    const int8_t q = strata::kernels::q8_1_quant(xi, d, amax);
+    Q81Block& dst = out_q8_1[t * (n >> 5) + (i >> 5)];
+    dst.qs[i & 31] = q;
+    if ((i & 31) == 0) dst.ds = strata::kernels::q8_1_ds(d, bsum);
 }
 
 // ---- 2. Block Attention Residual stream mixing ----
@@ -296,6 +324,131 @@ void launch_mix_held(int n_slots, int n_queries, dim3 grid, cudaStream_t s, Args
     }
 }
 
+template <int NS>
+__global__ void __launch_bounds__(kMixThreads) inkling_mix_norm_q8_kernel(
+    const float* __restrict__ r, int streams, MixSlots slots, const float* __restrict__ query,
+    const float* __restrict__ norm_w, float* __restrict__ xn_out, Q81Block* __restrict__ xq_out,
+    int n_embd, float mix_eps, float rms_eps) {
+
+    constexpr int kSums = 2;
+    __shared__ float part[NS * kSums][kMixThreads / WARP];
+    __shared__ float whole[NS * kSums];
+    __shared__ float inv_rms[NS];
+    __shared__ float probs[NS];
+    __shared__ float part_out[kMixThreads / WARP];
+
+    const int t = blockIdx.x;
+    const float* tok_r = r + size_t(t) * streams * n_embd;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+
+    float x[kMixHeld][NS];
+    float sum[NS][kSums];
+
+#pragma unroll
+    for (int s = 0; s < NS; ++s) {
+        sum[s][0] = 0.0f;
+        sum[s][1] = 0.0f;
+    }
+
+#pragma unroll
+    for (int h = 0; h < kMixHeld; ++h) {
+        const int i = tid + h * kMixThreads;
+        if (i < n_embd) {
+            const float qv = query[i];
+#pragma unroll
+            for (int s = 0; s < NS; ++s) {
+                const float v = tok_r[size_t(slots.s[s]) * n_embd + i];
+                x[h][s] = v;
+                sum[s][0] += v * v;
+                sum[s][1] += v * qv;
+            }
+        }
+    }
+
+#pragma unroll
+    for (int s = 0; s < NS; ++s) {
+#pragma unroll
+        for (int k = 0; k < kSums; ++k) {
+            const float w = warp_sum(sum[s][k]);
+            if (lane == 0) part[s * kSums + k][warp] = w;
+        }
+    }
+    __syncthreads();
+
+    if (tid < NS * kSums) {
+        float val = 0.0f;
+#pragma unroll
+        for (int w = 0; w < kMixThreads / WARP; ++w) val += part[tid][w];
+        whole[tid] = val;
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        const float score_scale = rsqrtf((float) n_embd);
+        for (int s = 0; s < NS; ++s) {
+            inv_rms[s] = rsqrtf(whole[s * kSums] / (float) n_embd + mix_eps);
+        }
+        float logits[NS];
+        float mx = -1e30f;
+        for (int s = 0; s < NS; ++s) {
+            logits[s] = whole[s * kSums + 1] * inv_rms[s] * score_scale;
+            mx = fmaxf(mx, logits[s]);
+        }
+        float exps[NS];
+        float sum_exp = 0.0f;
+        for (int s = 0; s < NS; ++s) {
+            exps[s] = expf(logits[s] - mx);
+            sum_exp += exps[s];
+        }
+        const float inv_s = 1.0f / sum_exp;
+        for (int s = 0; s < NS; ++s) probs[s] = exps[s] * inv_s;
+    }
+    __syncthreads();
+
+    float m[kMixHeld];
+    float sq_m = 0.0f;
+#pragma unroll
+    for (int h = 0; h < kMixHeld; ++h) {
+        const int i = tid + h * kMixThreads;
+        float acc = 0.0f;
+        if (i < n_embd) {
+#pragma unroll
+            for (int s = 0; s < NS; ++s) acc += probs[s] * (x[h][s] * inv_rms[s]);
+            sq_m += acc * acc;
+        }
+        m[h] = acc;
+    }
+
+    const float w_sq = warp_sum(sq_m);
+    if (lane == 0) part_out[warp] = w_sq;
+    __syncthreads();
+
+    float total_sq = 0.0f;
+#pragma unroll
+    for (int w = 0; w < kMixThreads / WARP; ++w) total_sq += part_out[w];
+    const float inv_norm = rsqrtf(total_sq / (float) n_embd + rms_eps);
+
+    const int nb = n_embd >> 5;
+    Q81Block* qr = xq_out ? xq_out + size_t(t) * nb : nullptr;
+#pragma unroll
+    for (int h = 0; h < kMixHeld; ++h) {
+        const int i = tid + h * kMixThreads;
+        if (i < n_embd) {
+            const float xi = (m[h] * inv_norm) * norm_w[i];
+            xn_out[size_t(t) * n_embd + i] = xi;
+            if (qr) {
+                const float amax = warp_max(fabsf(xi));
+                const float bsum = warp_sum(xi);
+                const float d = strata::kernels::q8_1_finite(amax / 127.0f);
+                const int8_t q = strata::kernels::q8_1_quant(xi, d, amax);
+                Q81Block& dst = qr[i >> 5];
+                dst.qs[lane] = q;
+                if (lane == 0) dst.ds = strata::kernels::q8_1_ds(d, bsum);
+            }
+        }
+    }
+}
+
 // ---- 3. Cross-pass loop controllers ----
 
 __global__ void inkling_control_prep_kernel(const float* __restrict__ cur, const float* __restrict__ msg,
@@ -397,10 +550,152 @@ __global__ void __launch_bounds__(kDownThreads) ink_ctrl_down_kernel(CtrlDown d,
     }
 }
 
+// STRATA_INK_FAST_CTRL=1 (opt-in, other bits): ink_ctrl_down_kernel in one pass over cur and msg.  Half the threads
+// of a block, and cur and msg are read once a block instead of twice.
+constexpr int kFastDownThreads = 256;
+__global__ void __launch_bounds__(kFastDownThreads) ink_ctrl_down_fast_kernel(CtrlDown d, int n_embd, int rank) {
+    __shared__ float part[kFastDownThreads / WARP][4];
+    const int j = blockIdx.x / rank, o = blockIdx.x % rank, tid = threadIdx.x;
+    const size_t row = size_t(blockIdx.y) * n_embd;
+    const float* __restrict__ cur = d.cur[j] + row;
+    const float* __restrict__ msg = d.msg[j] + row;
+    const float* __restrict__ wl = d.w[j] + size_t(o) * 2 * n_embd;
+    const float* __restrict__ wr = wl + n_embd;
+    float dl = 0.0f, dr = 0.0f, cc = 0.0f, mm = 0.0f;
+    for (int i = tid; i < n_embd; i += kFastDownThreads) {
+        const float c = cur[i], m = msg[i];
+        dl += wl[i] * c;
+        dr += wr[i] * m;
+        cc += c * c;
+        mm += m * m;
+    }
+    dl = warp_sum(dl), dr = warp_sum(dr), cc = warp_sum(cc), mm = warp_sum(mm);
+    if ((tid & 31) == 0) part[tid >> 5][0] = dl, part[tid >> 5][1] = dr, part[tid >> 5][2] = cc, part[tid >> 5][3] = mm;
+    __syncthreads();
+    if (tid == 0) {
+        float v[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (int w = 0; w < kFastDownThreads / WARP; ++w)
+#pragma unroll
+            for (int k = 0; k < 4; ++k) v[k] += part[w][k];
+        d.y[j][size_t(blockIdx.y) * rank + o] = v[0] * cat_scale(v[2], n_embd) + v[1] * cat_scale(v[3], n_embd);
+    }
+}
+
+int g_fast_ctrl = -1;
+bool fast_ctrl_on() {
+#if defined(__HIPCC__)
+    return false;
+#else
+    if (g_fast_ctrl < 0) {
+        const char* v = std::getenv("STRATA_INK_FAST_CTRL");
+        g_fast_ctrl = v != nullptr && v[0] == '1';
+    }
+    return g_fast_ctrl == 1;
+#endif
+}
+
+struct CtrlGate {
+    const float* cur[kCtrlSet];
+    const float* msg[kCtrlSet];
+    const float* ch[kCtrlSet];
+    const float* gf[kCtrlSet];
+    float* out[kCtrlSet];
+};
+
+constexpr int kCtrlGateWarps = 8;
+__global__ void __launch_bounds__(kCtrlGateWarps * WARP) ink_control3_gate_kernel(CtrlGate d, int count, int n_embd,
+                                                                                 int rank) {
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int i = blockIdx.x * kCtrlGateWarps + warp;
+    if (i >= n_embd) return;
+    const int row = blockIdx.y;
+    const size_t idx = size_t(row) * n_embd + i;
+
+    float c_val[kCtrlSet];
+    float m_val[kCtrlSet];
+    if (lane == 0) {
+#pragma unroll
+        for (int j = 0; j < kCtrlSet; ++j) {
+            if (j < count) {
+                c_val[j] = d.cur[j][idx];
+                m_val[j] = d.msg[j][idx];
+            }
+        }
+    }
+
+    float out_val[kCtrlSet];
+    for (int j = 0; j < count; ++j) {
+        const float* x = d.ch[j] + size_t(row) * rank;
+        const float* wg = d.gf[j] + size_t(i) * rank;
+        const float* wf = d.gf[j] + size_t(n_embd + i) * rank;
+        float g = 0.0f;
+        float f = 0.0f;
+        for (int k = lane; k < rank; k += WARP) {
+            const float xv = x[k];
+            g += wg[k] * xv;
+            f += wf[k] * xv;
+        }
+        g = warp_sum(g);
+        f = warp_sum(f);
+        if (lane == 0) {
+            out_val[j] = c_val[j] * (1.0f - tanhf(f)) + m_val[j] * tanhf(g);
+        }
+    }
+
+    if (lane == 0) {
+        for (int j = 0; j < count; ++j) {
+            d.out[j][idx] = out_val[j];
+        }
+    }
+}
+
 // ---- 4. Causal 4-tap short convolution (static + optional dynamic per-head reversed-lag taps) ----
 
 __device__ __forceinline__ float* snap_of(float* snap, size_t stride, unsigned snaps, int row) {
     return row < 32 && (snaps >> row & 1u) ? snap + size_t(__popc(snaps & ((1u << row) - 1u))) * stride : nullptr;
+}
+
+__global__ void inkling_conv4_stream_kernel(const float* __restrict__ x, float* __restrict__ state,
+                                            const float* __restrict__ w, float* __restrict__ r, int n_streams,
+                                            int n_embd, int rows, int pre_copy_dst, bool replace_s0, int post_op,
+                                            float* __restrict__ snap, size_t stride, unsigned snaps) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= n_embd) return;
+    const float* wc = w + 4 * size_t(c);
+    float* st = state + size_t(c) * 3;
+    float s0 = st[0], s1 = st[1], s2 = st[2];
+    const float scale = rsqrtf(5.0f);
+    for (int row = 0; row < rows; ++row) {
+        const float v = x[size_t(row) * n_embd + c];
+        const float y = (v + (s0 * wc[0] + s1 * wc[1] + s2 * wc[2] + v * wc[3])) * scale;
+        s0 = s1;
+        s1 = s2;
+        s2 = v;
+        if (float* m = snap_of(snap, stride, snaps, row)) {
+            m += size_t(c) * 3;
+            m[0] = s0;
+            m[1] = s1;
+            m[2] = s2;
+        }
+        float* r_row = r + size_t(row) * n_streams * n_embd + c;
+        const float s0_old = r_row[0];
+        if (pre_copy_dst >= 0) r_row[size_t(pre_copy_dst) * n_embd] = s0_old;
+        const float s0_new = replace_s0 ? y : (s0_old + y);
+        if (post_op == 0) {
+            r_row[0] = s0_new;
+        } else if (post_op == 1) {
+            r_row[0] = s0_new;
+            r_row[2 * size_t(n_embd)] = s0_new;
+        } else if (post_op == 2) {
+            r_row[4 * size_t(n_embd)] = r_row[3 * size_t(n_embd)];
+            r_row[5 * size_t(n_embd)] = s0_new;
+            r_row[0] = r_row[2 * size_t(n_embd)];
+        }
+    }
+    st[0] = s0;
+    st[1] = s1;
+    st[2] = s2;
 }
 
 __global__ void inkling_conv4_walk_kernel(const float* __restrict__ x, float* __restrict__ state,
@@ -541,6 +836,102 @@ __global__ void inkling_l2_clip_kernel(const float* __restrict__ x, const float*
         float v = x[base + d];
         if (scale) v *= scale[size_t(h) * dim + d];
         out[base + d] = v * factor;
+    }
+}
+
+__device__ __forceinline__ float block128_sum(float v, float* sm) {
+    v = warp_sum(v);
+    if ((threadIdx.x & 31) == 0) sm[threadIdx.x >> 5] = v;
+    __syncthreads();
+    return sm[0] + sm[1] + sm[2] + sm[3];
+}
+
+__device__ __forceinline__ void store_kv128(float v, uint16_t* fp16, int8_t* q8, uint8_t* q4, uint16_t* scales,
+                                            size_t dst_row, int kv_width, int kv_nb, int h, int tid, int warp,
+                                            int lane) {
+    if (q8) {
+        const float amax = warp_max(fabsf(v));
+        const float d = amax / 127.0f;
+        const float id = d > 0.0f ? 1.0f / d : 0.0f;
+        if (lane == 0) scales[dst_row * kv_nb + h * 4 + warp] = __half_as_ushort(__float2half(d));
+        float q = rintf(v * id);
+        q = fminf(fmaxf(q, -127.0f), 127.0f);
+        q8[dst_row * kv_width + h * 128 + tid] = (int8_t) q;
+    } else if (q4) {
+        const float amax = warp_max(fabsf(v));
+        const half dh = __float2half(amax / 7.0f);
+        const float df = __half2float(dh);
+        const float id = df > 0.0f ? 1.0f / df : 0.0f;
+        if (lane == 0) scales[dst_row * kv_nb + h * 4 + warp] = __half_as_ushort(dh);
+        const float qf = fminf(fmaxf(rintf(v * id), -8.0f), 7.0f);
+        const unsigned qi = unsigned(int(qf) + 8) & 0x0fu;
+        const unsigned qhi = __shfl_down_sync(0xffffffffu, qi, 16);
+        if (lane < 16) {
+            q4[dst_row * (kv_width >> 1) + h * 64 + warp * 16 + lane] = uint8_t(qi | (qhi << 4));
+        }
+    } else {
+        fp16[dst_row * kv_width + h * 128 + tid] = __half_as_ushort(__float2half(v));
+    }
+}
+
+__global__ void inkling_clips_store_kernel(InkClipsStore c) {
+    __shared__ float sm[4];
+    const int b = blockIdx.x;
+    const int t = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+
+    if (b < c.n_head) {
+        const int h = b;
+        const size_t base = (size_t(t) * c.n_head + h) * 128;
+        float v = c.q_in[base + tid];
+        if (c.q_scale) v *= c.q_scale[size_t(h) * 128 + tid];
+        const float norm = sqrtf(block128_sum(v * v, sm)) + 1e-6f;
+        float factor = fminf(1.0f, fmaxf(0.0f, c.qk_clip / norm));
+        if (c.is_global) {
+            const long long p = c.at ? c.at[2 * t] : c.pos + t;
+            const float ratio = float(p + 1) / c.log_floor;
+            if (ratio > 1.0f) factor *= (1.0f + c.log_alpha * logf(ratio));
+        }
+        c.q_out[base + tid] = v * factor;
+    } else if (b < c.n_head + c.n_kv) {
+        const int h = b - c.n_head;
+        const int kv_width = c.n_kv * 128;
+        const int kv_nb = c.n_kv * 4;
+        const size_t base = size_t(t) * kv_width + size_t(h) * 128;
+        const float v = c.k_in[base + tid];
+        const float norm = sqrtf(block128_sum(v * v, sm)) + 1e-6f;
+        const float factor = fminf(1.0f, fmaxf(0.0f, c.qk_clip / norm));
+        const long long p_row = c.at ? (*c.at + t) : (c.pos + t);
+        const size_t dst_row = size_t(c.ring > 0 ? p_row % c.ring : p_row);
+        store_kv128(v * factor, c.k_fp16, c.k_q8, c.k_q4, c.k_scales, dst_row, kv_width, kv_nb, h, tid, warp, lane);
+    } else if (b < c.n_head + 2 * c.n_kv) {
+        const int h = b - c.n_head - c.n_kv;
+        const int kv_width = c.n_kv * 128;
+        const int kv_nb = c.n_kv * 4;
+        const size_t base = size_t(t) * kv_width + size_t(h) * 128;
+        const float v = c.v_in[base + tid];
+        const float inv = rsqrtf(block128_sum(v * v, sm) / 128.0f + c.rms_eps);
+        const long long p_row = c.at ? (*c.at + t) : (c.pos + t);
+        const size_t dst_row = size_t(c.ring > 0 ? p_row % c.ring : p_row);
+        store_kv128(v * inv, c.v_fp16, c.v_q8, c.v_q4, c.v_scales, dst_row, kv_width, kv_nb, h, tid, warp, lane);
+    } else if (warp == 0) {
+        const int h = b - c.n_head - 2 * c.n_kv;
+        const size_t base = (size_t(t) * c.n_head + h) * c.n_rel;
+        float v = 0.0f;
+        if (lane < c.n_rel) {
+            v = c.r_in[base + lane];
+            if (c.r_scale) v *= c.r_scale[size_t(h) * c.n_rel + lane];
+        }
+        const float norm = sqrtf(warp_sum(v * v)) + 1e-6f;
+        float factor = fminf(1.0f, fmaxf(0.0f, c.rel_clip / norm));
+        if (c.is_global) {
+            const long long p = c.at ? c.at[2 * t] : c.pos + t;
+            const float ratio = float(p + 1) / c.log_floor;
+            if (ratio > 1.0f) factor *= (1.0f + c.log_alpha * logf(ratio));
+        }
+        if (lane < c.n_rel) c.r_out[base + lane] = v * factor;
     }
 }
 
@@ -769,14 +1160,15 @@ __global__ void inkling_attend_split_kernel(const float* __restrict__ q, const u
     }
 }
 
-template <int PER, bool WHOLE = false>
+template <int PER, bool WHOLE = false, bool DIRECT_REL = false>
 __global__ void inkling_attend_split_gqa_kernel(const float* __restrict__ q, const uint16_t* __restrict__ kcache,
                                                 const uint16_t* __restrict__ vcache, const float* __restrict__ table,
                                                 const float* __restrict__ sinks, int n_extent, long long pos,
                                                 float* __restrict__ partials, int n_splits, int dim, int n_head,
                                                 int kv_heads, float scale, int window, int ring,
                                                 const long long* __restrict__ at, Kvq8 kq8, Kvq8 vq8,
-                                                Kvq4 kq4, Kvq4 vq4) {
+                                                Kvq4 kq4, Kvq4 vq4, const float* __restrict__ r_cur,
+                                                const float* __restrict__ rel_bias) {
     const int s = blockIdx.x;
     const int kv_h = blockIdx.y;
     const int t = blockIdx.z;
@@ -814,6 +1206,8 @@ __global__ void inkling_attend_split_gqa_kernel(const float* __restrict__ q, con
     float o_reg[PER][4];
     float m_w[PER];
     float l_w[PER];
+    float r_lane[PER];
+    float neg_sink[PER];
 #pragma unroll
     for (int p = 0; p < PER; ++p) {
         const float* q_ptr = q + (size_t(t) * n_head + (h_base + p)) * dim;
@@ -825,6 +1219,11 @@ __global__ void inkling_attend_split_gqa_kernel(const float* __restrict__ q, con
         }
         m_w[p] = -INFINITY;
         l_w[p] = 0.0f;
+        if constexpr (DIRECT_REL) {
+            const int h = h_base + p;
+            r_lane[p] = (lane < 16) ? r_cur[(size_t(t) * n_head + h) * 16 + lane] : 0.0f;
+            neg_sink[p] = -sinks[size_t(t) * n_head + h];
+        }
     }
 
     for (int off = k_begin + warp; off < k_end; off += 4) {
@@ -846,14 +1245,20 @@ __global__ void inkling_attend_split_gqa_kernel(const float* __restrict__ q, con
         }
 
         const long long dist = q_pos - j;
+        if constexpr (DIRECT_REL) {
+            const float rb = (lane < 16 && dist < n_extent) ? __ldg(rel_bias + size_t(dist) * 16 + lane) : 0.0f;
+#pragma unroll
+            for (int p = 0; p < PER; ++p) dot[p] += r_lane[p] * rb;
+        }
         float w_j[PER];
 #pragma unroll
         for (int p = 0; p < PER; ++p) {
             const int h = h_base + p;
             const float dp = warp_sum(dot[p]);
             const float bias = WHOLE ? 0.0f
-                                     : (dist < n_extent ? table[(size_t(t) * n_head + h) * n_extent + dist]
-                                                        : -sinks[size_t(t) * n_head + h]);
+                                     : (DIRECT_REL ? neg_sink[p]
+                                                   : (dist < n_extent ? table[(size_t(t) * n_head + h) * n_extent + dist]
+                                                                      : -sinks[size_t(t) * n_head + h]));
             const float score = dp + bias;
             const float m_new = fmaxf(m_w[p], score);
             const float alpha = l_w[p] > 0.0f ? expf(m_w[p] - m_new) : 0.0f;
@@ -915,7 +1320,8 @@ __global__ void inkling_attend_split_gqa_kernel(const float* __restrict__ q, con
 template <bool ZERO_SINK = true, bool WHOLE = false>
 __global__ void inkling_attend_join_kernel(const float* __restrict__ partials, float* __restrict__ out, int n_splits,
                                            int dim, int n_head, long long pos, int window,
-                                           const long long* __restrict__ at) {
+                                           const long long* __restrict__ at, const float* __restrict__ gate,
+                                           Q81Block* __restrict__ out_q8) {
     const int h = blockIdx.x;
     const int t = blockIdx.y;
     const int d = threadIdx.x;
@@ -949,7 +1355,20 @@ __global__ void inkling_attend_join_kernel(const float* __restrict__ partials, f
         acc = acc * alpha + p[d] * beta;
         m = m_new;
     }
-    out[(size_t(t) * n_head + h) * dim + d] = l > 0.0f ? acc / l : 0.0f;
+    const size_t out_idx = (size_t(t) * n_head + h) * dim + d;
+    float v = l > 0.0f ? acc / l : 0.0f;
+    if (gate) v *= sigmoidf_d(gate[out_idx]);
+    if (out) out[out_idx] = v;
+    if (out_q8) {
+        const int lane = d & 31;
+        const float amax = warp_max(fabsf(v));
+        const float bsum = warp_sum(v);
+        const float sc = strata::kernels::q8_1_finite(amax / 127.0f);
+        const int8_t q = strata::kernels::q8_1_quant(v, sc, amax);
+        Q81Block& dst = out_q8[(size_t(t) * n_head + h) * (dim >> 5) + (d >> 5)];
+        dst.qs[lane] = q;
+        if (lane == 0) dst.ds = strata::kernels::q8_1_ds(sc, bsum);
+    }
 }
 
 __global__ void dequant_q8_kernel(const int8_t* __restrict__ codes, const uint16_t* __restrict__ scales,
@@ -1095,12 +1514,6 @@ __global__ void inkling_add_to_stream_kernel(const float* __restrict__ a, const 
     const size_t dst_i = (size_t(blockIdx.y) * streams + dst_stream) * n_embd + i;
     r[dst_i] = a ? (a[src_i] + b[src_i]) : (r[dst_i] + b[src_i]);
 }
-
-struct Q81Block {
-    half2 ds;
-    int8_t qs[32];
-};
-static_assert(sizeof(Q81Block) == 36);
 
 __global__ void inkling_swiglu_gate_up_q8_1_kernel(const float* __restrict__ gate_up, Q81Block* __restrict__ out_q8_1,
                                                    int ff_dim) {
@@ -1288,6 +1701,17 @@ void situ_rows(const float* gate_up, float* out, int n, int rows, float beta, fl
     ck("situ_rows");
 }
 
+void situ_rows_q8_1(const float* gate_up, void* out_q8_1, int n, int rows, float beta, float linear_beta, void* stream,
+                    const ExpertScales* scales) {
+    if (rows <= 0) return;
+    if (n <= 0 || (n & 31) != 0)
+        throw std::invalid_argument("situ_rows_q8_1: n must be a positive multiple of 32");
+    const ExpertScales s = scales ? *scales : ExpertScales{};
+    situ_rows_q8_1_kernel<<<dim3(grid(n, 256), rows), 256, 0, cs(stream)>>>(
+        gate_up, (Q81Block*) out_q8_1, n, beta, linear_beta, s);
+    ck("situ_rows_q8_1");
+}
+
 void inkling_mix(const float* r, int streams, MixSlots slots, int n_slots, const float* query, int n_queries,
                  float* out, int n_embd, int rows, float eps, void* stream) {
     if (rows <= 0) return;
@@ -1311,6 +1735,31 @@ void inkling_mix(const float* r, int streams, MixSlots slots, int n_slots, const
     ck("inkling_mix");
 }
 
+bool inkling_mix_norm_q8(const float* r, int streams, MixSlots slots, int n_slots, const float* query,
+                         const float* norm_w, float* xn_out, void* xq_out, int n_embd, int rows, float mix_eps,
+                         float rms_eps, void* stream) {
+    if (rows <= 0) return true;
+    if (n_slots < 1 || n_slots > 6 || n_embd <= 0 || n_embd > kMixHeld * kMixThreads || (n_embd & 31) != 0)
+        return false;
+    Q81Block* xq = (Q81Block*) xq_out;
+    switch (n_slots) {
+        case 1: inkling_mix_norm_q8_kernel<1><<<rows, kMixThreads, 0, cs(stream)>>>(
+            r, streams, slots, query, norm_w, xn_out, xq, n_embd, mix_eps, rms_eps); break;
+        case 2: inkling_mix_norm_q8_kernel<2><<<rows, kMixThreads, 0, cs(stream)>>>(
+            r, streams, slots, query, norm_w, xn_out, xq, n_embd, mix_eps, rms_eps); break;
+        case 3: inkling_mix_norm_q8_kernel<3><<<rows, kMixThreads, 0, cs(stream)>>>(
+            r, streams, slots, query, norm_w, xn_out, xq, n_embd, mix_eps, rms_eps); break;
+        case 4: inkling_mix_norm_q8_kernel<4><<<rows, kMixThreads, 0, cs(stream)>>>(
+            r, streams, slots, query, norm_w, xn_out, xq, n_embd, mix_eps, rms_eps); break;
+        case 5: inkling_mix_norm_q8_kernel<5><<<rows, kMixThreads, 0, cs(stream)>>>(
+            r, streams, slots, query, norm_w, xn_out, xq, n_embd, mix_eps, rms_eps); break;
+        default: inkling_mix_norm_q8_kernel<6><<<rows, kMixThreads, 0, cs(stream)>>>(
+            r, streams, slots, query, norm_w, xn_out, xq, n_embd, mix_eps, rms_eps); break;
+    }
+    ck("inkling_mix_norm_q8");
+    return true;
+}
+
 void inkling_control_prep(const float* cur, const float* msg, float* out_concat, int n_embd, int rows, float eps,
                           void* stream) {
     if (rows <= 0) return;
@@ -1328,6 +1777,8 @@ void inkling_control_apply(const float* cur, const float* msg, const float* gain
     ck("inkling_control_apply");
 }
 
+void ink_set_fast_ctrl(bool on) { g_fast_ctrl = on ? 1 : 0; }
+
 bool ink_ctrl_down(const float* const* cur, const float* const* msg, const float* const* down, float* const* ch,
                    int count, int n_embd, int rank, int rows, void* stream) {
     if (count < 1 || count > kCtrlSet) throw std::invalid_argument("ink_ctrl_down: 1 to 3 controllers");
@@ -1341,8 +1792,32 @@ bool ink_ctrl_down(const float* const* cur, const float* const* msg, const float
         d.w[j] = down[j];
         d.y[j] = ch[j];
     }
+    if (fast_ctrl_on()) {
+        ink_ctrl_down_fast_kernel<<<dim3(count * rank, rows), kFastDownThreads, 0, cs(stream)>>>(d, n_embd, rank);
+        ck("ink_ctrl_down_fast");
+        return true;
+    }
     ink_ctrl_down_kernel<<<dim3(count * rank, rows), kDownThreads, 0, cs(stream)>>>(d, n_embd, rank);
     ck("ink_ctrl_down");
+    return true;
+}
+
+bool ink_control3_gate(const float* const* cur, const float* const* msg, const float* const* ch, const float* const* gf,
+                       float* const* out, int count, int n_embd, int rank, int rows, void* stream) {
+    if (count < 1 || count > kCtrlSet) throw std::invalid_argument("ink_control3_gate: 1 to 3 controllers");
+    if (rows <= 0) return true;
+    if (rows >= CONV_ROWS || rank <= 0) return false;
+    CtrlGate d{};
+    for (int j = 0; j < count; ++j) {
+        d.cur[j] = cur[j];
+        d.msg[j] = msg[j];
+        d.ch[j] = ch[j];
+        d.gf[j] = gf[j];
+        d.out[j] = out[j];
+    }
+    ink_control3_gate_kernel<<<dim3(grid(n_embd, kCtrlGateWarps), rows), kCtrlGateWarps * WARP, 0, cs(stream)>>>(
+        d, count, n_embd, rank);
+    ck("ink_control3_gate");
     return true;
 }
 
@@ -1359,6 +1834,16 @@ void inkling_conv4(const float* x, float* state, const float* w, const float* dy
             x, state, w, dyn, head_dim, n_heads, out, channels, rows, snap, stride, snaps);
     }
     ck("inkling_conv4");
+}
+
+void inkling_conv4_stream(const float* x, float* state, const float* w, float* r, int n_streams, int n_embd, int rows,
+                          int pre_copy_dst, bool replace_s0, int post_op, void* stream, float* snap, size_t stride,
+                          unsigned snaps) {
+    if (rows <= 0) return;
+    if (rows >= CONV_ROWS) throw std::invalid_argument("inkling_conv4_stream: requires rows < 16");
+    inkling_conv4_stream_kernel<<<grid(n_embd, 256), 256, 0, cs(stream)>>>(
+        x, state, w, r, n_streams, n_embd, rows, pre_copy_dst, replace_s0, post_op, snap, stride, snaps);
+    ck("inkling_conv4_stream");
 }
 
 __global__ void inkling_unpack_q_fused_kernel(const float* __restrict__ src, float* __restrict__ qraw,
@@ -1412,6 +1897,15 @@ void inkling_l2_clip(const float* x, const float* scale, float* out, int dim, in
     ck("inkling_l2_clip");
 }
 
+void inkling_clips_store(const InkClipsStore& c, void* stream) {
+    if (c.rows <= 0) return;
+    if (c.dim != 128 || c.n_rel <= 0 || c.n_rel > 32)
+        throw std::invalid_argument("inkling_clips_store: requires dim=128 and 1 <= n_rel <= 32");
+    const int n_blocks = 2 * c.n_head + 2 * c.n_kv;
+    inkling_clips_store_kernel<<<dim3(n_blocks, c.rows), 128, 0, cs(stream)>>>(c);
+    ck("inkling_clips_store");
+}
+
 void inkling_rel_table(const float* r_cur, const float* rel_bias, const float* sinks, float* table, int n_rel,
                        int n_extent, int n_head, int rows, void* stream, bool term_major) {
     if (rows <= 0) return;
@@ -1451,24 +1945,33 @@ void store_q4_at(const float* x, uint8_t* codes, uint16_t* scales, int n, const 
 void inkling_attend(const float* q, const uint16_t* kcache, const uint16_t* vcache, const float* table,
                     const float* sinks, int n_extent, int64_t pos, int rows, float* score, int chunk, float* out,
                     int dim, int n_head, int kv_heads, float scale, void* stream, int window, int ring,
-                    const long long* at, int room, Kvq8 kq8, Kvq8 vq8, Kvq4 kq4, Kvq4 vq4) {
+                    const long long* at, int room, Kvq8 kq8, Kvq8 vq8, Kvq4 kq4, Kvq4 vq4,
+                    const float* r_cur, const float* rel_bias, int n_rel, const float* gate, void* out_q8) {
     (void) chunk;
     if (rows <= 0) return;
     if (dim > 128) throw std::invalid_argument("inkling_attend: head dim must be <= 128");
+    if (out_q8 && (dim & 31) != 0) throw std::invalid_argument("inkling_attend: out_q8 requires dim % 32 == 0");
     const long long max_pos = at ? (long long) room : (long long) pos + rows - 1;
     const int span = window > 0 ? std::min<int>((int) (max_pos + 1), window) : (int) (max_pos + 1);
     const int n_splits = std::clamp((span + SPLIT_KEYS - 1) / SPLIT_KEYS, 1, MAX_SPLITS);
-    if (dim == 128 && n_head == kv_heads * 3) {
-        inkling_attend_split_gqa_kernel<3><<<dim3(n_splits, kv_heads, rows), 128, 0, cs(stream)>>>(
+    if (!table) {
+        if (!r_cur || !rel_bias || dim != 128 || n_head != kv_heads * 3 || n_rel != 16)
+            throw std::invalid_argument("inkling_attend: direct relative bias requires dim=128, n_head=3*kv_heads, n_rel=16");
+        inkling_attend_split_gqa_kernel<3, false, true><<<dim3(n_splits, kv_heads, rows), 128, 0, cs(stream)>>>(
+            q, kcache, vcache, nullptr, sinks, n_extent, (long long) pos, score, n_splits, dim, n_head, kv_heads, scale,
+            window, ring, at, kq8, vq8, kq4, vq4, r_cur, rel_bias);
+    } else if (dim == 128 && n_head == kv_heads * 3) {
+        inkling_attend_split_gqa_kernel<3, false, false><<<dim3(n_splits, kv_heads, rows), 128, 0, cs(stream)>>>(
             q, kcache, vcache, table, sinks, n_extent, (long long) pos, score, n_splits, dim, n_head, kv_heads, scale,
-            window, ring, at, kq8, vq8, kq4, vq4);
+            window, ring, at, kq8, vq8, kq4, vq4, nullptr, nullptr);
     } else {
         inkling_attend_split_kernel<<<dim3(n_splits, n_head, rows), 128, 0, cs(stream)>>>(
             q, kcache, vcache, table, sinks, n_extent, (long long) pos, score, n_splits, dim, n_head, kv_heads, scale,
             window, ring, at, kq8, vq8, kq4, vq4);
     }
     inkling_attend_join_kernel<<<dim3(n_head, rows), dim, 0, cs(stream)>>>(score, out, n_splits, dim, n_head,
-                                                                            (long long) pos, window, at);
+                                                                            (long long) pos, window, at, gate,
+                                                                            (Q81Block*) out_q8);
     ck("inkling_attend");
 }
 
@@ -1482,16 +1985,16 @@ void inkling_dspark_attend(const float* q, const uint16_t* kcache, const uint16_
     const int span = window > 0 ? std::min<int>((int) (max_pos + 1), window + rows - 1) : (int) (max_pos + 1);
     const int n_splits = std::clamp((span + SPLIT_KEYS - 1) / SPLIT_KEYS, 1, MAX_SPLITS);
     if (dim == 128 && n_head == kv_heads * 3) {
-        inkling_attend_split_gqa_kernel<3, true><<<dim3(n_splits, kv_heads, rows), 128, 0, cs(stream)>>>(
+        inkling_attend_split_gqa_kernel<3, true, false><<<dim3(n_splits, kv_heads, rows), 128, 0, cs(stream)>>>(
             q, kcache, vcache, nullptr, nullptr, 0, (long long) pos, score, n_splits, dim, n_head, kv_heads, scale,
-            window, ring, at, kq8, vq8, kq4, vq4);
+            window, ring, at, kq8, vq8, kq4, vq4, nullptr, nullptr);
     } else {
         inkling_attend_split_kernel<true><<<dim3(n_splits, n_head, rows), 128, 0, cs(stream)>>>(
             q, kcache, vcache, nullptr, nullptr, 0, (long long) pos, score, n_splits, dim, n_head, kv_heads, scale,
             window, ring, at, kq8, vq8, kq4, vq4);
     }
     inkling_attend_join_kernel<false, true><<<dim3(n_head, rows), dim, 0, cs(stream)>>>(
-        score, out, n_splits, dim, n_head, (long long) pos, window, at);
+        score, out, n_splits, dim, n_head, (long long) pos, window, at, nullptr, nullptr);
     ck("inkling_dspark_attend");
 }
 
@@ -1540,23 +2043,28 @@ template <int ahead> __device__ __forceinline__ void ink_cp_wait() {
 #endif
 
 constexpr int kMaxPer = 4;
-constexpr int kFlashTokens = 64, kFlashKeys = 64, kFlashRow = 128 + 8, kFlashRel = 16;
+constexpr int kFlashKeys = 64, kFlashRow = 128 + 8, kFlashRel = 16;
 constexpr size_t kFlashKv = size_t(4) * kFlashKeys * kFlashRow * sizeof(__half);
 constexpr size_t kFlashKvQ = size_t(2) * kFlashKeys * kFlashRow * sizeof(__half);
 
-template <int G, bool QUANT = false>
-__global__ void __launch_bounds__(kFlashTokens / 16 * G * 32, 1) ink_flash_kernel(InkAttn a) {
+constexpr size_t flash_smem(int g, bool quant, int tokens) {
+    return (quant ? kFlashKvQ : kFlashKv) + size_t(tokens) * g * kFlashRel * sizeof(float);
+}
+
+template <int G, bool QUANT = false, int TOKENS = 64>
+__global__ void __launch_bounds__(TOKENS / 16 * G * 32, 1) ink_flash_kernel(InkAttn a) {
+    static_assert(TOKENS % 16 == 0, "a warp takes 16 tokens");
 #if INK_FLASH
-    constexpr int DIM = 128, KEYS = kFlashKeys, ROW = kFlashRow, NR = kFlashRel, THREADS = kFlashTokens / 16 * G * 32;
+    constexpr int DIM = 128, KEYS = kFlashKeys, ROW = kFlashRow, NR = kFlashRel, THREADS = TOKENS / 16 * G * 32;
     constexpr int BUFS = QUANT ? 1 : 2;
     extern __shared__ __align__(16) __half ink_flash_sm[];
     __half(*ks)[KEYS][ROW] = reinterpret_cast<__half(*)[KEYS][ROW]>(ink_flash_sm);
     __half(*vs)[KEYS][ROW] = reinterpret_cast<__half(*)[KEYS][ROW]>(ink_flash_sm + BUFS * KEYS * ROW);
     float* rs = reinterpret_cast<float*>(ink_flash_sm + 2 * BUFS * KEYS * ROW);   // [token of the block][head of G][NR]
-    const int g = blockIdx.y, t0 = blockIdx.x * kFlashTokens, lane = threadIdx.x % 32, w = threadIdx.x / 32;
+    const int g = blockIdx.y, t0 = blockIdx.x * TOKENS, lane = threadIdx.x % 32, w = threadIdx.x / 32;
     const int gid = lane / 4, tig = lane % 4, hg = w % G, sub = w / G, head = g * G + hg;
     const int tok[2] = {t0 + 16 * sub + gid, t0 + 16 * sub + gid + 8};
-    for (int i = threadIdx.x; i < kFlashTokens * G * NR; i += THREADS) {
+    for (int i = threadIdx.x; i < TOKENS * G * NR; i += THREADS) {
         const int t = t0 + i / (G * NR);
         rs[i] = t < a.rows ? a.r[(size_t(t) * a.n_head + g * G + i / NR % G) * NR + i % NR] : 0.0f;
     }
@@ -1578,7 +2086,7 @@ __global__ void __launch_bounds__(kFlashTokens / 16 * G * 32, 1) ink_flash_kerne
     float o[16][4], m[2] = {-INFINITY, -INFINITY}, l[2] = {0.0f, 0.0f};
     for (int n = 0; n < 16; ++n) o[n][0] = o[n][1] = o[n][2] = o[n][3] = 0.0f;
     // the block's tokens attend positions [lo, hi): from the first one's window to the last one
-    const long long hi = a.pos + min(t0 + kFlashTokens, a.rows);
+    const long long hi = a.pos + min(t0 + TOKENS, a.rows);
     const long long lo = a.window > 0 ? max(0LL, a.pos + t0 - a.window + 1) : 0;
     const __half* kc = reinterpret_cast<const __half*>(a.keys);
     const __half* vc = reinterpret_cast<const __half*>(a.vals);
@@ -1657,6 +2165,11 @@ __global__ void __launch_bounds__(kFlashTokens / 16 * G * 32, 1) ink_flash_kerne
             }
             __syncthreads();
         }
+        // the warp's rows' positions own0..own1: skip tiles this warp cannot attend, and elide edge masks inside full tiles
+        const int w0 = t0 + 16 * sub, w1 = min(w0 + 15, a.rows - 1);
+        const long long own0 = a.pos + w0, own1 = a.pos + w1;
+        if (w0 >= a.rows || k0 > own1 || (a.window > 0 && k0 + KEYS - 1 <= own0 - a.window)) continue;
+        const bool edge = w0 + 15 >= a.rows || k0 + KEYS - 1 > own0 || (a.window > 0 && k0 <= own1 - a.window);
         float s[8][4];
 #pragma unroll
         for (int n = 0; n < 8; ++n) {
@@ -1683,7 +2196,7 @@ __global__ void __launch_bounds__(kFlashTokens / 16 * G * 32, 1) ink_flash_kerne
                 for (int j = 2 * i; j < 2 * i + 2; ++j) {
                     const long long key = k0 + 8 * n + 2 * tig + j % 2;
                     float v = -INFINITY;
-                    if (tok[i] < a.rows && key <= own && (a.window <= 0 || key > own - a.window)) {
+                    if (!edge || (tok[i] < a.rows && key <= own && (a.window <= 0 || key > own - a.window))) {
                         const long long d = own - key;
                         float add = 0.0f;
                         if (d < a.extent) {
@@ -1709,11 +2222,12 @@ __global__ void __launch_bounds__(kFlashTokens / 16 * G * 32, 1) ink_flash_kerne
             const float f = expf(m[i] - base);
             m[i] = now;
             l[i] *= f;
+            if (__any_sync(0xffffffffu, f != 1.0f))
 #pragma unroll
-            for (int n = 0; n < 16; ++n) {
-                o[n][2 * i] *= f;
-                o[n][2 * i + 1] *= f;
-            }
+                for (int n = 0; n < 16; ++n) {
+                    o[n][2 * i] *= f;
+                    o[n][2 * i + 1] *= f;
+                }
 #pragma unroll
             for (int n = 0; n < 8; ++n)
 #pragma unroll
@@ -1756,6 +2270,83 @@ __global__ void __launch_bounds__(kFlashTokens / 16 * G * 32, 1) ink_flash_kerne
 #endif
 }
 
+#if !defined(__HIPCC__)
+namespace {
+
+constexpr int kFlashSizes[] = {64, 48, 32};
+
+int flash_size_index(int tokens) { return tokens == 64 ? 0 : tokens == 48 ? 1 : 2; }
+
+template <int G, bool Q, int T> void* flash_fn() { return reinterpret_cast<void*>(ink_flash_kernel<G, Q, T>); }
+
+void* flash_kernel(int g, bool quant, int tokens) {
+    static void* const fns[4][2][3] = {
+        {{flash_fn<1, false, 64>(), flash_fn<1, false, 48>(), flash_fn<1, false, 32>()},
+         {flash_fn<1, true, 64>(), flash_fn<1, true, 48>(), flash_fn<1, true, 32>()}},
+        {{flash_fn<2, false, 64>(), flash_fn<2, false, 48>(), flash_fn<2, false, 32>()},
+         {flash_fn<2, true, 64>(), flash_fn<2, true, 48>(), flash_fn<2, true, 32>()}},
+        {{flash_fn<3, false, 64>(), flash_fn<3, false, 48>(), flash_fn<3, false, 32>()},
+         {flash_fn<3, true, 64>(), flash_fn<3, true, 48>(), flash_fn<3, true, 32>()}},
+        {{flash_fn<4, false, 64>(), flash_fn<4, false, 48>(), flash_fn<4, false, 32>()},
+         {flash_fn<4, true, 64>(), flash_fn<4, true, 48>(), flash_fn<4, true, 32>()}},
+    };
+    return fns[g - 1][quant ? 1 : 0][flash_size_index(tokens)];
+}
+
+int flash_resident(int g, bool quant, int tokens) {
+    constexpr int kDevs = 16;
+    static std::atomic<int> cache[kDevs][4][2][3] = {};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) dev = 0;
+    std::atomic<int>* c = dev >= 0 && dev < kDevs ? &cache[dev][g - 1][quant ? 1 : 0][flash_size_index(tokens)] : nullptr;
+    if (c && c->load(std::memory_order_relaxed) > 0) return c->load(std::memory_order_relaxed) - 1;
+    void* fn = flash_kernel(g, quant, tokens);
+    const size_t smem = flash_smem(g, quant, tokens);
+    const cudaError_t e = cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
+    if (e != cudaSuccess)
+        throw std::runtime_error(std::string("ink_attend_batch: shared memory: ") + cudaGetErrorString(e));
+    int n = 0;
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, fn, tokens / 16 * g * 32, smem) != cudaSuccess) n = 0;
+    if (c) c->store(1 + n, std::memory_order_relaxed);
+    return n;
+}
+
+int flash_sms() {
+    int dev = 0, n = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return 0;
+    return cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev) == cudaSuccess ? n : 0;
+}
+
+int flash_pick(const InkAttn& a, int per, bool quant) {
+    static const int fixed = [] {
+        const char* v = std::getenv("STRATA_INK_FLASH_TOKENS");
+        const int t = v ? std::atoi(v) : 0;
+        return t == 64 || t == 48 || t == 32 ? t : 0;
+    }();
+    if (fixed) return fixed;
+    constexpr double kFlashCost[] = {1.0, 0.9, 0.65}, kFlashGain = 0.05;
+    const int sms = flash_sms();
+    if (sms < 1 || a.rows <= 0) return 64;
+    double best = 0.0, main_cost = 0.0;
+    int pick = 64;
+    for (int i = 0; i < 3; ++i) {
+        const int t = kFlashSizes[i], res = flash_resident(per, quant, t);
+        if (res < 1) continue;
+        const long long blocks = (long long) grid((size_t) a.rows, t) * a.n_kv, slots = (long long) sms * res;
+        const double cost = (double) ((blocks + slots - 1) / slots) * res * kFlashCost[i];
+        if (t == 64) {
+            main_cost = best = cost;
+        } else if (main_cost > 0.0 && cost < best && cost <= main_cost * (1.0 - kFlashGain)) {
+            best = cost;
+            pick = t;
+        }
+    }
+    return pick;
+}
+
+}  // namespace
+#endif
+
 bool ink_attend_batch(const InkAttn& a, void* stream) {
 #if defined(__HIPCC__)
     (void) a, (void) stream;
@@ -1775,27 +2366,16 @@ bool ink_attend_batch(const InkAttn& a, void* stream) {
     }();
     if (ptx < 80) return false;
     const bool has_quant = a.kq8.codes || a.vq8.codes || a.kq4.codes || a.vq4.codes;
-    const auto launch = [&](auto kernel, int g) {
-        const size_t smem = (has_quant ? kFlashKvQ : kFlashKv) + (size_t) kFlashTokens * g * kFlashRel * sizeof(float);
-        const cudaError_t e = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
-        if (e != cudaSuccess) throw std::runtime_error(std::string("ink_attend_batch: shared memory: ") + cudaGetErrorString(e));
-        kernel<<<dim3(grid((size_t) a.rows, kFlashTokens), a.n_kv), kFlashTokens / 16 * g * 32, smem, cs(stream)>>>(a);
-    };
-    if (has_quant) {
-        switch (per) {
-            case 1: launch(ink_flash_kernel<1, true>, 1); break;
-            case 2: launch(ink_flash_kernel<2, true>, 2); break;
-            case 3: launch(ink_flash_kernel<3, true>, 3); break;
-            default: launch(ink_flash_kernel<4, true>, 4); break;
-        }
-    } else {
-        switch (per) {
-            case 1: launch(ink_flash_kernel<1, false>, 1); break;
-            case 2: launch(ink_flash_kernel<2, false>, 2); break;
-            case 3: launch(ink_flash_kernel<3, false>, 3); break;
-            default: launch(ink_flash_kernel<4, false>, 4); break;
-        }
-    }
+    const int tokens = flash_pick(a, per, has_quant);
+    flash_resident(per, has_quant, tokens);
+    InkAttn arg = a;
+    void* args[] = {&arg};
+    const cudaError_t e = cudaLaunchKernel(flash_kernel(per, has_quant, tokens),
+                                           dim3(grid((size_t) a.rows, tokens), a.n_kv),
+                                           dim3(tokens / 16 * per * 32), args,
+                                           flash_smem(per, has_quant, tokens), cs(stream));
+    if (e != cudaSuccess)
+        throw std::runtime_error(std::string("ink_attend_batch: launch: ") + cudaGetErrorString(e));
     ck("ink_flash");
     return true;
 #endif
