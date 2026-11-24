@@ -6,11 +6,23 @@
 namespace strata::spec {
 namespace {
 
-// The shape of a round's cost by window size, relative to one token, used only for sizes not measured yet (the
-// measured round times replace it). Between the RTX 5070's measured curves: +10 ms per token with every missed expert
-// on the CPU (bench/results/2026-09-27-spec/window-cost), flatter with the default CPU/DMA split.
-constexpr double kShape[DraftPolicy::kMaxT + 1] = {0.0, 1.0, 1.35, 1.7, 2.05, 2.45, 2.85, 3.25, 3.6};
-constexpr double kCostAlpha = 0.1;    // EMA weight of a new round time
+// The shape of a round's cost by window size, relative to one token, used only below the smallest measured size or
+// while a single size is measured (two measured sizes give the cost of a row; measured round times replace both). It
+// sits between the measured curves: steeper with every missed expert on the CPU, flatter with the default CPU/DMA split.
+constexpr double kShape[DraftPolicy::kMaxT + 1] = {0.0, 1.0, 1.35, 1.7, 2.05, 2.45, 2.85, 3.25, 3.6,
+                                                    3.95, 4.3, 4.65, 5.0, 5.35, 5.7, 6.05, 6.4};
+// A round's cost is scale x base(size): the scale follows every round fast (the context grows, the tiers move, a
+// request's first windows run cold), each size's base follows its own rounds slowly, so the costs of sizes not taken
+// lately move with the ones taken
+constexpr double kScaleAlpha = 0.2;
+constexpr double kCostAlpha = 0.1;    // EMA weight of a size's new base
+// A size's first rounds start from the base the other sizes imply, worth this many rounds: one cold round (a
+// request's first windows run with the tiers still settling) cannot rule a size out
+constexpr double kBasePrior = 3.0;
+// Rounds after which a size's base is from another time (a cold start's, a past fixture's): the sizes measured since
+// stand in for it until it is measured again, so a size measured dear once is not ruled out for good
+constexpr long kStale = 64;
+constexpr double kChainStaleRounds = 300.0;
 constexpr double kTokAlpha = 0.05;    // EMA weight of a new MTP window outcome
 constexpr double kDecay = 0.97;       // lookup counts: older windows fade
 // Before a bucket has data: the longer the match, the likelier its continuation (llama.cpp's lookup decoding gates
@@ -18,17 +30,45 @@ constexpr double kDecay = 0.97;       // lookup counts: older windows fade
 constexpr double kPriorQ[DraftPolicy::kBuckets] = {0.75, 0.88, 0.93, 0.96};
 constexpr double kPriorN = 4.0;
 constexpr int kProbes = 3;       // a lookup window size is tried this often before its guessed cost can veto it
-// A size not measured for this many rounds is tried again when a confident lookup could use it: its cost was set in
-// one stretch (a prompt's cache refill, say) and, priced high, it would never be measured again (#1252)
-constexpr double kStaleRounds = 300.0;
+// Stated chances: the bins' upper edges. A confidence head is best near 1, where long windows are decided, so the bins
+// are finest there. Each bin starts from the stated chance, worth kChancePriorN tested drafts.
+constexpr float kChanceEdge[] = {0.3f, 0.5f, 0.7f, 0.8f, 0.9f, 0.95f, 0.98f, 0.995f};
+constexpr double kChanceDecay = 0.98;
+constexpr double kChancePriorN = 10.0;
+constexpr double kProbeChance = 0.85;   // the joint chance at which a drafter window one row past the best is probed
 
 }  // namespace
 
-DraftPolicy::DraftPolicy(int max_t, double margin)
-    : max_t_(std::clamp(max_t, 1, kMaxT)), margin_(margin) {}
+DraftPolicy::DraftPolicy(int max_t, double margin, bool timed)
+    : max_t_(std::clamp(max_t, 1, kMaxT)), margin_(margin), timed_(timed) {}
 
 int DraftPolicy::bucket(int match) {
     return match < 6 ? 0 : match < 12 ? 1 : match < 24 ? 2 : 3;
+}
+
+// measured fewer than kProbes times since it was new, or not for a long while
+bool DraftPolicy::unmeasured(int t) const { return base_n_[t] < kBasePrior + kProbes || !recent(t); }
+
+int DraftPolicy::chance_bin(float chance) {
+    int b = 0;
+    while (b < kChanceBins - 1 && chance >= kChanceEdge[b]) ++b;
+    return b;
+}
+
+double DraftPolicy::chance_rate(float chance) const {
+    const int b = chance_bin(chance);
+    const double c = std::clamp((double) chance, 0.0, 1.0);
+    return (c_ok_[b] + kChancePriorN * c) / (c_n_[b] + kChancePriorN);
+}
+
+// each bin's rate at its top edge (a chance of 1 in the last bin): no stated chance gets more
+double DraftPolicy::best_rate() const {
+    double hi = 0.0;
+    for (int b = 0; b < kChanceBins; ++b) {
+        const double top = b < kChanceBins - 1 ? (double) kChanceEdge[b] : 1.0;
+        hi = std::max(hi, (c_ok_[b] + kChancePriorN * top) / (c_n_[b] + kChancePriorN));
+    }
+    return hi;
 }
 
 double DraftPolicy::lookup_rate(int match) const {
@@ -36,21 +76,57 @@ double DraftPolicy::lookup_rate(int match) const {
     return (ok_[b] + kPriorN * kPriorQ[b]) / (ok_[b] + bad_[b] + kPriorN);
 }
 
+bool DraftPolicy::recent(int t) const { return base_n_[t] > 0 && round_ - seen_[t] <= kStale; }
+
+double DraftPolicy::base(int t) const {
+    if (recent(t)) return base_[t];
+    // sizes measured lately (else any measured) stand in for t: interpolated, extrapolated by the cost of a row, or
+    // scaled by the prior shape
+    for (const bool lately : {true, false}) {
+        const double b = base_from(t, lately);
+        if (b > 0) return b;
+    }
+    return kShape[t];
+}
+
+double DraftPolicy::base_from(int t, bool lately) const {
+    // the measured sizes next to t: between two, the line through them; above the largest, its line on from the two
+    // largest (the cost of a row on this machine); below the smallest, or with one, the prior shape scales it
+    int lo = 0, hi = 0, below = 0;
+    for (int u = 1; u <= kMaxT; ++u) {
+        if (u == t || base_n_[u] <= 0 || (lately && !recent(u))) continue;
+        if (u < t) { below = lo; lo = u; }
+        else if (hi == 0) hi = u;
+    }
+    if (lo > 0 && hi > 0) return base_[lo] + (base_[hi] - base_[lo]) * (double) (t - lo) / (double) (hi - lo);
+    if (lo > 0 && below > 0)
+        return base_[lo] + std::max(0.0, (base_[lo] - base_[below]) / (double) (lo - below)) * (double) (t - lo);
+    if (lo > 0) return base_[lo] * kShape[t] / kShape[lo];
+    if (hi > 0) return base_[hi] * kShape[t] / kShape[hi];
+    return -1.0;
+}
+
 double DraftPolicy::cost_ms(int t) const {
     t = std::clamp(t, 1, kMaxT);
-    if (cost_n_[t] > 0) return cost_[t];
-    // scale from the measured sizes, weighting each by how often it was seen
+    return (scale_ > 0 ? scale_ : 1.0) * base(t);       // before any round: the prior shape
+}
+
+double DraftPolicy::chain_cost_ms(int t) const {
+    t = std::clamp(t, 1, kMaxT);
+    if (chain_cost_n_[t] > 0) return chain_cost_[t];
     double num = 0.0, den = 0.0;
     for (int u = 1; u <= kMaxT; ++u)
-        if (cost_n_[u] > 0) {
-            const double w = std::min(cost_n_[u], 20.0);
-            num += w * cost_[u] * kShape[t] / kShape[u];
+        if (chain_cost_n_[u] > 0) {
+            const double w = std::min(chain_cost_n_[u], 20.0);
+            num += w * chain_cost_[u] * kShape[t] / kShape[u];
             den += w;
         }
     return den > 0 ? num / den : kShape[t];
 }
 
-bool DraftPolicy::stale(int t) const { return cost_n_[t] > 0 && rounds_ - last_[t] > kStaleRounds; }
+bool DraftPolicy::chain_stale(int t) const {
+    return chain_cost_n_[t] > 0 && chain_rounds_ - chain_last_[t] > kChainStaleRounds;
+}
 
 double DraftPolicy::mtp_tokens(int t) const {
     if (mtp_n_[t] > 0) return mtp_tok_[t];
@@ -58,10 +134,35 @@ double DraftPolicy::mtp_tokens(int t) const {
 }
 
 DraftPolicy::Pick DraftPolicy::choose(int t_mtp, int lookup_k, int match) const {
+    const int t = std::clamp(t_mtp, 1, max_t_);
+    if (lookup_k <= 0) {
+        Pick p;
+        p.t = t;
+        return p;
+    }
+    return lookup_over(t, mtp_tokens(t) / cost_ms(t), lookup_k, match);
+}
+
+DraftPolicy::Pick DraftPolicy::choose_window(const float* chance, int n, int lookup_k, int match) const {
     Pick p;
-    p.t = std::clamp(t_mtp, 1, max_t_);
+    p.t = window(chance, n);
     if (lookup_k <= 0) return p;
-    const double base = mtp_tokens(p.t) / cost_ms(p.t);
+    return lookup_over(p.t, drafter_tokens(chance, p.t) / cost_ms(p.t), lookup_k, match);
+}
+
+double DraftPolicy::drafter_tokens(const float* chance, int t) const {
+    double e = 1.0, all = 1.0;
+    for (int i = 0; i + 1 < t; ++i) {
+        all *= chance_rate(chance[i]);
+        e += all;
+    }
+    return e;
+}
+
+// `base`: the expected tokens per ms of the window of t the drafter would run
+DraftPolicy::Pick DraftPolicy::lookup_over(int t, double base, int lookup_k, int match) const {
+    Pick p;
+    p.t = t;
     const double q = lookup_rate(match);
     double e = 1.0, qi = 1.0, best = 0.0;
     int best_t = 0;
@@ -71,31 +172,108 @@ DraftPolicy::Pick DraftPolicy::choose(int t_mtp, int lookup_k, int match) const 
         const double r = e / cost_ms(k + 1);
         if (r > best) { best = r; best_t = k + 1; }
     }
-    const int t_full = std::min(lookup_k, max_t_ - 1) + 1;
     if (best_t > 0 && best > base * (1.0 + margin_)) {
         p.lookup = true;
         p.t = best_t;
-        // a wider size whose cost has gone stale is re-measured, so one slow stretch cannot price it out for good
-        if (best_t < t_full && q >= 0.85 && stale(t_full)) p.t = t_full;
         return p;
     }
     // a guessed cost can keep the policy from ever measuring a size: the first few times a confident lookup would
-    // need a size not measured yet, it is tried (verification keeps the output; only the one round's speed is at stake)
-    if (t_full > p.t && (cost_n_[t_full] < kProbes || stale(t_full)) && q >= 0.85) {
+    // need a size not measured yet (or not for long), it is tried (verification keeps the output; only the one
+    // round's speed is at stake)
+    const int t_full = std::min(lookup_k, max_t_ - 1) + 1;
+    if (t_full > p.t && unmeasured(t_full) && q >= 0.85) {
         p.lookup = true;
         p.t = t_full;
     }
     return p;
 }
 
+int DraftPolicy::window(const float* chance, int n) const {
+    const int most = std::clamp(n + 1, 1, max_t_);
+    double e = 1.0, all = 1.0, best = 1.0 / cost_ms(1);
+    int best_t = 1;
+    for (int t = 2; t <= most; ++t) {
+        all *= chance_rate(chance[t - 2]);
+        e += all;
+        const double r = e / cost_ms(t);
+        if (r > best) { best = r; best_t = t; }
+    }
+    // as for lookup windows: a size whose cost is only guessed (or old) is tried a few times when its drafts are
+    // likely accepted, so a guessed or stale cost cannot keep the window from ever growing
+    if (best_t < most && unmeasured(best_t + 1)) {
+        double joint = 1.0;
+        for (int i = 0; i < best_t; ++i) joint *= chance_rate(chance[i]);
+        if (joint >= kProbeChance) ++best_t;
+    }
+    return best_t;
+}
+
+// window()'s choice with draft j's chance known and the later ones at best_rate(): the windows without draft j are
+// priced exactly; one with it wins only above them (E grows with every chance), or by the probe one row past t = j + 1
+bool DraftPolicy::may_verify(const float* chance, int j, int n) const {
+    const int most = std::clamp(n + 1, 1, max_t_);
+    if (j < 0 || j + 2 > most) return false;
+    double e = 1.0, all = 1.0, best = 1.0 / cost_ms(1);
+    int best_t = 1;
+    for (int t = 2; t <= j + 1; ++t) {
+        all *= chance_rate(chance[t - 2]);
+        e += all;
+        const double r = e / cost_ms(t);
+        if (r > best) { best = r; best_t = t; }
+    }
+    const double hi = best_rate();
+    double joint = all * chance_rate(chance[j]);
+    for (int t = j + 2; t <= most; ++t) {
+        all *= t == j + 2 ? chance_rate(chance[j]) : hi;
+        e += all;
+        if (e / cost_ms(t) > best) return true;
+    }
+    return best_t == j + 1 && unmeasured(j + 2) && joint >= kProbeChance;
+}
+
+void DraftPolicy::observe_window(const float* chance, int t, int accepted, double round_ms) {
+    // drafts 0..accepted-1 were accepted given their prefix and draft `accepted` (if the window had it) was not; the
+    // drafts after it were never tested
+    const int tested = std::min(t - 1, accepted + 1);
+    for (int i = 0; i < tested; ++i) {
+        const int b = chance_bin(chance[i]);
+        c_ok_[b] = kChanceDecay * c_ok_[b] + (i < accepted ? 1.0 : 0.0);
+        c_n_[b] = kChanceDecay * c_n_[b] + 1.0;
+    }
+    observe(false, t, accepted, 0, round_ms);
+}
+
+void DraftPolicy::record_scale_cost(int t, double round_ms) {
+    ++round_;
+    if (!timed_) round_ms = kShape[t];
+    if (round_ms > 0) {
+        if (scale_ <= 0) scale_ = round_ms / kShape[t];          // the first round sets the scale
+        if (!recent(t)) {                                        // new, or measured too long ago: start over from
+            base_[t] = base(t);                                  // what the other sizes imply
+            base_n_[t] = kBasePrior;
+        }
+        scale_ += kScaleAlpha * (round_ms / base_[t] - scale_);
+        const double w = std::max(kCostAlpha, 1.0 / (base_n_[t] + 1.0));
+        base_[t] = (1.0 - w) * base_[t] + w * round_ms / scale_;
+        base_n_[t] += 1.0;
+        seen_[t] = round_;
+    }
+}
+
+void DraftPolicy::record_chain_cost(int t, double round_ms) {
+    if (!timed_) round_ms = kShape[t];
+    if (round_ms > 0) {
+        chain_cost_[t] = chain_cost_n_[t] > 0 ? (1.0 - kCostAlpha) * chain_cost_[t] + kCostAlpha * round_ms : round_ms;
+        chain_cost_n_[t] += 1.0;
+        chain_last_[t] = chain_rounds_;
+    }
+    chain_rounds_ += 1.0;
+}
+
 void DraftPolicy::observe(bool lookup, int t, int accepted, int match, double round_ms) {
     t = std::clamp(t, 1, kMaxT);
-    if (round_ms > 0) {
-        cost_[t] = cost_n_[t] > 0 ? (1.0 - kCostAlpha) * cost_[t] + kCostAlpha * round_ms : round_ms;
-        cost_n_[t] += 1.0;
-        last_[t] = rounds_;
-    }
-    rounds_ += 1.0;
+    record_scale_cost(t, round_ms);
+    record_chain_cost(t, round_ms);
     if (lookup) {
         const int b = bucket(match);
         ok_[b] = kDecay * ok_[b] + accepted;
@@ -118,35 +296,31 @@ int DraftPolicy::chain(int t_mtp, double p_mtp, int k_avail, int match) const {
     t_mtp = std::clamp(t_mtp, 1, max_t_);
     const int kmax = std::min(k_avail, max_t_ - t_mtp);
     if (kmax <= 0) return 0;
-    const double e0 = mtp_tokens(t_mtp), base = e0 / cost_ms(t_mtp), c = chain_rate(match);
+    const double e0 = mtp_tokens(t_mtp), base = e0 / chain_cost_ms(t_mtp), c = chain_rate(match);
     p_mtp = std::clamp(p_mtp, 0.0, 1.0);
     double gain = 0.0, ci = 1.0, best = 0.0;
     int best_k = 0;
     for (int k = 1; k <= kmax; ++k) {
         ci *= c;
         gain += ci;
-        const double r = (e0 + p_mtp * gain) / cost_ms(t_mtp + k);
+        const double r = (e0 + p_mtp * gain) / chain_cost_ms(t_mtp + k);
         if (r > best) { best = r; best_k = k; }
     }
     const int t_full = t_mtp + kmax;
     if (best_k > 0 && best > base * (1.0 + margin_)) {
         // As choose(): a profitable shorter chain must not keep a stale full size from being measured again.
-        if (best_k < kmax && p_mtp * c >= 0.6 && stale(t_full)) return kmax;
+        if (best_k < kmax && p_mtp * c >= 0.6 && chain_stale(t_full)) return kmax;
         return best_k;
     }
     // as choose(): a size whose cost is only guessed is tried a few times when the continuation looks likely
-    if ((cost_n_[t_full] < kProbes || stale(t_full)) && p_mtp * c >= 0.6) return kmax;
+    if ((chain_cost_n_[t_full] < kProbes || chain_stale(t_full)) && p_mtp * c >= 0.6) return kmax;
     return 0;
 }
 
 void DraftPolicy::observe_chain(int t_mtp, int k, int accepted, int match, double round_ms) {
     const int t = std::clamp(t_mtp + k, 1, kMaxT);
-    if (round_ms > 0) {
-        cost_[t] = cost_n_[t] > 0 ? (1.0 - kCostAlpha) * cost_[t] + kCostAlpha * round_ms : round_ms;
-        cost_n_[t] += 1.0;
-        last_[t] = rounds_;
-    }
-    rounds_ += 1.0;
+    record_scale_cost(t, round_ms);
+    record_chain_cost(t, round_ms);
     // the MTP part is an ordinary MTP window as far as its own drafts go
     const int mtp_acc = std::min(accepted, t_mtp - 1);
     const double got = mtp_acc + 1.0;

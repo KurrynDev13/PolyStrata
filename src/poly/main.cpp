@@ -75,6 +75,16 @@ constexpr int kBlockWindow = 4;
 // A repeat of a few tokens is in any text, and what followed it there is seldom what follows here for long.
 constexpr int kCopyMatch = 8;
 
+inline bool adaptive_draft_policy_on() {
+    const char* v = std::getenv("STRATA_POLY_DRAFT_POLICY");
+    return !(v && v[0] == '0' && v[1] == '\0');
+}
+
+inline bool draft_policy_log_on() {
+    const char* v = std::getenv("STRATA_POLY_DRAFT_LOG");
+    return v && v[0] == '1' && v[1] == '\0';
+}
+
 // With batch slots a prompt is read in pieces: between two, a BYIELD can stop the read and the slots write for half
 // the time the piece took.  A piece is a call (max_rows()) while slots write, so that they are not held up long,
 // and this many calls while none does, as Strata's engine reads its chunks.
@@ -506,7 +516,13 @@ struct Session {
         };
         if (max_new > 0) {
             int32_t w[strata::spec::DraftPolicy::kMaxT], d[strata::spec::DraftPolicy::kMaxT];
+            float chance[strata::spec::DraftPolicy::kMaxT] = {};
             const int block_window = engine.guesses_at_once() ? most : kBlockWindow;
+            const bool use_adaptive = engine.guesses_at_once() && adaptive_draft_policy_on();
+            const bool draft_log = draft_policy_log_on();
+            int win_hist[strata::spec::DraftPolicy::kMaxT + 1] = {};
+            long long ds_rounds = 0, ds_acc = 0, ds_prop = 0;
+            long long lk_rounds = 0, lk_acc = 0, lk_prop = 0;
             int32_t t = pick(engine.logits());   // picked, and not shown yet
             while (show(t)) {
                 // t goes into the model now, and with it guesses at what follows when there are any that pay
@@ -520,14 +536,57 @@ struct Session {
                 // is taken as it is: the block would mostly say the same, and asking it takes time.  Otherwise the
                 // block guesses, each guess from the one before, while a guess more pays (Guesses).
                 const bool blocks = engine.drafts() && room && !(k == widest - 1 && policy.lookup_rate(match) >= 0.9);
+                strata::spec::DraftPolicy::Pick use{};
+                int n_d = 0;
+                if (use_adaptive) {
+                    if (blocks) {
+                        const int max_d = std::min(most, block_window) - 1;
+                        if (max_d > 0) {
+                            d[0] = engine.draft(t, 0, &chance[0]);
+                            n_d = std::min(max_d, engine.block_drafts());
+                            for (int i = 1; i < n_d; ++i) d[i] = engine.draft(d[i - 1], i, &chance[i]);
+                        }
+                    }
+                    const int k_eff = (n_d > 0 && k > 0 && w[1] != d[0]) ? 0 : k;
+                    use = policy.choose_window(chance, n_d, k_eff, match);
+                    if (draft_log) ++win_hist[use.t];
+                    if (use.t == 1) {
+                        engine.eval(&t, 1, true);
+                        kept.read(&t, 1);
+                        t = pick(engine.logits());
+                        const double ms = engine.took_record() ? 0.0 : ms_since(round);
+                        policy.observe_window(chance, 1, 0, ms);
+                        continue;
+                    }
+                    w[0] = t;
+                    if (!use.lookup) std::copy(d, d + use.t - 1, w + 1);
+                    engine.window(w, use.t);
+                    int right = 0;
+                    bool more = true;
+                    t = pick(engine.logits_of(0));
+                    while (right < use.t - 1 && t == w[right + 1] && (more = show(t))) t = pick(engine.logits_of(++right));
+                    engine.keep(right + 1);
+                    kept.read(w, right + 1);
+                    const int acc = right + (more ? 0 : 1);
+                    r.guessed += use.t - 1;
+                    r.guessed_right += acc;
+                    const double ms = engine.took_record() ? 0.0 : ms_since(round);
+                    if (draft_log) {
+                        if (use.lookup) { ++lk_rounds; lk_acc += acc; lk_prop += use.t - 1; }
+                        else { ++ds_rounds; ds_acc += acc; ds_prop += use.t - 1; }
+                    }
+                    if (use.lookup) policy.observe(true, use.t, acc, match, ms);
+                    else policy.observe_window(chance, use.t, acc, ms);
+                    if (!more) break;
+                    continue;
+                }
                 const bool ask = guesses.begin(blocks, policy);
                 // the round's time, as the policy counts it: a window of `in` tokens wrote n of them
                 const auto count = [&](int in, int n) {
                     return guesses.end(in, n, ms_since(round), engine.took_record());
                 };
-                strata::spec::DraftPolicy::Pick use = policy.choose(1, k, match);
+                use = policy.choose(1, k, match);
                 if (ask) {
-                    int n_d = 0;
                     for (int32_t from = t; n_d < std::min(most, block_window) - 1 && guesses.wants(n_d); from = d[n_d++]) {
                         float p = 0.f;
                         const Clock::time_point asked_at = Clock::now();
@@ -558,6 +617,14 @@ struct Session {
                 r.guessed_right += right + (more ? 0 : 1);
                 policy.observe(use.lookup, use.t, right, match, count(use.t, right + 1));
                 if (!more) break;
+            }
+            if (draft_log && use_adaptive) {
+                std::fprintf(stderr, "strata-poly: draft_policy hist=[");
+                for (int i = 1; i <= most; ++i) std::fprintf(stderr, "%s%d:%d", i == 1 ? "" : " ", i, win_hist[i]);
+                std::fprintf(stderr, "] dspark=%lld/%lld(%lld) lookup=%lld/%lld(%lld) cost=[",
+                             ds_acc, ds_prop, ds_rounds, lk_acc, lk_prop, lk_rounds);
+                for (int i = 1; i <= most; ++i) std::fprintf(stderr, "%s%.2f", i == 1 ? "" : ",", policy.cost_ms(i));
+                std::fprintf(stderr, "]\n");
             }
         }
         r.decode_ms = ms_since(t0);

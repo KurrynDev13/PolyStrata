@@ -1,14 +1,28 @@
-// src/spec/draft_policy_test.cpp - DraftPolicy: when does a lookup window beat the MTP's?
+// src/spec/draft_policy_test.cpp - DraftPolicy: when does a lookup window beat the MTP's? How many of a drafter's
+// stated-chance drafts does a window take?
 //
 // Simulated rounds with the costs measured on the RTX 5070 (window-cost: ~10 ms more per token) check that
 //   1. with no lookup proposal the MTP window is kept;
 //   2. lookup drafts that are mostly rejected stop being taken (their bucket's rate falls);
 //   3. lookup drafts that are always accepted are taken, and the window grows with them;
 //   4. match-length buckets learn separately (short matches failing does not stop long ones);
-//   5. the policy never proposes a window beyond its cap.
+//   5. the policy never proposes a window beyond its cap;
+//   6. --lookup-chain behavior;
+//   7. stale full size re-probes for chain.
+// Drafter windows (stated chances, DeepSeek's measured shape: about 3.6 ms more per row on 13 ms):
+//   8. drafts that are always accepted fill the window, which grows past a size measured too dear at the start;
+//   9. middling chances stop the window where another row costs more than it returns;
+//  10. a head that overstates its chances is calibrated down, and the window shrinks with it;
+//  11. rows that cost little take more drafts at the same chances;
+//  12. never more rows than the drafts, nor beyond the cap;
+//  13. choose_window vs lookup;
+//  14. may_verify soundness and early stops;
+//  15. untimed determinism.
 #include "strata/spec/draft_policy.hpp"
 
+#include <algorithm>
 #include <cstdio>
+#include <random>
 
 using strata::spec::DraftPolicy;
 
@@ -19,6 +33,26 @@ void check(bool ok, const char* what) {
     if (!ok) ++g_fail;
 }
 double cost(int t) { return 19.0 + 10.5 * (t - 1); }   // ms per round, measured shape
+double ds_cost(int t) { return 13.0 + 3.6 * (t - 1); }  // DeepSeek's round: verify + commit + draft
+// rounds of a drafter whose drafts are each accepted with chance `q` (a fixed-seed draw), stating `stated`; returns the
+// window the policy picks most often over the last half
+int run(DraftPolicy& p, float stated, float q, int rounds, double (*c)(int)) {
+    const float ch[5] = {stated, stated, stated, stated, stated};
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<float> u(0.0f, 1.0f);
+    int seen[DraftPolicy::kMaxT + 1] = {};
+    for (int i = 0; i < rounds; ++i) {
+        const int t = p.window(ch, 5);
+        int a = 0;
+        while (a < t - 1 && u(rng) < q) ++a;
+        p.observe_window(ch, t, a, c(t));
+        if (2 * i >= rounds) ++seen[t];
+    }
+    int best = 1;
+    for (int t = 1; t <= DraftPolicy::kMaxT; ++t)
+        if (seen[t] > seen[best]) best = t;
+    return best;
+}
 }  // namespace
 
 int main() {
@@ -57,21 +91,8 @@ int main() {
         check(k.lookup && k.t == 6, "an unmeasured size is probed for a confident lookup");
         for (int i = 0; i < 3; ++i) p.observe(true, 6, 5, 40, 3.0 * cost(6));   // it turns out very expensive
         check(!p.choose(4, 5, 40).lookup, "after the probes, the measured cost decides");
-    }
-    {
-        // #1252: a wide size priced high in one slow stretch is measured again after a while
-        DraftPolicy p(6);
-        for (int i = 0; i < 50; ++i) p.observe(false, 4, 3, 0, cost(4));      // a strong MTP
-        for (int t = 2; t <= 6; ++t) for (int i = 0; i < 4; ++i) p.observe(false, t, t - 1, 0, cost(t));
-        for (int i = 0; i < 6; ++i) p.observe(true, 6, 5, 40, 4.0 * cost(6));  // the wide size, in a slow stretch
-        for (int i = 0; i < 30; ++i) p.observe(true, 4, 3, 40, cost(4));       // and the short window's rate is fine
-        bool saw6 = false;
-        for (int i = 0; i < 400 && !saw6; ++i) {
-            const DraftPolicy::Pick k = p.choose(4, 5, 40);
-            if (k.lookup && k.t == 6) { saw6 = true; p.observe(true, 6, 5, 40, cost(6)); }
-            else p.observe(k.lookup, k.t, k.t - 1, 40, cost(k.t));
-        }
-        check(saw6, "a stale wide size is tried again within a few hundred rounds");
+        for (int i = 0; i < 100; ++i) p.observe(false, 4, 3, 0, cost(4));
+        check(p.choose(4, 5, 40).lookup, "a size measured long ago is probed again");
     }
     {
         // --lookup-chain: rows cheap (UMA-like) and the chain always accepted -> chained; rows dear or the chain
@@ -113,6 +134,130 @@ int main() {
         check(probes > 0 && probes <= 3 && spaced,
               "chain: stale full size is re-probed despite a profitable shorter chain");
         check(probes > 0 && confident, "chain: stale re-probes retain the MTP confidence gate");
+    }
+    {
+        DraftPolicy p(6);
+        const float ch[5] = {0.999f, 0.999f, 0.999f, 0.999f, 0.999f};
+        for (int i = 0; i < 20; ++i) {   // a cold start: size 6 measured dear beside size 1
+            p.observe_window(nullptr, 1, 0, ds_cost(1));
+            p.observe_window(ch, 6, 5, 3.0 * ds_cost(6));
+        }
+        check(p.window(ch, 5) < 6, "drafter: a size measured dear is not taken at first");
+        const int t = run(p, 0.999f, 1.0f, 800, ds_cost);
+        check(t == 6, "drafter: accepted drafts fill the window once its cost is known");
+        check(p.cost_ms(6) < 1.2 * ds_cost(6), "drafter: the dear size's cost is measured again");
+    }
+    {
+        DraftPolicy p(6);
+        const float ch[5] = {0.6f, 0.6f, 0.6f, 0.6f, 0.6f};
+        const int t = run(p, 0.6f, 0.6f, 300, ds_cost);
+        // E/cost at q 0.6: t1 1/13 = .0769, t2 1.6/16.6 = .0964, t3 1.96/20.2 = .0970, t4 2.18/23.8 = .0914
+        check(t == 2 || t == 3, "drafter: middling chances stop at 2 or 3 rows");
+        check(p.window(ch, 5) <= 3, "drafter: no deeper than the rows pay");
+    }
+    {
+        DraftPolicy p(6);
+        const int t0 = run(p, 0.95f, 0.95f, 200, ds_cost);
+        DraftPolicy o(6);
+        const int t1 = run(o, 0.95f, 0.45f, 300, ds_cost);   // stated 0.95, accepted 0.45
+        check(o.chance_rate(0.95f) < 0.7, "drafter: an overstated chance is calibrated down");
+        check(t1 < t0, "drafter: the window shrinks with the calibrated chance");
+    }
+    {
+        DraftPolicy p(6), q(6);
+        const int t_dear = run(p, 0.75f, 0.75f, 300, ds_cost);
+        const int t_cheap = run(q, 0.75f, 0.75f, 300, [](int t) { return 13.0 + 0.8 * (t - 1); });
+        check(t_cheap > t_dear, "drafter: cheap rows take more drafts at the same chances");
+    }
+    {
+        DraftPolicy p(4);
+        const float ch[5] = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
+        check(p.window(ch, 2) <= 3, "drafter: never more rows than drafts + 1");
+        check(p.window(ch, 5) <= 4, "drafter: never beyond the cap");
+        check(p.window(ch, 0) == 1, "drafter: no drafts, one row");
+    }
+    {
+        DraftPolicy p(DraftPolicy::kMaxT);
+        const float ch[DraftPolicy::kMaxT - 1] = {0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.9f};
+        for (int i = 0; i < 200; ++i) {
+            const int t = 1 + i % DraftPolicy::kMaxT;
+            p.observe(true, t, t - 1, 40, 20.0 + 1.5 * (t - 1));   // copies behind long matches: all accepted, rows cheap
+        }
+        const DraftPolicy::Pick none = p.choose_window(ch, 7, 0, 0);
+        check(!none.lookup && none.t == p.window(ch, 7), "drafter vs lookup: no proposal, the drafter's window");
+        const DraftPolicy::Pick k = p.choose_window(ch, 7, 15, 40);
+        check(k.lookup && k.t > 8, "drafter vs lookup: a long reliable copy takes a wide window");
+        check(p.choose_window(ch, 7, 40, 40).t <= DraftPolicy::kMaxT, "drafter vs lookup: never beyond the cap");
+        for (int i = 0; i < 200; ++i) p.observe(true, 6, 0, 4, 20.0 + 1.5 * 5);   // short matches: the first draft fails
+        const float sure[7] = {0.99f, 0.99f, 0.99f, 0.99f, 0.99f, 0.99f, 0.99f};
+        check(!p.choose_window(sure, 7, 5, 4).lookup, "drafter vs lookup: a failing short copy loses to sure drafts");
+    }
+    {   // may_verify: a draft it rules out is in no window of any later chances, and stopping there keeps the window
+        std::mt19937 rng(11);
+        std::uniform_real_distribution<float> u(0.0f, 1.0f);
+        bool sound = true, same = true;
+        int stops = 0, asked = 0;
+        for (int pass = 0; pass < 40; ++pass) {
+            DraftPolicy p(6);
+            const double row = 1.0 + 6.0 * u(rng);   // ms a row on top of a 15 ms round
+            for (int i = 0; i < 30 + pass * 7; ++i) {
+                float ch[5];
+                for (float& c : ch) c = u(rng);
+                const int t = p.window(ch, 5);
+                int a = 0;
+                while (a < t - 1 && u(rng) < ch[a]) ++a;
+                p.observe_window(ch, t, a, 15.0 + row * (t - 1));
+            }
+            for (int k = 0; k < 200; ++k) {
+                float ch[5];
+                for (float& c : ch) c = u(rng) < 0.3f ? 0.99f + 0.01f * u(rng) : u(rng);
+                const int n = 1 + k % 5;
+                for (int j = 0; j < n; ++j) {
+                    ++asked;
+                    if (p.may_verify(ch, j, n)) continue;
+                    ++stops;
+                    const int cut = p.window(ch, j);   // the drafts made before the stop
+                    for (int r = 0; r < 20; ++r) {
+                        float full[5];
+                        std::copy(ch, ch + 5, full);
+                        for (int i = j + 1; i < n; ++i) full[i] = r == 0 ? 1.0f : u(rng);
+                        const int t = p.window(full, n);
+                        sound = sound && t <= j + 1;
+                        same = same && t == cut;
+                    }
+                    break;
+                }
+            }
+        }
+        std::printf("  (may_verify stopped %d of %d asks)\n", stops, asked);
+        check(sound, "may_verify: a draft ruled out is in no window of any later chances");
+        check(same, "may_verify: the window of the drafts made is the full window");
+        check(stops > asked / 10, "may_verify: drafts are ruled out");
+        DraftPolicy p(6);
+        for (int i = 0; i < 100; ++i) {   // prose-like: a first draft at 0.6, a second at 0.45
+            const float ch[5] = {0.6f, 0.45f, 0.45f, 0.45f, 0.45f};
+            const int t = p.window(ch, 2);
+            p.observe_window(ch, t, i % 5 < 3 ? std::min(1, t - 1) : 0, 16.0 + 4.0 * (t - 1));
+        }
+        const float lo[2] = {0.6f, 0.2f};
+        check(p.window(lo, 2) <= 2 && !p.may_verify(lo, 1, 2), "may_verify: a weak second draft is not made");
+        const float none[1] = {0.0f};
+        check(!p.may_verify(none, 0, 0) && !p.may_verify(none, 5, 5), "may_verify: no draft past the drafts or the cap");
+    }
+    {   // an untimed policy ignores round times: the same outcomes give the same picks whatever the clock said
+        DraftPolicy fast(8, 0.03, false), slow(8, 0.03, false);
+        std::mt19937 rng(7);
+        std::uniform_int_distribution<int> acc(0, 5);
+        bool same = true;
+        for (int i = 0; i < 300; ++i) {
+            const int t = 2 + i % 6, a2 = std::min(acc(rng), t - 1), m = 3 + (i * 5) % 40;
+            const bool lk = i % 3 == 0;
+            fast.observe(lk, t, a2, m, 10.0 + 7.0 * t);
+            slow.observe(lk, t, a2, m, 55.0 - 3.0 * t + (i % 11));
+            const DraftPolicy::Pick x = fast.choose(t, 5 + i % 9, m), y = slow.choose(t, 5 + i % 9, m);
+            same = same && x.lookup == y.lookup && x.t == y.t;
+        }
+        check(same, "untimed: the picks do not depend on the round times");
     }
     std::printf(g_fail ? "FAIL\n" : "PASS\n");
     return g_fail ? 1 : 0;
