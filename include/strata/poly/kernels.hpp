@@ -666,4 +666,28 @@ void inkling_dspark_attend(const float* q, const uint16_t* kcache, const uint16_
                            int window = 0, int ring = 0, const long long* at = nullptr, int room = 0,
                            Kvq8 kq8 = {}, Kvq8 vq8 = {}, Kvq4 kq4 = {}, Kvq4 vq4 = {});
 
+/// 2-bit head screening proxy + mapped pinned-host fold/w1 exact rescore for Inkling 2 DSpark (Basalt head_proxy).
+struct DsparkHeadArgs {
+    const void* head = nullptr;        ///< output_ weights on device (GGML_TYPE_Q8_0=8 or GGML_TYPE_Q6_K=14, [n_vocab, 2304])
+    int head_type = 8;                 ///< 8 = Q8_0, 14 = Q6_K
+    const void* head_sc = nullptr;     ///< 2-bit packed transposed copy of head
+    const void* fold = nullptr;        ///< dspark_fold_w_ (Q8_0, [n_vocab, 256], host or device)
+    const void* fold_sc = nullptr;     ///< 2-bit packed transposed copy of fold
+    const float* fold_b = nullptr;     ///< [n_vocab] F32 in token order
+    const float* fold_bp = nullptr;    ///< [screen_rows] F32 in transposed copy order
+    int64_t n_vocab = 0;
+    float cap = 0.0f;
+};
+size_t inkling_dspark_screen_bytes(int n_in, int64_t n_rows);
+int64_t inkling_dspark_screen_rows(int64_t n_vocab);
+size_t inkling_dspark_head_scratch_bytes(int64_t n_vocab);
+void inkling_dspark_screen_pack(const void* src, int src_type, int n_in, int64_t n_rows, void* screen, void* stream);
+void inkling_dspark_screen_order(const float* by_token, int64_t n_vocab, float* by_row, void* stream);
+void inkling_dspark_head_base(const void* head_sc, const void* hq, int rows, int64_t n_vocab, float* approx,
+                              void* stream);
+void inkling_dspark_head_pick(const DsparkHeadArgs& h, const void* hq, const void* latq, const float* approx, int step,
+                              void* scratch, Likeliest* out_pick, const uint16_t* w1_host_dev, uint16_t* w1_row,
+                              void* stream);
+void inkling_dspark_prep_rnn_step_row(const float* state, const uint16_t* w1_row, float* out, int rank, void* stream);
+
 }  // namespace strata::poly

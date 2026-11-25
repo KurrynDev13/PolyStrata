@@ -493,6 +493,13 @@ size_t Inkling2::recurrent_floats() const {
     return schedule_.size() * slot_conv_floats_;
 }
 
+Inkling2::~Inkling2() {
+    if (device_ >= 0) cudaSetDevice(device_);
+    if (st_) cudaStreamSynchronize(cs(st_));
+    if (h_dspark_w1_) cudaFreeHost(h_dspark_w1_);
+    if (h_dspark_fold_w_) cudaFreeHost(h_dspark_fold_w_);
+}
+
 size_t Inkling2::kv_code_row_bytes(bool value) const {
     const size_t row = (size_t) n_kv_ * head_dim_;
     if (opt_.kv_format == KvFmt::kQ4_0 || (value && opt_.kv_format == KvFmt::kK8V4)) return row / 2;
@@ -717,8 +724,15 @@ void Inkling2::assign_scratch() {
         d_blk_attn_ = fbuf(blk * n_embd_);
         d_blk_gate_ = fbuf(blk * 2 * dspark_ff_);
         dspark_mask_tiled_ = fbuf((blk - 1) * n_embd_);
-        d_base_logits_ = fbuf((blk - 1) * (size_t) dv);
-        d_markov_bias_ = fbuf((size_t) dv);
+        if (dspark_proxy_) {
+            d_head_approx_ = fbuf((blk - 1) * (size_t) inkling_dspark_screen_rows(dv));
+            d_head_scr_ = (void*) fbuf((inkling_dspark_head_scratch_bytes(dv) + 3) / 4);
+            d_rnn_lat_q_ = (void*) fbuf(((blk - 1) * kernels::native_q8_1_bytes(dspark_rank_) + 3) / 4);
+            d_w1_row_ = (uint16_t*) fbuf(((size_t) dspark_rank_ * sizeof(uint16_t) + 3) / 4);
+        } else {
+            d_base_logits_ = fbuf((blk - 1) * (size_t) dv);
+            d_markov_bias_ = fbuf((size_t) dv);
+        }
         d_rnn_in_ = fbuf((size_t) (2 * dspark_rank_));
         d_rnn_gates_ = fbuf((size_t) (3 * dspark_rank_));
         d_rnn_h_gates_ = fbuf((blk - 1) * (size_t) (3 * dspark_rank_));
@@ -1615,6 +1629,15 @@ void Inkling2::load_drafter() {
         dspark_rnn_h_ = dmat_cols_q4(rw, 2 * (int64_t) dspark_rank_, n_embd_, rnn_out);
         dspark_rnn_f_ = dmat_cols_q4(rw, 2 * (int64_t) dspark_rank_ + n_embd_, n_embd_, rnn_out);
     }
+    auto env_on = [](const char* name) {
+        const char* v = std::getenv(name);
+        return !(v && v[0] == '0' && v[1] == '\0');
+    };
+    const bool can_proxy = (output_.type == (uint32_t) GGML_TYPE_Q8_0 || output_.type == (uint32_t) GGML_TYPE_Q6_K) &&
+                           n_embd_ == 2304 && dspark_rank_ == 256 && dspark_block_ == 8;
+    dspark_proxy_ = can_proxy && env_on("STRATA_INK_DSPARK_PROXY");
+    dspark_stage_graphs_ = env_on("STRATA_INK_DSPARK_GRAPHS");
+
     dspark_rnn_bias_ = dvec("markov_head.rnn_proj.bias", 3 * (int64_t) dspark_rank_);
     {
         const TensorInfo* w1 = dtensor("markov_head.markov_w1.weight");
@@ -1622,10 +1645,22 @@ void Inkling2::load_drafter() {
             (int64_t) w1->shape[1] != dspark_w1_vocab_)
             throw std::runtime_error("dspark markov_w1.weight has wrong shape or type");
         const size_t w1_bytes = dg_->payload(*w1);
-        dspark_w1_ = reserve_dense(w1_bytes, kTypeBF16, dspark_rank_, dspark_w1_vocab_);
-        if (dense_) {
-            h2d(dspark_w1_.p, dg_->data(*w1), w1_bytes);
-            uploaded_.emplace_back(dg_->data(*w1), w1_bytes);
+        if (dspark_proxy_) {
+            if (dense_) {
+                ck(cudaHostAlloc(&h_dspark_w1_, w1_bytes, cudaHostAllocMapped), "dspark w1 host alloc");
+                std::memcpy(h_dspark_w1_, dg_->data(*w1), w1_bytes);
+                void* dev_p = nullptr;
+                ck(cudaHostGetDevicePointer(&dev_p, h_dspark_w1_, 0), "dspark w1 host dev ptr");
+                d_dspark_w1_dev_ = (const uint16_t*) dev_p;
+                dspark_w1_ = Dev{dev_p, kTypeBF16, dspark_rank_, dspark_w1_vocab_, 1.f};
+                uploaded_.emplace_back(dg_->data(*w1), w1_bytes);
+            }
+        } else {
+            dspark_w1_ = reserve_dense(w1_bytes, kTypeBF16, dspark_rank_, dspark_w1_vocab_);
+            if (dense_) {
+                h2d(dspark_w1_.p, dg_->data(*w1), w1_bytes);
+                uploaded_.emplace_back(dg_->data(*w1), w1_bytes);
+            }
         }
     }
 
@@ -1653,7 +1688,22 @@ void Inkling2::load_drafter() {
 
     const size_t fold_w_bytes = ggml_row_size(GGML_TYPE_Q8_0, dspark_rank_) * (size_t) n_vocab_;
     const size_t fold_b_bytes = (size_t) n_vocab_ * sizeof(float);
-    dspark_fold_w_ = reserve_dense(fold_w_bytes, (uint32_t) GGML_TYPE_Q8_0, dspark_rank_, n_vocab_);
+    if (dspark_proxy_) {
+        if (dense_) {
+            ck(cudaHostAlloc(&h_dspark_fold_w_, fold_w_bytes, cudaHostAllocMapped), "dspark fold_w host alloc");
+            ck(cudaHostGetDevicePointer(&d_dspark_fold_w_dev_, h_dspark_fold_w_, 0), "dspark fold_w host dev ptr");
+            dspark_fold_w_ = Dev{d_dspark_fold_w_dev_, (uint32_t) GGML_TYPE_Q8_0, dspark_rank_, n_vocab_, 1.f};
+        } else {
+            dspark_fold_w_ = Dev{nullptr, (uint32_t) GGML_TYPE_Q8_0, dspark_rank_, n_vocab_, 1.f};
+        }
+        const int dv = draft_rows();
+        dspark_head_sc_ = reserve_dense(inkling_dspark_screen_bytes(n_embd_, dv), kTypeF32, n_embd_, dv);
+        dspark_fold_sc_ = reserve_dense(inkling_dspark_screen_bytes(dspark_rank_, dv), kTypeF32, dspark_rank_, dv);
+        dspark_fold_bp_ = reserve_dense((size_t) inkling_dspark_screen_rows(dv) * sizeof(float), kTypeF32,
+                                        (int) inkling_dspark_screen_rows(dv), 1);
+    } else {
+        dspark_fold_w_ = reserve_dense(fold_w_bytes, (uint32_t) GGML_TYPE_Q8_0, dspark_rank_, n_vocab_);
+    }
     dspark_fold_b_ = reserve_dense(fold_b_bytes, kTypeF32, n_vocab_, 1);
 
     if (!dense_) return;
@@ -1726,6 +1776,15 @@ void Inkling2::init_drafter() {
         ck(cudaMemcpyAsync(dspark_mask_tiled_ + (size_t) r * n_embd_, dspark_mask_.p, (size_t) n_embd_ * sizeof(float),
                            cudaMemcpyDeviceToDevice, cs(st_)),
            "dspark mask tile");
+    if (dspark_proxy_) {
+        const int64_t dv = draft_rows();
+        inkling_dspark_screen_pack(output_.p, (int) output_.type, n_embd_, dv, dspark_head_sc_.p, st_);
+        inkling_dspark_screen_pack(dspark_fold_w_.p, (int) GGML_TYPE_Q8_0, dspark_rank_, dv, dspark_fold_sc_.p, st_);
+        inkling_dspark_screen_order((const float*) dspark_fold_b_.p, dv, (float*) dspark_fold_bp_.p, st_);
+        std::fprintf(stderr, "strata-poly: Inkling2 DSpark 2-bit head proxy enabled (type=%s, dv=%lld, w1+fold_w in pinned host RAM)\n",
+                     output_.type == (uint32_t) GGML_TYPE_Q6_K ? "Q6_K" : "Q8_0", (long long) dv);
+    }
+    dspark_stage_graph_.assign((size_t) dspark_layers_, nullptr);
     ck(cudaStreamSynchronize(cs(st_)), "init_drafter");
     cudaFree(tmp_in);
     cudaFree(tmp_out);
@@ -1815,6 +1874,16 @@ void Inkling2::draft_block(int32_t token) {
     ck(cudaMemcpyAsync(d_blk_x_ + n_embd_, dspark_mask_tiled_,
                        (size_t) (dspark_block_ - 1) * n_embd_ * sizeof(float), cudaMemcpyDeviceToDevice, cs(st_)),
        "dspark mask");
+    if (dspark_proxy_) {
+        if (token >= 0 && token < dspark_w1_vocab_) {
+            ck(cudaMemcpyAsync(d_w1_row_, h_dspark_w1_ + (size_t) token * (size_t) dspark_rank_,
+                               (size_t) dspark_rank_ * sizeof(uint16_t), cudaMemcpyHostToDevice, cs(st_)),
+               "dspark w1 anchor row");
+        } else {
+            ck(cudaMemsetAsync(d_w1_row_, 0, (size_t) dspark_rank_ * sizeof(uint16_t), cs(st_)),
+               "dspark w1 anchor zero");
+        }
+    }
 
     const int B = dspark_block_;
     const int q_dim = dspark_heads_ * dspark_head_dim_;
@@ -1850,12 +1919,36 @@ void Inkling2::draft_block(int32_t token) {
     };
 
     const float scale = 1.0f / std::sqrt((float) dspark_head_dim_);
-    for (int l = 0; l < dspark_layers_; ++l) {
+    const bool use_stage_graphs = opt_.graphs && !opt_.dump && dspark_stage_graphs_;
+    auto pre_attn = [&](int l) {
         DsparkLayer& dl = dspark_l_[(size_t) l];
         kernels::native_add_rms_norm_q8_1(d_blk_x_, l == 0 ? nullptr : d_blk_attn_, fp(dl.input_norm), d_blk_xn_,
                                           d_blk_xq_, n_embd_, B, dspark_eps_, threads, st_);
         lin(dl.qkv_proj, d_blk_xn_, d_blk_qkv_, B, d_blk_xq_);
         inkling_dspark_split_qkv(d_blk_qkv_, d_blk_qraw_, d_blk_kraw_, v_, q_dim, kv_width, B, st_);
+    };
+    auto post_attn = [&](int l) {
+        DsparkLayer& dl = dspark_l_[(size_t) l];
+        lin(dl.o_proj, att_, d_blk_attn_, B);
+        kernels::native_add_rms_norm_q8_1(d_blk_x_, d_blk_attn_, fp(dl.ff_norm), d_blk_xn_, d_blk_xq_, n_embd_, B,
+                                          dspark_eps_, threads, st_);
+        lin(dl.gate_up_proj, d_blk_xn_, d_blk_gate_, B, d_blk_xq_);
+        inkling_swiglu_gate_up_q8_1(d_blk_gate_, d_blk_q8ff_, dspark_ff_, B, st_);
+        lin(dl.down_proj, d_blk_gate_, d_blk_attn_, B, d_blk_q8ff_);
+    };
+    for (int l = 0; l < dspark_layers_; ++l) {
+        auto run_stage = [&] {
+            if (l > 0) post_attn(l - 1);
+            pre_attn(l);
+        };
+        if (use_stage_graphs) {
+            void*& g = dspark_stage_graph_[(size_t) l];
+            if (!g) g = record_fn(run_stage);
+            ck(cudaGraphLaunch((cudaGraphExec_t) g, cs(st_)), "dspark stage graph");
+        } else {
+            run_stage();
+        }
+        DsparkLayer& dl = dspark_l_[(size_t) l];
         head_norm_rope(d_blk_qraw_, dspark_head_dim_, fp(dl.q_norm), q_, dspark_head_dim_, dspark_heads_,
                        dspark_head_dim_, dspark_theta_scale_, pos_, B, dspark_eps_, st_);
         head_norm_rope(d_blk_kraw_, dspark_head_dim_, fp(dl.k_norm), k_, dspark_head_dim_, dspark_kv_, dspark_head_dim_,
@@ -1872,13 +1965,6 @@ void Inkling2::draft_block(int32_t token) {
                               dspark_head_dim_, dspark_heads_, dspark_kv_, scale, st_,
                               dl.local ? (dspark_window_ + 1) : 0, dl.local ? dspark_ring_ : 0, nullptr, 0, kq, vq,
                               kq4, vq4);
-        lin(dl.o_proj, att_, d_blk_attn_, B);
-
-        kernels::native_add_rms_norm_q8_1(d_blk_x_, d_blk_attn_, fp(dl.ff_norm), d_blk_xn_, d_blk_xq_, n_embd_, B,
-                                          dspark_eps_, threads, st_);
-        lin(dl.gate_up_proj, d_blk_xn_, d_blk_gate_, B, d_blk_xq_);
-        inkling_swiglu_gate_up_q8_1(d_blk_gate_, d_blk_q8ff_, dspark_ff_, B, st_);
-        lin(dl.down_proj, d_blk_gate_, d_blk_attn_, B, d_blk_q8ff_);
     }
 
     const int n_cand = B - 1;
@@ -1886,44 +1972,65 @@ void Inkling2::draft_block(int32_t token) {
     const int steady_steps = std::min(n_cand, opt_.window - 1);
     const int n_steps = std::min(steady_steps, (int) std::max<int64_t>(0, opt_.max_context - pos_ - 1));
     if (n_steps <= 0) {
+        post_attn(dspark_layers_ - 1);
         block_n_ = 0;
         return;
     }
 
-    kernels::native_add_rms_norm_q8_1(d_blk_x_ + n_embd_, d_blk_attn_ + n_embd_, fp(dspark_norm_), d_blk_h_,
-                                      d_blk_xq_, n_embd_, n_steps, dspark_eps_, threads, st_);
-    Dev head = output_;
-    head.n_out = dv;
-    lin(head, d_blk_h_, d_base_logits_, n_steps, d_blk_xq_);
-    lin(dspark_rnn_h_, d_blk_h_, d_rnn_h_gates_, n_steps, d_blk_xq_);
+    if (!dspark_proxy_) {
+        h_dspark_anchor_pick_ = {token, 1.0f};
+        ck(cudaMemcpyAsync(d_block_picks_ + (B - 1), &h_dspark_anchor_pick_, sizeof(Likeliest), cudaMemcpyHostToDevice,
+                           cs(st_)),
+           "dspark anchor pick");
+    }
 
-    h_dspark_anchor_pick_ = {token, 1.0f};
-    ck(cudaMemcpyAsync(d_block_picks_ + (B - 1), &h_dspark_anchor_pick_, sizeof(Likeliest), cudaMemcpyHostToDevice,
-                       cs(st_)),
-       "dspark anchor pick");
-
-    auto run_markov = [&](int steps) {
+    auto run_head = [&](int steps) {
+        post_attn(dspark_layers_ - 1);
+        kernels::native_add_rms_norm_q8_1(d_blk_x_ + n_embd_, d_blk_attn_ + n_embd_, fp(dspark_norm_), d_blk_h_,
+                                          d_blk_xq_, n_embd_, steps, dspark_eps_, threads, st_);
+        lin(dspark_rnn_h_, d_blk_h_, d_rnn_h_gates_, steps, d_blk_xq_);
         ck(cudaMemsetAsync(d_rnn_state_, 0, (size_t) dspark_rank_ * sizeof(float), cs(st_)), "dspark state");
-        for (int i = 0; i < steps; ++i) {
-            inkling_dspark_prep_rnn_step(d_rnn_state_, (const uint16_t*) dspark_w1_.p, -1, d_block_picks_, i, B - 1,
-                                         dspark_rank_, dspark_w1_vocab_, d_rnn_in_, st_);
-            lin(dspark_rnn_sp_, d_rnn_in_, d_rnn_gates_, 1);
-            inkling_dspark_rnn_gate(d_rnn_gates_, d_rnn_h_gates_ + (size_t) i * 3 * dspark_rank_, d_rnn_f_gates_,
-                                    fp(dspark_rnn_bias_), d_rnn_state_, d_rnn_latent_, dspark_rank_, st_);
-            Dev fhead = dspark_fold_w_;
-            fhead.n_out = dv;
-            lin(fhead, d_rnn_latent_, d_markov_bias_, 1);
-            inkling_dspark_add_softcap(d_base_logits_ + (size_t) i * dv, d_markov_bias_,
-                                       (const float*) dspark_fold_b_.p, logits_, dv, final_logit_softcapping_, st_);
-            likeliest(logits_, dv, d_block_picks_ + i, st_);
+        if (dspark_proxy_) {
+            inkling_dspark_head_base(dspark_head_sc_.p, d_blk_xq_, steps, dv, d_head_approx_, st_);
+            const DsparkHeadArgs hargs{
+                output_.p, (int) output_.type, dspark_head_sc_.p, dspark_fold_w_.p, dspark_fold_sc_.p,
+                (const float*) dspark_fold_b_.p, (const float*) dspark_fold_bp_.p, dv, final_logit_softcapping_};
+            const size_t lat_stride = kernels::native_q8_1_bytes(dspark_rank_);
+            for (int i = 0; i < steps; ++i) {
+                inkling_dspark_prep_rnn_step_row(d_rnn_state_, d_w1_row_, d_rnn_in_, dspark_rank_, st_);
+                lin(dspark_rnn_sp_, d_rnn_in_, d_rnn_gates_, 1);
+                inkling_dspark_rnn_gate(d_rnn_gates_, d_rnn_h_gates_ + (size_t) i * 3 * dspark_rank_, d_rnn_f_gates_,
+                                        fp(dspark_rnn_bias_), d_rnn_state_, d_rnn_latent_, dspark_rank_, st_);
+                void* latq = static_cast<char*>(d_rnn_lat_q_) + (size_t) i * lat_stride;
+                kernels::native_quantize_q8_1(d_rnn_latent_, latq, dspark_rank_, 1, st_);
+                inkling_dspark_head_pick(hargs, d_blk_xq_, latq, d_head_approx_, i, d_head_scr_, d_block_picks_ + i,
+                                         d_dspark_w1_dev_, d_w1_row_, st_);
+            }
+        } else {
+            Dev head = output_;
+            head.n_out = dv;
+            lin(head, d_blk_h_, d_base_logits_, steps, d_blk_xq_);
+            for (int i = 0; i < steps; ++i) {
+                inkling_dspark_prep_rnn_step(d_rnn_state_, (const uint16_t*) dspark_w1_.p, -1, d_block_picks_, i, B - 1,
+                                             dspark_rank_, dspark_w1_vocab_, d_rnn_in_, st_);
+                lin(dspark_rnn_sp_, d_rnn_in_, d_rnn_gates_, 1);
+                inkling_dspark_rnn_gate(d_rnn_gates_, d_rnn_h_gates_ + (size_t) i * 3 * dspark_rank_, d_rnn_f_gates_,
+                                        fp(dspark_rnn_bias_), d_rnn_state_, d_rnn_latent_, dspark_rank_, st_);
+                Dev fhead = dspark_fold_w_;
+                fhead.n_out = dv;
+                lin(fhead, d_rnn_latent_, d_markov_bias_, 1);
+                inkling_dspark_add_softcap(d_base_logits_ + (size_t) i * dv, d_markov_bias_,
+                                           (const float*) dspark_fold_b_.p, logits_, dv, final_logit_softcapping_, st_);
+                likeliest(logits_, dv, d_block_picks_ + i, st_);
+            }
         }
     };
 
-    if (opt_.graphs && !opt_.dump && n_steps == steady_steps) {
-        if (!dspark_markov_graph_) dspark_markov_graph_ = record_fn([&] { run_markov(steady_steps); });
-        ck(cudaGraphLaunch((cudaGraphExec_t) dspark_markov_graph_, cs(st_)), "dspark markov graph");
+    if (use_stage_graphs && n_steps == steady_steps) {
+        if (!dspark_head_graph_) dspark_head_graph_ = record_fn([&] { run_head(steady_steps); });
+        ck(cudaGraphLaunch((cudaGraphExec_t) dspark_head_graph_, cs(st_)), "dspark head graph");
     } else {
-        run_markov(n_steps);
+        run_head(n_steps);
     }
 
     ck(cudaMemcpyAsync(h_block_, d_block_picks_, (size_t) n_steps * sizeof(Likeliest), cudaMemcpyDeviceToHost,

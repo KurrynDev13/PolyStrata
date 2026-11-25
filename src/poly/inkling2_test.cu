@@ -2004,6 +2004,190 @@ int test_decode_fusions() {
     return bad;
 }
 
+int test_dspark_head_proxy() {
+    int bad = 0;
+    const int n_vocab = 4096, n_in = 2304, rank = 256, rows = 3;
+    const float cap = 30.0f;
+
+    auto deq_q8_1_row = [](const uint8_t* row_bytes, int k) {
+        std::vector<float> out((size_t) k);
+        const int nb = k / 32;
+        for (int b = 0; b < nb; ++b) {
+            const uint8_t* blk = row_bytes + (size_t) b * 36;
+            const __half* ds = reinterpret_cast<const __half*>(blk);
+            const float d = __half2float(ds[0]);
+            const int8_t* qs = reinterpret_cast<const int8_t*>(blk + 4);
+            for (int j = 0; j < 32; ++j) out[(size_t) b * 32 + j] = d * (float) qs[j];
+        }
+        return out;
+    };
+
+    auto quant_q8_1_rows = [](const std::vector<float>& x, int rows_cnt, int k) {
+        const size_t row_bytes = (size_t) (k / 32) * 36;
+        std::vector<uint8_t> out((size_t) rows_cnt * row_bytes, 0);
+        for (int r = 0; r < rows_cnt; ++r) {
+            for (int b = 0; b < k / 32; ++b) {
+                const float* src = x.data() + (size_t) r * k + (size_t) b * 32;
+                float amax = 0.0f;
+                for (int j = 0; j < 32; ++j) amax = std::max(amax, std::fabs(src[j]));
+                const float d = amax / 127.0f;
+                const float id = d > 0.0f ? 1.0f / d : 0.0f;
+                uint8_t* blk = out.data() + (size_t) r * row_bytes + (size_t) b * 36;
+                int8_t* qs = reinterpret_cast<int8_t*>(blk + 4);
+                float sum = 0.0f;
+                for (int j = 0; j < 32; ++j) {
+                    const int q = std::max(-127, std::min(127, (int) std::lrintf(src[j] * id)));
+                    qs[j] = (int8_t) q;
+                    sum += d * (float) q;
+                }
+                __half* ds = reinterpret_cast<__half*>(blk);
+                ds[0] = __float2half(d);
+                ds[1] = __float2half(sum);
+            }
+        }
+        return out;
+    };
+
+    auto run_proxy_case = [&](const char* label, int head_type) {
+        auto h_f = random_vec((size_t) rows * n_in, 0.25f);
+        auto lat_f = random_vec((size_t) rows * rank, 0.25f);
+        auto fold_b = random_vec(n_vocab, 0.2f);
+
+        auto wh_f = random_vec((size_t) n_vocab * n_in, 0.12f);
+        auto wf_f = random_vec((size_t) n_vocab * rank, 0.12f);
+        const int winners[rows] = {13, 1987, 4021};
+        for (int r = 0; r < rows; ++r) {
+            const int tok = winners[r];
+            for (int j = 0; j < n_in; ++j) wh_f[(size_t) tok * n_in + j] += 0.22f * h_f[(size_t) r * n_in + j];
+            for (int j = 0; j < rank; ++j) wf_f[(size_t) tok * rank + j] += 0.22f * lat_f[(size_t) r * rank + j];
+        }
+
+        const ggml_type ht = (ggml_type) head_type;
+        const size_t wh_bytes = ggml_row_size(ht, n_in) * (size_t) n_vocab;
+        const size_t wf_bytes = ggml_row_size(GGML_TYPE_Q8_0, rank) * (size_t) n_vocab;
+        std::vector<uint8_t> wh_q(wh_bytes), wf_q(wf_bytes);
+        ggml_quantize_chunk(ht, wh_f.data(), wh_q.data(), 0, n_vocab, n_in, nullptr);
+        ggml_quantize_chunk(GGML_TYPE_Q8_0, wf_f.data(), wf_q.data(), 0, n_vocab, rank, nullptr);
+
+        // Allocate fold & w1 in pinned mapped host memory just like production Inkling2.
+        const size_t w1_bytes = (size_t) n_vocab * rank * sizeof(uint16_t);
+        uint16_t *h_w1 = nullptr, *d_w1_dev = nullptr;
+        uint8_t *h_fold = nullptr, *d_fold_dev = nullptr;
+        cudaHostAlloc(&h_w1, w1_bytes, cudaHostAllocMapped);
+        cudaHostAlloc(&h_fold, wf_bytes, cudaHostAllocMapped);
+        cudaHostGetDevicePointer(&d_w1_dev, h_w1, 0);
+        cudaHostGetDevicePointer(&d_fold_dev, h_fold, 0);
+        std::memcpy(h_fold, wf_q.data(), wf_bytes);
+        for (size_t i = 0; i < (size_t) n_vocab * rank; ++i) h_w1[i] = (uint16_t) (0x3c00u + (i * 131u) % 0x1000u);
+
+        uint8_t* d_head = dev(wh_q);
+        float* d_fb = dev(fold_b);
+        const size_t head_q8_row = (size_t) (n_in / 32) * 36;
+        const size_t lat_q8_row = (size_t) (rank / 32) * 36;
+        const auto hq_host = quant_q8_1_rows(h_f, rows, n_in);
+        const auto lq_host = quant_q8_1_rows(lat_f, rows, rank);
+        uint8_t* d_hq = dev(hq_host);
+        uint8_t* d_latq = dev(lq_host);
+
+        void *d_head_sc = nullptr, *d_fold_sc = nullptr, *d_scr = nullptr;
+        float *d_fb_p = nullptr, *d_approx = nullptr;
+        uint16_t* d_w1_row = nullptr;
+        Likeliest* d_picks = nullptr;
+        cudaMalloc(&d_head_sc, inkling_dspark_screen_bytes(n_in, n_vocab));
+        cudaMalloc(&d_fold_sc, inkling_dspark_screen_bytes(rank, n_vocab));
+        cudaMalloc(&d_fb_p, (size_t) inkling_dspark_screen_rows(n_vocab) * sizeof(float));
+        cudaMalloc(&d_approx, (size_t) rows * (size_t) inkling_dspark_screen_rows(n_vocab) * sizeof(float));
+        cudaMalloc(&d_scr, inkling_dspark_head_scratch_bytes(n_vocab));
+        cudaMalloc(&d_w1_row, (size_t) rank * sizeof(uint16_t));
+        cudaMalloc(&d_picks, (size_t) rows * sizeof(Likeliest));
+
+        inkling_dspark_screen_pack(d_head, head_type, n_in, n_vocab, d_head_sc, nullptr);
+        inkling_dspark_screen_pack(d_fold_dev, (int) GGML_TYPE_Q8_0, rank, n_vocab, d_fold_sc, nullptr);
+        inkling_dspark_screen_order(d_fb, n_vocab, d_fb_p, nullptr);
+        inkling_dspark_head_base(d_head_sc, d_hq, rows, n_vocab, d_approx, nullptr);
+
+        DsparkHeadArgs hargs{d_head, head_type, d_head_sc, d_fold_dev, d_fold_sc, d_fb, d_fb_p, n_vocab, cap};
+        const auto* h_traits = ggml_get_type_traits(ht);
+        const auto* q8_traits = ggml_get_type_traits(GGML_TYPE_Q8_0);
+        std::vector<float> wh_deq((size_t) n_vocab * n_in), wf_deq((size_t) n_vocab * rank);
+        h_traits->to_float(wh_q.data(), wh_deq.data(), (int64_t) wh_deq.size());
+        q8_traits->to_float(wf_q.data(), wf_deq.data(), (int64_t) wf_deq.size());
+
+        double max_prob_err = 0.0;
+        for (int r = 0; r < rows; ++r) {
+            inkling_dspark_head_pick(hargs, d_hq, d_latq + (size_t) r * lat_q8_row, d_approx, r, d_scr, d_picks + r,
+                                     d_w1_dev, d_w1_row, nullptr);
+            cudaDeviceSynchronize();
+            const cudaError_t ce = cudaGetLastError();
+            if (ce != cudaSuccess) {
+                std::printf("%-42s CUDA ERR: %s\n", label, cudaGetErrorString(ce));
+                ++bad;
+                break;
+            }
+            const Likeliest got = host(d_picks + r, 1)[0];
+            const auto w1_got = host(d_w1_row, (size_t) rank);
+
+            // CPU exact reference using Q8_1 quantized vectors & dequantized quantized weights.
+            const auto hr = deq_q8_1_row(hq_host.data() + (size_t) r * head_q8_row, n_in);
+            const auto lr = deq_q8_1_row(lq_host.data() + (size_t) r * lat_q8_row, rank);
+            std::vector<double> logits(n_vocab);
+            int ref_tok = 0;
+            double ref_max = -1e30;
+            for (int v = 0; v < n_vocab; ++v) {
+                double s = fold_b[v];
+                const float* whv = wh_deq.data() + (size_t) v * n_in;
+                const float* wfv = wf_deq.data() + (size_t) v * rank;
+                for (int j = 0; j < n_in; ++j) s += (double) whv[j] * (double) hr[j];
+                for (int j = 0; j < rank; ++j) s += (double) wfv[j] * (double) lr[j];
+                s = (double) cap * std::tanh(s / (double) cap);
+                logits[v] = s;
+                if (s > ref_max) { ref_max = s; ref_tok = v; }
+            }
+            double sum_exp = 0.0;
+            for (int v = 0; v < n_vocab; ++v) sum_exp += std::exp(logits[v] - ref_max);
+            const double ref_prob = 1.0 / sum_exp;
+            max_prob_err = std::max(max_prob_err, std::abs((double) got.prob - ref_prob));
+
+            const bool w1_ok = std::memcmp(w1_got.data(), h_w1 + (size_t) ref_tok * rank,
+                                           (size_t) rank * sizeof(uint16_t)) == 0;
+            if (got.token != ref_tok || !w1_ok || std::abs((double) got.prob - ref_prob) > 0.05) {
+                std::printf("%-42s r=%d FAIL tok=%d(ref=%d) prob=%.5f(ref=%.5f) w1=%d\n", label, r, got.token,
+                            ref_tok, got.prob, ref_prob, (int) w1_ok);
+                ++bad;
+            }
+        }
+        std::printf("%-42s %d rows  max_prob_err=%.4f  %s\n", label, rows, max_prob_err,
+                    max_prob_err <= 0.05 ? "PASS" : "FAIL");
+
+        // Also test prep_rnn_step_row against w1_row
+        auto state_f = random_vec(rank, 0.5f);
+        float *d_state = dev(state_f), *d_rnn_out = dev(std::vector<float>(2 * rank, 0.f));
+        inkling_dspark_prep_rnn_step_row(d_state, d_w1_row, d_rnn_out, rank, nullptr);
+        cudaDeviceSynchronize();
+        const auto rnn_got = host(d_rnn_out, (size_t) (2 * rank));
+        const auto w1_ref = host(d_w1_row, (size_t) rank);
+        for (int j = 0; j < rank; ++j) {
+            uint32_t bits = (uint32_t) w1_ref[j] << 16;
+            float wf = 0.f;
+            std::memcpy(&wf, &bits, sizeof(float));
+            if (rnn_got[j] != state_f[j] || rnn_got[rank + j] != wf) {
+                ++bad;
+                break;
+            }
+        }
+        cudaFree(d_state); cudaFree(d_rnn_out);
+        cudaFree(d_head); cudaFree(d_fb);
+        cudaFree(d_hq); cudaFree(d_latq); cudaFree(d_head_sc); cudaFree(d_fold_sc);
+        cudaFree(d_fb_p); cudaFree(d_approx); cudaFree(d_scr); cudaFree(d_w1_row); cudaFree(d_picks);
+        cudaFreeHost(h_w1);
+        cudaFreeHost(h_fold);
+    };
+
+    run_proxy_case("DSpark 2-bit head proxy Q8_0", (int) GGML_TYPE_Q8_0);
+    run_proxy_case("DSpark 2-bit head proxy Q6_K", (int) GGML_TYPE_Q6_K);
+    return bad;
+}
+
 }  // namespace
 
 int main() {
@@ -2017,6 +2201,7 @@ int main() {
     bad += test_dspark_kernels();
     bad += test_fused_and_predequant();
     bad += test_decode_fusions();
+    bad += test_dspark_head_proxy();
     std::printf("\n%s\n", bad ? "FAILED" : "ALL PASSED");
     return bad ? 1 : 0;
 }

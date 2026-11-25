@@ -15,6 +15,7 @@ namespace strata::poly {
 
 class Inkling2 final : public Engine {
 public:
+    ~Inkling2() override;
     size_t card_row_bytes() const override;
     void save_card_rows(int64_t first, int64_t n, uint8_t* dst) override;
     void load_card_rows(const uint8_t* src, int64_t from, int64_t count, int64_t first, int64_t n) override;
@@ -169,6 +170,8 @@ private:
     void cached_bias(const Layer& L, int il, float* b) const;
 
     bool dspark_ = false;
+    bool dspark_proxy_ = false;
+    bool dspark_stage_graphs_ = false;
     int dspark_layers_ = 0, dspark_ff_ = 0, dspark_heads_ = 0, dspark_kv_ = 0, dspark_head_dim_ = 0;
     int dspark_window_ = 0, dspark_ring_ = 0, dspark_block_ = 0, dspark_rank_ = 0, dspark_w1_vocab_ = 0;
     float dspark_eps_ = 1e-6f, dspark_rope_theta_ = 1000000.f, dspark_theta_scale_ = 0.f;
@@ -177,6 +180,11 @@ private:
     std::vector<DsparkLayer> dspark_l_;
     Dev dspark_mask_, dspark_norm_, dspark_rnn_norm_, dspark_rnn_sp_, dspark_rnn_h_, dspark_rnn_f_, dspark_rnn_bias_;
     Dev dspark_w1_, dspark_fold_w_, dspark_fold_b_;
+    Dev dspark_head_sc_, dspark_fold_sc_, dspark_fold_bp_;
+    uint16_t* h_dspark_w1_ = nullptr;
+    const uint16_t* d_dspark_w1_dev_ = nullptr;
+    uint8_t* h_dspark_fold_w_ = nullptr;
+    void* d_dspark_fold_w_dev_ = nullptr;
     std::vector<float> h_hidden_out_wt_, h_hidden_out_b_;
     mutable std::vector<float> h_dspark_anchor_;
     mutable Likeliest h_dspark_anchor_pick_{};
@@ -184,10 +192,15 @@ private:
     float *d_blk_qkv_ = nullptr, *d_blk_qraw_ = nullptr, *d_blk_kraw_ = nullptr, *d_blk_attn_ = nullptr;
     float *d_blk_gate_ = nullptr, *dspark_mask_tiled_ = nullptr;
     float *d_base_logits_ = nullptr, *d_markov_bias_ = nullptr;
+    float* d_head_approx_ = nullptr;
     float *d_rnn_in_ = nullptr, *d_rnn_gates_ = nullptr, *d_rnn_h_gates_ = nullptr, *d_rnn_f_gates_ = nullptr;
     float *d_rnn_state_ = nullptr, *d_rnn_latent_ = nullptr;
     void *d_blk_xq_ = nullptr, *d_blk_q8ff_ = nullptr;
+    void *d_head_scr_ = nullptr, *d_rnn_lat_q_ = nullptr;
+    uint16_t* d_w1_row_ = nullptr;
     Likeliest* d_block_picks_ = nullptr;
+    std::vector<void*> dspark_stage_graph_;
+    void* dspark_head_graph_ = nullptr;
     void* dspark_markov_graph_ = nullptr;
 };
 

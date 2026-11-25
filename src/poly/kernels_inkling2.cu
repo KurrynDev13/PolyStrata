@@ -2950,4 +2950,609 @@ void inkling_dspark_split_qkv(const float* qkv, float* qraw, float* kraw, float*
     ck("inkling_dspark_split_qkv");
 }
 
+namespace dspark_px {
+
+constexpr int kDsWidth = 2304;
+constexpr int kDsRank = 256;
+constexpr int kDsDrafts = 7;
+constexpr int kHeadNb = kDsWidth / 32;   // 72
+constexpr int kFoldNb = kDsRank / 32;    // 8
+constexpr int kQ8Block = 34;
+constexpr int kQ8Row = kHeadNb * kQ8Block;     // 2448
+constexpr int kQ6KBlock = 210;
+constexpr int kQ6KRow = (kDsWidth / 256) * kQ6KBlock;   // 9 * 210 = 1890
+constexpr int kFoldRow = kFoldNb * kQ8Block;   // 272
+constexpr int kPer = 4;
+constexpr int kMaxCand = 64;
+constexpr float kDelta = 5.0f;
+constexpr int kTilesPerBlock = 4;
+constexpr int kW1Words = kDsRank * 2 / 16;   // 32 uint4 per w1 row
+
+struct DsQ81 {
+    half2 ds;
+    int8_t qs[32];
+};
+static_assert(sizeof(DsQ81) == 36, "block_q8_1 size");
+
+struct DsQ6KBlock {
+    uint8_t ql[128];
+    uint8_t qh[64];
+    int8_t scales[16];
+    half d;
+};
+static_assert(sizeof(DsQ6KBlock) == 210, "block_q6_K size");
+
+__host__ __device__ __forceinline__ int64_t tiles(int64_t n_cap) { return (n_cap + 31) / 32; }
+__host__ __device__ constexpr int nw4(int n_in) { return n_in / 64; }
+__host__ __device__ __forceinline__ int64_t token_of(int64_t r, int64_t t) { return (r & 31) * t + (r >> 5); }
+__device__ __forceinline__ float capf(float x, float cap) { return cap > 0.0f ? cap * tanhf(x / cap) : x; }
+
+__device__ __forceinline__ int load_int_b2(const uint8_t* x, int i32) {
+    const uint16_t* p = reinterpret_cast<const uint16_t*>(x) + 2 * i32;
+    return (int) p[0] | ((int) p[1] << 16);
+}
+
+__device__ __forceinline__ int level(float w, float sh) {
+    return min(3, max(0, (int) floorf(w / sh + 2.0f)));
+}
+
+__device__ __forceinline__ __half fit_group_unshrunk(const float* w, float& sh_out) {
+    float amax = 1e-9f;
+    for (int l = 0; l < 32; ++l) amax = fmaxf(amax, fabsf(w[l]));
+    float best_s = amax / 1.5f, best_e = INFINITY;
+    for (int t = 0; t < 6; ++t) {
+        const float s = amax / 1.5f * (1.0f - 0.1f * (float) t);
+        const float sh = __half2float(__float2half(s));
+        float e = 0.0f;
+        for (int l = 0; l < 32; ++l) {
+            const float r = ((float) level(w[l], sh) - 1.5f) * sh - w[l];
+            e += r * r;
+        }
+        if (e < best_e) { best_e = e; best_s = s; }
+    }
+    __half hs = __float2half(best_s);
+    const float sh = __half2float(hs);
+    sh_out = sh;
+    float ww = 0.0f, wr = 0.0f;
+    for (int l = 0; l < 32; ++l) {
+        const float r = ((float) level(w[l], sh) - 1.5f) * sh;
+        ww += w[l] * w[l];
+        wr += w[l] * r;
+    }
+    if (wr > 0.0f) hs = __float2half(sh * sqrtf(ww / wr));
+    return hs;
+}
+
+template <int N_IN>
+__device__ __forceinline__ void pack_group(const float* w, int64_t row, int g, uint4* __restrict__ wq,
+                                           uint16_t* __restrict__ sc) {
+    constexpr int kNw4 = nw4(N_IN);
+    float sh;
+    const __half hs = fit_group_unshrunk(w, sh);
+    const int tile = (int) (row >> 5), lane = (int) (row & 31), w4 = g / 2, h = g & 1;
+    uint32_t words[2] = {0u, 0u};
+    for (int c = 0; c < 2; ++c)
+        for (int ii = 0; ii < 4; ++ii)
+            for (int bb = 0; bb < 4; ++bb)
+                words[c] |= (uint32_t) level(w[c * 16 + 4 * ii + bb], sh) << (8 * bb + 2 * ii);
+    uint32_t* wd = reinterpret_cast<uint32_t*>(wq) + (((size_t) tile * kNw4 + w4) * 32 + lane) * 4 + 2 * h;
+    wd[0] = words[0];
+    wd[1] = words[1];
+    sc[(((size_t) tile * kNw4 + w4) * 32 + lane) * 2 + h] = __half_as_ushort(hs);
+}
+
+template <int N_IN, int SRC_TYPE>
+__global__ void screen_pack_kernel(const uint8_t* __restrict__ src, int64_t n_rows, uint4* __restrict__ wq,
+                                   uint16_t* __restrict__ sc) {
+    constexpr int NB = N_IN / 32;
+    const int64_t n_tiles = tiles(n_rows);
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_tiles * 32 * NB) return;
+    const int64_t row = i / NB, tok = token_of(row, n_tiles);
+    const int g = (int) (i % NB);
+    if (tok >= n_rows) return;
+    float w[32];
+    if constexpr (SRC_TYPE == 8) {
+        const uint8_t* b = src + (tok * NB + g) * kQ8Block;
+        const float d = __half2float(*reinterpret_cast<const __half*>(b));
+        for (int l = 0; l < 32; ++l) w[l] = d * (float) (int8_t) b[2 + l];
+    } else if constexpr (SRC_TYPE == 14) {
+        const uint8_t* row_b = src + (size_t) tok * ((size_t) (N_IN / 256) * kQ6KBlock);
+        const uint8_t* b = row_b + (size_t) (g / 8) * kQ6KBlock;
+        const int gi = g & 7, n = gi >> 2, qu = gi & 3;
+        const uint8_t* ql = b + 64 * n;
+        const uint8_t* qh = b + 128 + 32 * n;
+        const int8_t* qs = reinterpret_cast<const int8_t*>(b + 192) + 8 * n;
+        const float d = __half2float(*reinterpret_cast<const __half*>(b + 208));
+        for (int l = 0; l < 32; ++l) {
+            const int is = l >> 4;
+            int q;
+            if (qu == 0) q = (ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4);
+            else if (qu == 1) q = (ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4);
+            else if (qu == 2) q = (ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4);
+            else q = (ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4);
+            w[l] = d * (float) qs[is + 2 * qu] * (float) (q - 32);
+        }
+    }
+    pack_group<N_IN>(w, row, g, wq, sc);
+}
+
+__global__ void screen_rows_kernel(const float* __restrict__ by_token, int64_t n, int64_t n_tiles,
+                                   float* __restrict__ by_row) {
+    const int64_t r = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_tiles * 32) return;
+    const int64_t tok = token_of(r, n_tiles);
+    by_row[r] = tok < n ? by_token[tok] : 0.0f;
+}
+
+template <int NW>
+__device__ __forceinline__ float screen_acc(const uint4 (&w)[NW], const uint32_t (&s)[NW], int j0, const int* xi,
+                                            const float* xs, const float* xdd) {
+    float acc = 0.0f;
+#pragma unroll
+    for (int j = 0; j < NW; ++j) {
+        const int w4 = j0 + j;
+        const uint32_t ww[4] = {w[j].x, w[j].y, w[j].z, w[j].w};
+#pragma unroll
+        for (int hh = 0; hh < 2; ++hh) {
+            const int g = 2 * w4 + hh;
+            int P = 0;
+#pragma unroll
+            for (int c = 0; c < 2; ++c) {
+                const uint32_t v = ww[2 * hh + c];
+                const int4 x0 = *reinterpret_cast<const int4*>(&xi[g * 8 + c * 4]);
+                P = __dp4a((int) (v & 0x03030303u), x0.x, P);
+                P = __dp4a((int) ((v >> 2) & 0x03030303u), x0.y, P);
+                P = __dp4a((int) ((v >> 4) & 0x03030303u), x0.z, P);
+                P = __dp4a((int) ((v >> 6) & 0x03030303u), x0.w, P);
+            }
+            const float sg = __half2float(__ushort_as_half((unsigned short) (hh ? (s[j] >> 16) : (s[j] & 0xffff))));
+            acc += sg * (xdd[g] * (float) P - 1.5f * xs[g]);
+        }
+    }
+    return acc;
+}
+
+__device__ __forceinline__ void screen_x(const DsQ81* __restrict__ x, int nb, int* xi, float* xs, float* xdd, int tid,
+                                         int nthreads) {
+    for (int i = tid; i < nb * 8; i += nthreads) xi[i] = reinterpret_cast<const int*>(x[i / 8].qs)[i % 8];
+    if (tid < nb) {
+        const int* q = reinterpret_cast<const int*>(x[tid].qs);
+        int sum = 0;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) sum = __dp4a(0x01010101, q[i], sum);
+        const float d8 = __low2float(x[tid].ds);
+        xdd[tid] = d8;
+        xs[tid] = d8 * (float) sum;
+    }
+}
+
+__global__ void __launch_bounds__(128) head_base_kernel(const uint4* __restrict__ wq, const uint32_t* __restrict__ sc,
+                                                        const DsQ81* __restrict__ x, int rows, int64_t n_pad,
+                                                        float* __restrict__ approx) {
+    constexpr int kNw4 = nw4(kDsWidth), NW = kNw4 / 4;
+    __shared__ __align__(16) int xi[kDsDrafts][kDsWidth / 4];
+    __shared__ float xs[kDsDrafts][kHeadNb], xdd[kDsDrafts][kHeadNb];
+    __shared__ float red[kDsDrafts][4][32];
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, tile = (int) blockIdx.x;
+    const size_t base = ((size_t) tile * kNw4 + warp * NW) * 32 + lane;
+    uint4 w[NW];
+    uint32_t s[NW];
+#pragma unroll
+    for (int j = 0; j < NW; ++j) {
+        w[j] = __ldcs(wq + base + (size_t) j * 32);
+        s[j] = __ldcs(sc + base + (size_t) j * 32);
+    }
+    for (int r = 0; r < rows; ++r) screen_x(x + (size_t) r * kHeadNb, kHeadNb, xi[r], xs[r], xdd[r], tid, 128);
+    __syncthreads();
+#pragma unroll
+    for (int r = 0; r < kDsDrafts; ++r)
+        if (r < rows) red[r][warp][lane] = screen_acc<NW>(w, s, warp * NW, xi[r], xs[r], xdd[r]);
+    __syncthreads();
+    const int64_t row = (int64_t) tile * 32 + lane;
+    for (int r = warp; r < rows; r += 4)
+        approx[(size_t) r * (size_t) n_pad + (size_t) row] =
+            red[r][0][lane] + red[r][1][lane] + red[r][2][lane] + red[r][3][lane];
+}
+
+__global__ void __launch_bounds__(32 * kTilesPerBlock)
+    head_step_kernel(const uint4* __restrict__ wq, const uint32_t* __restrict__ sc, const DsQ81* __restrict__ lat,
+                     const float* __restrict__ approx, const float* __restrict__ fold_bp, float cap, int64_t n_rows,
+                     int n_tiles, float2* __restrict__ cand, float2* __restrict__ part) {
+    constexpr int kNw4 = kDsRank / 64;
+    __shared__ __align__(16) int xi[kDsRank / 4];
+    __shared__ float xs[kFoldNb], xdd[kFoldNb];
+    const int tid = threadIdx.x, lane = tid & 31;
+    const int tile = (int) blockIdx.x * kTilesPerBlock + (tid >> 5);
+    const int64_t row = (int64_t) tile * 32 + lane;
+    const bool live = tile < n_tiles, real = live && token_of(row, n_tiles) < n_rows;
+    uint4 w[kNw4];
+    uint32_t s[kNw4];
+    float fb = 0.0f;
+#pragma unroll
+    for (int j = 0; j < kNw4; ++j) {
+        const size_t at = ((size_t) (live ? tile : 0) * kNw4 + j) * 32 + lane;
+        w[j] = __ldcs(wq + at);
+        s[j] = __ldcs(sc + at);
+    }
+    if (live) fb = __ldg(fold_bp + row);
+    screen_x(lat, kFoldNb, xi, xs, xdd, tid, 32 * kTilesPerBlock);
+    __syncthreads();
+    if (!live) return;
+    const float ninf = __int_as_float(0xff800000);
+    float v = ninf;
+    if (real) v = capf(approx[row] + screen_acc<kNw4>(w, s, 0, xi, xs, xdd) + fb, cap);
+    float m = warp_max(v);
+    float e = v > ninf ? __expf(v - m) : 0.0f;
+    e = warp_sum(e);
+    if (lane == 0) part[tile] = make_float2(m, e);
+    for (int k = 0; k < kPer; ++k) {
+        float bv = v;
+        int bi = lane;
+#pragma unroll
+        for (int o = 16; o; o >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
+            const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+            if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+        }
+        if (lane == 0) cand[tile * kPer + k] = make_float2(bv, __int_as_float(tile * 32 + bi));
+        if (lane == bi) v = ninf;
+    }
+}
+
+__device__ __forceinline__ float q80_dot(const uint8_t* __restrict__ w, const DsQ81* x, int nb, int lane) {
+    const int k = 2 * (lane & 3);
+    float s = 0.0f;
+    for (int b = lane >> 2; b < nb; b += 8) {
+        const uint8_t* blk = w + (size_t) b * kQ8Block;
+        const int* xq = reinterpret_cast<const int*>(x[b].qs);
+        int sumi = __dp4a(load_int_b2(blk + 2, k), xq[k], 0);
+        sumi = __dp4a(load_int_b2(blk + 2, k + 1), xq[k + 1], sumi);
+        s += __half2float(*reinterpret_cast<const __half*>(blk)) * __low2float(x[b].ds) * (float) sumi;
+    }
+    return warp_sum(s);
+}
+
+__device__ __forceinline__ float q6k_dot(const DsQ6KBlock* __restrict__ w, const DsQ81* x, int n_blocks, int lane) {
+    const int bq8_offset = 4 * (lane >> 4) + ((lane & 15) >> 3);
+    const int scale_offset = 8 * (lane >> 4) + ((lane & 15) >> 2);
+    const int vh_shift = 2 * ((lane & 15) >> 3);
+    float s = 0.0f;
+    for (int kbx = 0; kbx < n_blocks; ++kbx) {
+        const DsQ6KBlock* bk = w + kbx;
+        const DsQ81* xk = x + kbx * 8;
+        const int vl = load_int_b2(bk->ql, lane);
+        const int vh = load_int_b2(bk->qh, 8 * (lane >> 4) + (lane & 7)) >> vh_shift;
+        float sumf = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const int u = reinterpret_cast<const int*>(xk[bq8_offset + 2 * i].qs)[lane & 7];
+            const float d8 = __low2float(xk[bq8_offset + 2 * i].ds);
+            const int sc = bk->scales[scale_offset + 4 * i];
+            const int vil = (vl >> (4 * i)) & 0x0f0f0f0f;
+            const int vih = ((vh >> (4 * i)) << 4) & 0x30303030;
+            const int vi = __vsubss4(vil | vih, 0x20202020);
+            sumf += d8 * (float) (__dp4a(vi, u, 0) * sc);
+        }
+        s += __half2float(bk->d) * sumf;
+    }
+    return warp_sum(s);
+}
+
+template <int HEAD_TYPE>
+__device__ __forceinline__ float exact_logit(const DsparkHeadArgs& h, int64_t v, const DsQ81* xh, const DsQ81* xl,
+                                             int lane) {
+    float a = 0.0f;
+    if constexpr (HEAD_TYPE == 8) {
+        a = q80_dot(static_cast<const uint8_t*>(h.head) + (size_t) v * kQ8Row, xh, kHeadNb, lane);
+    } else if constexpr (HEAD_TYPE == 14) {
+        a = q6k_dot(reinterpret_cast<const DsQ6KBlock*>(static_cast<const uint8_t*>(h.head) + (size_t) v * kQ6KRow),
+                    xh, kDsWidth / 256, lane);
+    }
+    const float b = q80_dot(static_cast<const uint8_t*>(h.fold) + (size_t) v * kFoldRow, xl, kFoldNb, lane);
+    return capf(a + b + h.fold_b[v], h.cap);
+}
+
+struct FinalState {
+    float wmax[16];
+    int list[kMaxCand];
+    float lp[kMaxCand], ex[kMaxCand];
+    int cnt;
+    int hist[256];
+    unsigned long long want;
+    int need;
+};
+
+__device__ __forceinline__ unsigned long long cand_key(float2 c) {
+    const unsigned u = __float_as_uint(c.x);
+    const unsigned o = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+    return ((unsigned long long) o << 32) | (unsigned) (0xffffffffu - (unsigned) __float_as_int(c.y));
+}
+
+__device__ __forceinline__ unsigned long long kth_key(FinalState& f, int nc, const float2* __restrict__ cand,
+                                                      float m) {
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const float ninf = __int_as_float(0xff800000);
+    if (tid == 0) { f.want = 0ull; f.need = kMaxCand; }
+    unsigned long long mask = 0ull;
+    for (int shift = 56; shift >= 0; shift -= 8) {
+        if (tid < 256) f.hist[tid] = 0;
+        __syncthreads();
+        const unsigned long long want = f.want;
+        for (int i = tid; i < nc; i += 512) {
+            const float2 c = __ldcg(&cand[i]);
+            if (!(c.x > ninf && c.x >= m - kDelta)) continue;
+            const unsigned long long k = cand_key(c);
+            if ((k & mask) == want) atomicAdd(&f.hist[(int) ((k >> shift) & 255u)], 1);
+        }
+        __syncthreads();
+        if (warp == 0) {
+            int b[8], s = 0;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) { b[j] = f.hist[255 - 8 * lane - j]; s += b[j]; }
+            int incl = s;
+#pragma unroll
+            for (int o = 1; o < 32; o <<= 1) {
+                const int v = __shfl_up_sync(0xffffffffu, incl, o);
+                if (lane >= o) incl += v;
+            }
+            const int need = f.need, excl = incl - s;
+            if (excl < need && incl >= need) {
+                int acc = excl, j = 0;
+                while (acc + b[j] < need) acc += b[j++];
+                f.want = want | ((unsigned long long) (255 - 8 * lane - j) << shift);
+                f.need = need - acc;
+            }
+        }
+        __syncthreads();
+        mask |= 0xffull << shift;
+    }
+    return f.want;
+}
+
+__device__ __forceinline__ int collect_tiles(FinalState& f, int n_tiles, const float2* __restrict__ cand,
+                                             const float2* __restrict__ part) {
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const float ninf = __int_as_float(0xff800000);
+    float lm = ninf;
+    for (int t = tid; t < n_tiles; t += 512) lm = fmaxf(lm, __ldcg(&part[t].x));
+    lm = warp_max(lm);
+    if (lane == 0) f.wmax[warp] = lm;
+    __syncthreads();
+    if (tid == 0) {
+        float m = ninf;
+        for (int w = 0; w < 16; ++w) m = fmaxf(m, f.wmax[w]);
+        f.wmax[0] = m;
+    }
+    __syncthreads();
+    const float m = f.wmax[0];
+    if (!(m > ninf)) return 0;
+    for (int t = tid; t < n_tiles; t += 512) {
+        const float tm = __ldcg(&part[t].x);
+        if (!(tm > ninf && tm >= m - kDelta)) continue;
+        for (int k = 0; k < kPer; ++k) {
+            const float2 c = __ldcg(&cand[t * kPer + k]);
+            if (c.x > ninf && c.x >= m - kDelta) {
+                const int p = atomicAdd(&f.cnt, 1);
+                if (p < kMaxCand) { f.list[p] = __float_as_int(c.y); f.lp[p] = c.x; }
+            }
+        }
+    }
+    __syncthreads();
+    const int total = f.cnt;
+    if (total > kMaxCand) {
+        const int nc = n_tiles * kPer;
+        const unsigned long long kth = kth_key(f, nc, cand, m);
+        if (tid == 0) f.cnt = 0;
+        __syncthreads();
+        for (int i = tid; i < nc; i += 512) {
+            const float2 c = __ldcg(&cand[i]);
+            if (c.x > ninf && c.x >= m - kDelta && cand_key(c) >= kth) {
+                const int p = atomicAdd(&f.cnt, 1);
+                if (p < kMaxCand) { f.list[p] = __float_as_int(c.y); f.lp[p] = c.x; }
+            }
+        }
+        __syncthreads();
+    }
+    const int n = total < kMaxCand ? total : kMaxCand;
+    int row = 0, rank = 0;
+    float lp = 0.0f;
+    if (tid < n) {
+        row = f.list[tid];
+        lp = f.lp[tid];
+        for (int j = 0; j < n; ++j) rank += f.list[j] < row;
+    }
+    __syncthreads();
+    if (tid < n) { f.list[rank] = row; f.lp[rank] = lp; }
+    __syncthreads();
+    return n;
+}
+
+__device__ __forceinline__ int pick_block(FinalState& f, int n, int n_tiles, const float2* __restrict__ part,
+                                          Likeliest* __restrict__ out_pick) {
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const float ninf = __int_as_float(0xff800000);
+    if (warp == 0) {
+        float bv = ninf;
+        int bi = 0x7fffffff;
+        for (int c = lane; c < n; c += 32)
+            if (f.ex[c] > bv || (f.ex[c] == bv && f.list[c] < bi)) { bv = f.ex[c]; bi = f.list[c]; }
+#pragma unroll
+        for (int o = 16; o; o >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
+            const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+            if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+        }
+        if (lane == 0) { f.wmax[0] = bv; f.cnt = bi; }
+    }
+    __syncthreads();
+    const float bv = f.wmax[0];
+    const int bi = f.cnt < 0x7fffffff ? f.cnt : 0;
+    float sum = 0.0f;
+    for (int t = tid; t < n_tiles; t += 512) {
+        const float2 p = __ldcg(&part[t]);
+        if (p.y > 0.0f) sum += p.y * __expf(p.x - bv);
+    }
+    for (int c = tid; c < n; c += 512) sum += __expf(f.ex[c] - bv) - __expf(f.lp[c] - bv);
+    sum = warp_sum(sum);
+    __syncthreads();
+    if (lane == 0) f.wmax[warp] = sum;
+    __syncthreads();
+    if (tid == 0) {
+        sum = 0.0f;
+        for (int w = 0; w < 16; ++w) sum += f.wmax[w];
+        float one = 0.0f;
+        for (int c = 0; c < n; ++c) if (f.list[c] == bi) one = 1.0f;
+        sum = fmaxf(sum, one);
+        out_pick->token = bi;
+        out_pick->prob = 1.0f / sum;
+    }
+    return bi;
+}
+
+template <int HEAD_TYPE>
+__global__ void __launch_bounds__(512)
+    head_final_kernel(DsparkHeadArgs h, const DsQ81* __restrict__ xh_g, const DsQ81* __restrict__ xl_g, int n_tiles,
+                      const float2* __restrict__ cand, const float2* __restrict__ part, Likeliest* __restrict__ out_pick,
+                      const uint16_t* __restrict__ w1, uint16_t* __restrict__ w1_row) {
+    __shared__ DsQ81 xh[kHeadNb], xl[kFoldNb];
+    __shared__ FinalState f;
+    __shared__ uint4 wr[kMaxCand][kW1Words];
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    if (tid == 0) f.cnt = 0;
+    for (int k = tid; k < (kHeadNb + kFoldNb) * 9; k += 512) {
+        const int b = k / 9, j = k % 9;
+        const int* src = reinterpret_cast<const int*>(b < kHeadNb ? xh_g + b : xl_g + (b - kHeadNb));
+        int* dst = reinterpret_cast<int*>(b < kHeadNb ? xh + b : xl + (b - kHeadNb));
+        dst[j] = src[j];
+    }
+    __syncthreads();
+    const int n = collect_tiles(f, n_tiles, cand, part);
+    if (n == 0) {
+        if (tid == 0) { out_pick->token = 0; out_pick->prob = 1.0f; }
+        if (warp == 0) reinterpret_cast<uint4*>(w1_row)[lane] = reinterpret_cast<const uint4*>(w1)[lane];
+        return;
+    }
+    for (int c = warp; c < n; c += 16) {
+        const int64_t tok = token_of(f.list[c], n_tiles);
+        wr[c][lane] = reinterpret_cast<const uint4*>(w1 + tok * kDsRank)[lane];
+        const float y = exact_logit<HEAD_TYPE>(h, tok, xh, xl, lane);
+        if (lane == 0) {
+            f.ex[c] = y;
+            f.list[c] = (int) tok;
+        }
+    }
+    __syncthreads();
+    const int pick = pick_block(f, n, n_tiles, part, out_pick);
+    __syncthreads();
+    for (int c = warp; c < n; c += 16)
+        if (f.list[c] == pick) reinterpret_cast<uint4*>(w1_row)[lane] = wr[c][lane];
+}
+
+__global__ void prep_rnn_step_row_kernel(const float* __restrict__ state, const uint16_t* __restrict__ w1_row,
+                                         float* __restrict__ out, int rank) {
+    const int i = threadIdx.x;
+    if (i >= rank) return;
+    out[i] = state[i];
+    const uint32_t bits = (uint32_t) w1_row[i] << 16;
+    out[rank + i] = __uint_as_float(bits);
+}
+
+}  // namespace dspark_px
+
+size_t inkling_dspark_screen_bytes(int n_in, int64_t n_rows) {
+    const size_t n_tiles = (size_t) dspark_px::tiles(n_rows);
+    const size_t w4 = (size_t) dspark_px::nw4(n_in);
+    return n_tiles * w4 * 32 * (16 + 4);
+}
+
+int64_t inkling_dspark_screen_rows(int64_t n_vocab) { return dspark_px::tiles(n_vocab) * 32; }
+
+size_t inkling_dspark_head_scratch_bytes(int64_t n_vocab) {
+    return (size_t) dspark_px::tiles(n_vocab) * (dspark_px::kPer + 1) * sizeof(float2);
+}
+
+void inkling_dspark_screen_pack(const void* src, int src_type, int n_in, int64_t n_rows, void* screen, void* stream) {
+    if (n_rows <= 0) return;
+    cudaStream_t s = cs(stream);
+    if (const cudaError_t e = cudaMemsetAsync(screen, 0, inkling_dspark_screen_bytes(n_in, n_rows), s);
+        e != cudaSuccess) {
+        throw std::runtime_error(std::string("dspark screen memset: ") + cudaGetErrorString(e));
+    }
+    const int64_t total = dspark_px::tiles(n_rows) * 32 * (n_in / 32);
+    uint4* wq = static_cast<uint4*>(screen);
+    uint16_t* sc = reinterpret_cast<uint16_t*>(static_cast<char*>(screen) +
+                                               (size_t) dspark_px::tiles(n_rows) * dspark_px::nw4(n_in) * 32 * 16);
+    const unsigned blocks = (unsigned) grid((size_t) total, 256);
+    const uint8_t* p = static_cast<const uint8_t*>(src);
+    if (n_in == dspark_px::kDsWidth && src_type == 8) {
+        dspark_px::screen_pack_kernel<dspark_px::kDsWidth, 8><<<blocks, 256, 0, s>>>(p, n_rows, wq, sc);
+    } else if (n_in == dspark_px::kDsWidth && src_type == 14) {
+        dspark_px::screen_pack_kernel<dspark_px::kDsWidth, 14><<<blocks, 256, 0, s>>>(p, n_rows, wq, sc);
+    } else if (n_in == dspark_px::kDsRank && src_type == 8) {
+        dspark_px::screen_pack_kernel<dspark_px::kDsRank, 8><<<blocks, 256, 0, s>>>(p, n_rows, wq, sc);
+    } else {
+        throw std::invalid_argument("inkling_dspark_screen_pack: unsupported shape or quant type");
+    }
+    ck("inkling_dspark_screen_pack");
+}
+
+void inkling_dspark_screen_order(const float* by_token, int64_t n_vocab, float* by_row, void* stream) {
+    if (n_vocab <= 0) return;
+    const int64_t n_tiles = dspark_px::tiles(n_vocab);
+    const int64_t total = n_tiles * 32;
+    dspark_px::screen_rows_kernel<<<(unsigned) grid((size_t) total, 256), 256, 0, cs(stream)>>>(
+        by_token, n_vocab, n_tiles, by_row);
+    ck("inkling_dspark_screen_order");
+}
+
+void inkling_dspark_head_base(const void* head_sc, const void* hq, int rows, int64_t n_vocab, float* approx,
+                              void* stream) {
+    if (rows <= 0 || n_vocab <= 0) return;
+    if (rows > dspark_px::kDsDrafts) throw std::invalid_argument("inkling_dspark_head_base: rows > 7");
+    const int64_t n_tiles = dspark_px::tiles(n_vocab);
+    const uint16_t* sc = reinterpret_cast<const uint16_t*>(
+        static_cast<const char*>(head_sc) + (size_t) n_tiles * dspark_px::nw4(dspark_px::kDsWidth) * 32 * 16);
+    dspark_px::head_base_kernel<<<(unsigned) n_tiles, 128, 0, cs(stream)>>>(
+        static_cast<const uint4*>(head_sc), reinterpret_cast<const uint32_t*>(sc),
+        static_cast<const dspark_px::DsQ81*>(hq), rows, n_tiles * 32, approx);
+    ck("inkling_dspark_head_base");
+}
+
+void inkling_dspark_head_pick(const DsparkHeadArgs& h, const void* hq, const void* latq, const float* approx, int step,
+                              void* scratch, Likeliest* out_pick, const uint16_t* w1_host_dev, uint16_t* w1_row,
+                              void* stream) {
+    cudaStream_t s = cs(stream);
+    const int n_tiles = (int) dspark_px::tiles(h.n_vocab);
+    float2* cand = static_cast<float2*>(scratch);
+    float2* part = cand + (size_t) n_tiles * dspark_px::kPer;
+    const uint16_t* fsc = reinterpret_cast<const uint16_t*>(
+        static_cast<const char*>(h.fold_sc) + (size_t) n_tiles * dspark_px::nw4(dspark_px::kDsRank) * 32 * 16);
+    const float* approx_row = approx + (size_t) step * (size_t) n_tiles * 32;
+    const dspark_px::DsQ81* xh_step = static_cast<const dspark_px::DsQ81*>(hq) + (size_t) step * dspark_px::kHeadNb;
+    const dspark_px::DsQ81* xl_step = static_cast<const dspark_px::DsQ81*>(latq);
+    dspark_px::head_step_kernel<<<(unsigned) ((n_tiles + dspark_px::kTilesPerBlock - 1) / dspark_px::kTilesPerBlock),
+                                  32 * dspark_px::kTilesPerBlock, 0, s>>>(
+        static_cast<const uint4*>(h.fold_sc), reinterpret_cast<const uint32_t*>(fsc), xl_step, approx_row, h.fold_bp,
+        h.cap, h.n_vocab, n_tiles, cand, part);
+    if (h.head_type == 8) {
+        dspark_px::head_final_kernel<8><<<1, 512, 0, s>>>(h, xh_step, xl_step, n_tiles, cand, part, out_pick,
+                                                          w1_host_dev, w1_row);
+    } else if (h.head_type == 14) {
+        dspark_px::head_final_kernel<14><<<1, 512, 0, s>>>(h, xh_step, xl_step, n_tiles, cand, part, out_pick,
+                                                           w1_host_dev, w1_row);
+    } else {
+        throw std::invalid_argument("inkling_dspark_head_pick: unsupported head_type");
+    }
+    ck("inkling_dspark_head_pick");
+}
+
+void inkling_dspark_prep_rnn_step_row(const float* state, const uint16_t* w1_row, float* out, int rank, void* stream) {
+    if (rank <= 0) return;
+    if (rank > 1024 || rank % 32 != 0)
+        throw std::invalid_argument("inkling_dspark_prep_rnn_step_row: rank must be a multiple of 32 <= 1024");
+    dspark_px::prep_rnn_step_row_kernel<<<1, rank, 0, cs(stream)>>>(state, w1_row, out, rank);
+    ck("inkling_dspark_prep_rnn_step_row");
+}
+
 }  // namespace strata::poly
