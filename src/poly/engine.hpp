@@ -619,6 +619,8 @@ protected:
     /// The routed experts' rows a call routed on the card has room for (d_): a window of a model that guesses its
     /// own block, or kSumRows.  The others keep kSumRows, whose windows past it are routed on the host as before.
     int card_rows() const;
+    int short_read_step() const;
+    int short_read_limit() const;
     void moe_add(int n);
     template <class F>
     void* record(F&& work);

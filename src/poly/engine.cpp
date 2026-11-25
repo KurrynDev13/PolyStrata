@@ -3232,7 +3232,7 @@ void Engine::alloc() {
     q8_ = dmalloc(n * kernels::native_q8_1_bytes((q_max + 255) / 256 * 256), "scratch");
 
     h_r_ = (float*) hmalloc(n * streams() * n_embd_ * sizeof(float), "pinned memory");
-    const size_t at_rows = (size_t) std::max(opt_.window, opt_.batch + 1);   // window()'s tokens, step()'s
+    const size_t at_rows = (size_t) std::max({opt_.window, short_read_step(), opt_.batch + 1});   // window()'s, short_read's, step()'s
     at_ = (long long*) dmalloc(at_rows * 2 * sizeof(long long), "scratch");
     h_at_ = (long long*) hmalloc(at_rows * 2 * sizeof(long long), "pinned memory");
     h_rl_ = (float*) hmalloc(n * n_expert_ * sizeof(float), "pinned memory");
@@ -3764,7 +3764,26 @@ void Engine::router_scores(const Layer& L, int n) { lin(L.gate_inp, xn_, rl_, n,
 
 bool Engine::batched(const Layer& L, int n) const { return mmq_ && L.mmq && n >= kStageRows; }
 
-int Engine::card_rows() const { return (block_guess_ || bells()) ? std::max(kSumRows, opt_.window * n_used_) : kSumRows; }
+int Engine::card_rows() const {
+    return (block_guess_ || bells()) ? std::max({kSumRows, opt_.window * n_used_, bells() ? kBellJobs : 0})
+                                     : kSumRows;
+}
+
+int Engine::short_read_step() const {
+    return (bells() && !split_ && n_used_ > 0)
+               ? std::min({rows_, kCpuRows, kBellJobs / n_used_})
+               : 0;
+}
+
+int Engine::short_read_limit() const {
+    static const int limit = [] {
+        const char* v = std::getenv("STRATA_POLY_SHORT_READ");
+        if (!v || !*v) return kStageRows - 1;
+        const int n = std::atoi(v);
+        return n > 0 ? n : 0;
+    }();
+    return std::min(limit, rows_);
+}
 
 // The router's scores, and the copies of them and of the experts' input to the host.
 void Engine::moe_router(const Layer& L, int n) {
@@ -5087,9 +5106,11 @@ void Engine::run(const int32_t* tokens, int n) {
     // layer up to the router, and they cost this thread more than the card.  They are recorded once, a graph a
     // layer and a number of tokens, and replayed with one call.  Only for the layers that can be (Layer::fixed).
     // What a launch needs of the position it reads at at_; an attention over the rows so far is recorded again
-    // when the rows outgrow what it was sized for (head_key()).  A prompt's few tokens are not a window: they
-    // leave no snapshots of the recurrent state, so their launches are others.
-    bool replay = opt_.graphs && n <= opt_.window && (windowed_ || block_pass_ || n == 1) && !opt_.dump;
+    // when the rows outgrow what it was sized for (head_key()).  A short prompt chunk with doorbell (short_pass)
+    // is recorded whole via passes_ with snap_bits_ == 0, without polluting the per-layer head/tail graphs.
+    const bool short_pass = !windowed_ && !block_pass_ && n > 1 && n <= short_read_step() && bell_on(n);
+    bool replay = opt_.graphs && !opt_.dump &&
+                  ((n <= opt_.window && (windowed_ || block_pass_ || n == 1)) || short_pass);
     for (int t = 0; t < n && replay; ++t) replay = !image_at(pos_ + t);
     const auto replayed = [&](std::vector<void*>& made, size_t key, auto&& work) {
         if (made.size() <= key) made.resize(key + 1, nullptr);
@@ -5246,8 +5267,9 @@ void Engine::run(const int32_t* tokens, int n) {
         const Layer& L = layers_[(size_t) step_ps(s).phys];
         whole = L.fixed && (!L.moe || L.card == 1);
     }
-    // A block of guesses is recorded whole or not at all: a layer's own recordings are a window's, of other kernels.
-    if (block_pass_ && !whole) replay = false;
+    // A block of guesses or a short-prompt decode chunk is recorded whole or not at all: a layer's own recordings
+    // are a window's, of other kernels (with snapshots).
+    if ((block_pass_ || short_pass) && !whole) replay = false;
     if (whole) {
         std::vector<int> key{block_pass_ ? -n : n, bell_ ? 1 : 0, (int) snap_bits_};
         for (int s = step0; s < step1; ++s) key.push_back(head_key(step_ps(s).slot, n));
@@ -5858,10 +5880,21 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
         if (marks[k].at <= (k ? marks[k - 1].at : 0) || marks[k].at >= n)
             throw std::logic_error("read: the marks rise, above 0 and below the tokens read");
 
-    // the calls: up to max_rows() tokens each, and none across a mark
+    // With experts in RAM, a short prompt or follow-up turn up to STRATA_POLY_SHORT_READ (default kStageRows - 1 = 31)
+    // tokens runs as graphed decode-path doorbell chunks instead of ungraphed synchronous moe(), while >= kStageRows
+    // uses the faster batched MMQ moe_rows() path.
+    const int short_limit = short_read_limit();
+    const int short_step = short_read_step();
+    const bool short_window_read = short_limit > 0 && short_step > 1 && n > short_step && n <= short_limit &&
+                                   !all_cached() && !next_ && !pool_ && !split_ && !opt_.dump &&
+                                   !(opt_.skip_weight > 0.f) && bell_on(short_step) &&
+                                   (opt_.stage_ahead <= 0 || n < opt_.stage_ahead);
+    const int chunk_cap = short_window_read ? short_step : rows_;
+
+    // the calls: up to chunk_cap tokens each, and none across a mark
     calls_.clear();
     for (int at = 0, k = 0; at < n;) {
-        const int m = std::min(rows_, (k < n_marks ? marks[k].at : n) - at);
+        const int m = std::min(chunk_cap, (k < n_marks ? marks[k].at : n) - at);
         const bool ends = k < n_marks && at + m == marks[k].at;
         calls_.push_back({at, m, ends ? k : -1});
         at += m;
@@ -5881,7 +5914,7 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
     };
     const bool groups =
         can_read_groups() && n_calls > 1 && !next_ && (!draft_ || draft_at_once()) && stage_wide_ > stage_narrow_;
-    if (n_calls == 1 || (!mmq_ && !groups) || all_cached() || n < opt_.stage_ahead) {
+    if (short_window_read || n_calls == 1 || (!mmq_ && !groups) || all_cached() || n < opt_.stage_ahead) {
         turn = share_to(n_layer_);   // eval() takes the calls through the cards after this one
         // On several cards the next one takes a call on a thread of its own, while this one runs the call after
         // it.  Each card runs the calls as eval() does, in the same order.

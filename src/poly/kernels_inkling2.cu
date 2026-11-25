@@ -2660,13 +2660,23 @@ void* flash_kernel(int g, bool quant, int tokens) {
     return fns[g - 1][quant ? 1 : 0][flash_size_index(tokens)];
 }
 
-int flash_resident(int g, bool quant, int tokens) {
+struct FlashInfo {
+    int res = 0;
+    size_t local_bytes = 0;
+};
+
+FlashInfo flash_info(int g, bool quant, int tokens) {
     constexpr int kDevs = 16;
-    static std::atomic<int> cache[kDevs][4][2][3] = {};
+    static std::atomic<int> res_cache[kDevs][4][2][3] = {};
+    static std::atomic<size_t> local_cache[kDevs][4][2][3] = {};
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess) dev = 0;
-    std::atomic<int>* c = dev >= 0 && dev < kDevs ? &cache[dev][g - 1][quant ? 1 : 0][flash_size_index(tokens)] : nullptr;
-    if (c && c->load(std::memory_order_relaxed) > 0) return c->load(std::memory_order_relaxed) - 1;
+    const int qi = quant ? 1 : 0, si = flash_size_index(tokens);
+    std::atomic<int>* rc = dev >= 0 && dev < kDevs ? &res_cache[dev][g - 1][qi][si] : nullptr;
+    std::atomic<size_t>* lc = dev >= 0 && dev < kDevs ? &local_cache[dev][g - 1][qi][si] : nullptr;
+    if (rc && rc->load(std::memory_order_relaxed) > 0) {
+        return {rc->load(std::memory_order_relaxed) - 1, lc ? lc->load(std::memory_order_relaxed) : 0};
+    }
     void* fn = flash_kernel(g, quant, tokens);
     const size_t smem = flash_smem(g, quant, tokens);
     const cudaError_t e = cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
@@ -2674,8 +2684,33 @@ int flash_resident(int g, bool quant, int tokens) {
         throw std::runtime_error(std::string("ink_attend_batch: shared memory: ") + cudaGetErrorString(e));
     int n = 0;
     if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, fn, tokens / 16 * g * 32, smem) != cudaSuccess) n = 0;
-    if (c) c->store(1 + n, std::memory_order_relaxed);
-    return n;
+    cudaFuncAttributes attr{};
+    const size_t local_b = cudaFuncGetAttributes(&attr, fn) == cudaSuccess ? attr.localSizeBytes : 0;
+    if (lc) lc->store(local_b, std::memory_order_relaxed);
+    if (rc) rc->store(1 + n, std::memory_order_relaxed);
+    return {n, local_b};
+}
+
+int flash_ptx() {
+    static const int ptx = [] {
+        cudaFuncAttributes f{};
+        return cudaFuncGetAttributes(&f, ink_flash_kernel<1, false>) == cudaSuccess ? f.ptxVersion : 0;
+    }();
+    return ptx;
+}
+
+int flash_per(const InkAttn& a) {
+    return a.n_kv > 0 && a.n_head % a.n_kv == 0 ? a.n_head / a.n_kv : 0;
+}
+
+bool flash_eligible(const InkAttn& a, int per) {
+    static const bool off = [] {   // STRATA_INK_FLASH=0: attend_batch()'s path
+        const char* v = std::getenv("STRATA_INK_FLASH");
+        return v && v[0] == '0';
+    }();
+    if (off) return false;
+    return a.dim == 128 && a.n_rel == kFlashRel && per >= 1 && per <= kMaxPer && !a.at && !a.q8 && !a.kv8 &&
+           flash_ptx() >= 80;
 }
 
 int flash_sms() {
@@ -2691,16 +2726,22 @@ int flash_pick(const InkAttn& a, int per, bool quant) {
         return t == 64 || t == 48 || t == 32 ? t : 0;
     }();
     if (fixed) return fixed;
+    static const bool spill_aware = [] {
+        const char* v = std::getenv("STRATA_INK_FLASH_SPILL");
+        return !(v && v[0] == '0');
+    }();
     constexpr double kFlashCost[] = {1.0, 0.9, 0.65}, kFlashGain = 0.05;
     const int sms = flash_sms();
     if (sms < 1 || a.rows <= 0) return 64;
     double best = 0.0, main_cost = 0.0;
     int pick = 64;
     for (int i = 0; i < 3; ++i) {
-        const int t = kFlashSizes[i], res = flash_resident(per, quant, t);
-        if (res < 1) continue;
-        const long long blocks = (long long) grid((size_t) a.rows, t) * a.n_kv, slots = (long long) sms * res;
-        const double cost = (double) ((blocks + slots - 1) / slots) * res * kFlashCost[i];
+        const int t = kFlashSizes[i];
+        const FlashInfo info = flash_info(per, quant, t);
+        if (info.res < 1) continue;
+        const long long blocks = (long long) grid((size_t) a.rows, t) * a.n_kv, slots = (long long) sms * info.res;
+        const double spill = (spill_aware && !quant && info.local_bytes > 0) ? 1.25 : 1.0;
+        const double cost = (double) ((blocks + slots - 1) / slots) * info.res * kFlashCost[i] * spill;
         if (t == 64) {
             main_cost = best = cost;
         } else if (main_cost > 0.0 && cost < best && cost <= main_cost * (1.0 - kFlashGain)) {
@@ -2714,27 +2755,34 @@ int flash_pick(const InkAttn& a, int per, bool quant) {
 }  // namespace
 #endif
 
-bool ink_attend_batch(const InkAttn& a, void* stream) {
+int ink_flash_tokens(const InkAttn& a) {
 #if defined(__HIPCC__)
-    (void) a, (void) stream;
+    (void) a;
+    return 0;
+#else
+    if (a.rows <= 0) return 0;
+    const int per = flash_per(a);
+    if (!flash_eligible(a, per)) return 0;
+    const bool has_quant = a.kq8.codes || a.vq8.codes || a.kq4.codes || a.vq4.codes;
+    return flash_pick(a, per, has_quant);
+#endif
+}
+
+bool ink_attend_batch(const InkAttn& a, void* stream) {
+    return ink_attend_batch_rows(a, stream, 0);
+}
+
+bool ink_attend_batch_rows(const InkAttn& a, void* stream, int tokens) {
+#if defined(__HIPCC__)
+    (void) a, (void) stream, (void) tokens;
     return false;   // the kernel is NVIDIA's tensor cores' (INK_FLASH)
 #else
     if (a.rows <= 0) return true;
-    static const bool off = [] {   // STRATA_INK_FLASH=0: attend_batch()'s path
-        const char* v = std::getenv("STRATA_INK_FLASH");
-        return v && v[0] == '0';
-    }();
-    const int per = a.n_kv > 0 && a.n_head % a.n_kv == 0 ? a.n_head / a.n_kv : 0;
-    if (off) return false;
-    if (a.dim != 128 || a.n_rel != kFlashRel || per < 1 || per > kMaxPer || a.at || a.q8 || a.kv8) return false;
-    static const int ptx = [] {
-        cudaFuncAttributes f{};
-        return cudaFuncGetAttributes(&f, ink_flash_kernel<1, false>) == cudaSuccess ? f.ptxVersion : 0;
-    }();
-    if (ptx < 80) return false;
+    const int per = flash_per(a);
+    if (!flash_eligible(a, per)) return false;
     const bool has_quant = a.kq8.codes || a.vq8.codes || a.kq4.codes || a.vq4.codes;
-    const int tokens = flash_pick(a, per, has_quant);
-    flash_resident(per, has_quant, tokens);
+    if (tokens != 64 && tokens != 48 && tokens != 32) tokens = flash_pick(a, per, has_quant);
+    flash_info(per, has_quant, tokens);
     InkAttn arg = a;
     void* args[] = {&arg};
     const cudaError_t e = cudaLaunchKernel(flash_kernel(per, has_quant, tokens),

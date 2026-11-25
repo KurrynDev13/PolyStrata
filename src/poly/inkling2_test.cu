@@ -691,6 +691,21 @@ int test_rel_and_attend() {
                 auto got_flash = host(d_out_flash, q.size());
                 std::snprintf(buf, sizeof(buf), "%s flash vs attend", label);
                 bad += report(buf, got_flash, got_dec, 5e-3);
+                if (ink_flash_tokens(ia) > 0) {
+                    const int sizes[3] = {64, 48, 32};
+                    std::vector<float> ref_bits;
+                    for (int sz : sizes) {
+                        cudaMemset(d_out_flash, 0, q.size() * sizeof(float));
+                        ink_attend_batch_rows(ia, nullptr, sz);
+                        auto got_sz = host(d_out_flash, q.size());
+                        if (sz == 64) {
+                            ref_bits = std::move(got_sz);
+                        } else if (std::memcmp(got_sz.data(), ref_bits.data(), ref_bits.size() * sizeof(float)) != 0) {
+                            std::printf("%-42s size %d bits differ from 64  FAIL\n", label, sz);
+                            ++bad;
+                        }
+                    }
+                }
             }
         }
 
@@ -2188,9 +2203,230 @@ int test_dspark_head_proxy() {
     return bad;
 }
 
+int test_flash_sizes() {
+    int bad = 0;
+    const int n_kv = 8, per = 3, n_head = n_kv * per, dim = 128, n_rel = 16, width = n_kv * dim;
+    const float scale = 1.f / std::sqrt((float) dim);
+    struct FlashCase {
+        const char* name;
+        int rows, total_keys, window, ring, extent;
+        bool quant_k8v4, quant_q8, quant_q4;
+    };
+    const FlashCase cases[] = {
+        {"flash 1024 full fp16",     1024, 1024,    0,    0, 1024, false, false, false},
+        {"flash 1024 swa fp16",      1024, 1024, 1024, 2048, 1024, false, false, false},
+        {"flash 512 full k8v4",       512, 1024,    0,    0, 1024,  true, false, false},
+        {"flash 1024 swa k8v4",      1024, 1500, 1024, 2048, 1024,  true, false, false},
+        {"flash 100 full q8_0",       100,  320,    0,    0,  320, false,  true, false},
+        {"flash 100 swa q4_0",        100,  500,  256,  512,  256, false, false,  true},
+    };
+    for (const auto& fc : cases) {
+        const int max_k = fc.ring > 0 ? fc.ring : fc.total_keys + fc.rows;
+        auto q_h = random_vec((size_t) fc.rows * n_head * dim, 0.5f);
+        auto r_h = random_vec((size_t) fc.rows * n_head * n_rel, 0.5f);
+        auto s_h = random_vec((size_t) fc.rows * n_head, 0.2f);
+        auto rb_h = random_vec((size_t) fc.extent * n_rel, 0.25f);
+        auto k_f = random_vec((size_t) max_k * width, 0.5f);
+        auto v_f = random_vec((size_t) max_k * width, 0.5f);
+
+        float *d_q = dev(q_h), *d_r = dev(r_h), *d_s = dev(s_h), *d_rb = dev(rb_h);
+        float *d_out = dev(std::vector<float>(q_h.size(), 0.f));
+
+        std::vector<uint16_t> kf16(k_f.size()), vf16(v_f.size()), ks8, vs8, ks4, vs4;
+        std::vector<int8_t> kc8, vc8;
+        std::vector<uint8_t> kc4, vc4;
+        for (size_t i = 0; i < k_f.size(); ++i) {
+            kf16[i] = __half_as_ushort(__float2half(k_f[i]));
+            vf16[i] = __half_as_ushort(__float2half(v_f[i]));
+        }
+        auto quant_q8 = [&](const std::vector<float>& src, std::vector<int8_t>& codes, std::vector<uint16_t>& sc) {
+            const int nb = width / 32;
+            codes.resize(src.size());
+            sc.resize((size_t) max_k * nb);
+            for (size_t b = 0; b < sc.size(); ++b) {
+                float amax = 0.f;
+                for (int l = 0; l < 32; ++l) amax = std::max(amax, std::abs(src[b * 32 + l]));
+                const float d = amax / 127.f;
+                const uint16_t ds = __half_as_ushort(__float2half(d));
+                sc[b] = ds;
+                const float d_eff = __half2float(__ushort_as_half(ds));
+                for (int l = 0; l < 32; ++l) {
+                    const int qv = d_eff > 0.f ? (int) std::lrintf(src[b * 32 + l] / d_eff) : 0;
+                    codes[b * 32 + l] = (int8_t) std::clamp(qv, -127, 127);
+                }
+            }
+        };
+        auto quant_q4 = [&](const std::vector<float>& src, std::vector<uint8_t>& codes, std::vector<uint16_t>& sc) {
+            const int nb = width / 32;
+            codes.resize(src.size() / 2);
+            sc.resize((size_t) max_k * nb);
+            for (size_t b = 0; b < sc.size(); ++b) {
+                float amax = 0.f;
+                for (int l = 0; l < 32; ++l) amax = std::max(amax, std::abs(src[b * 32 + l]));
+                const float d = amax / 7.f;
+                const uint16_t ds = __half_as_ushort(__float2half(d));
+                sc[b] = ds;
+                const float d_eff = __half2float(__ushort_as_half(ds));
+                for (int l = 0; l < 16; ++l) {
+                    const int lo = std::clamp(d_eff > 0.f ? (int) std::lrintf(src[b * 32 + l] / d_eff) + 8 : 8, 0, 15);
+                    const int hi = std::clamp(d_eff > 0.f ? (int) std::lrintf(src[b * 32 + l + 16] / d_eff) + 8 : 8, 0, 15);
+                    codes[b * 16 + l] = (uint8_t) (lo | (hi << 4));
+                }
+            }
+        };
+        if (fc.quant_q8 || fc.quant_k8v4) quant_q8(k_f, kc8, ks8);
+        if (fc.quant_q8) quant_q8(v_f, vc8, vs8);
+        if (fc.quant_q4) quant_q4(k_f, kc4, ks4);
+        if (fc.quant_q4 || fc.quant_k8v4) quant_q4(v_f, vc4, vs4);
+
+        uint16_t *d_kf16 = dev(kf16), *d_vf16 = dev(vf16);
+        int8_t *d_kc8 = kc8.empty() ? nullptr : dev(kc8), *d_vc8 = vc8.empty() ? nullptr : dev(vc8);
+        uint16_t *d_ks8 = ks8.empty() ? nullptr : dev(ks8), *d_vs8 = vs8.empty() ? nullptr : dev(vs8);
+        uint8_t *d_kc4 = kc4.empty() ? nullptr : dev(kc4), *d_vc4 = vc4.empty() ? nullptr : dev(vc4);
+        uint16_t *d_ks4 = ks4.empty() ? nullptr : dev(ks4), *d_vs4 = vs4.empty() ? nullptr : dev(vs4);
+
+        InkAttn ia;
+        ia.q = d_q;
+        ia.r = d_r;
+        ia.sink = d_s;
+        const bool quant = fc.quant_k8v4 || fc.quant_q8 || fc.quant_q4;
+        ia.keys = quant ? nullptr : d_kf16;
+        ia.vals = quant ? nullptr : d_vf16;
+        ia.rel_bias = d_rb;
+        ia.out = d_out;
+        ia.pos = fc.total_keys;
+        ia.rows = fc.rows;
+        ia.n_head = n_head;
+        ia.n_kv = n_kv;
+        ia.dim = dim;
+        ia.n_rel = n_rel;
+        ia.extent = fc.extent;
+        ia.window = fc.window;
+        ia.ring = fc.ring;
+        ia.scale = scale;
+        if (d_kc8) ia.kq8 = {d_kc8, d_ks8};
+        if (d_vc8) ia.vq8 = {d_vc8, d_vs8};
+        if (d_kc4) ia.kq4 = {d_kc4, d_ks4};
+        if (d_vc4) ia.vq4 = {d_vc4, d_vs4};
+
+        if (ink_flash_tokens(ia) > 0) {
+            std::vector<float> ref_bits;
+            bool ok = true;
+            for (int sz : {64, 48, 32}) {
+                cudaMemset(d_out, 0, q_h.size() * sizeof(float));
+                ink_attend_batch_rows(ia, nullptr, sz);
+                cudaDeviceSynchronize();
+                auto got = host(d_out, q_h.size());
+                if (sz == 64) ref_bits = std::move(got);
+                else if (std::memcmp(got.data(), ref_bits.data(), ref_bits.size() * sizeof(float)) != 0) ok = false;
+            }
+            std::printf("%-42s pick=%2d  bit-exact(64/48/32)=%s\n", fc.name, ink_flash_tokens(ia),
+                        ok ? "PASS" : "FAIL");
+            if (!ok) ++bad;
+        } else {
+            std::printf("%-42s SKIP (no flash)\n", fc.name);
+        }
+
+        cudaFree(d_q); cudaFree(d_r); cudaFree(d_s); cudaFree(d_rb); cudaFree(d_out);
+        cudaFree(d_kf16); cudaFree(d_vf16);
+        if (d_kc8) cudaFree(d_kc8);
+        if (d_vc8) cudaFree(d_vc8);
+        if (d_ks8) cudaFree(d_ks8);
+        if (d_vs8) cudaFree(d_vs8);
+        if (d_kc4) cudaFree(d_kc4);
+        if (d_vc4) cudaFree(d_vc4);
+        if (d_ks4) cudaFree(d_ks4);
+        if (d_vs4) cudaFree(d_vs4);
+    }
+    return bad;
+}
+
+int bench_flash() {
+    const int n_kv = 8, n_head = 24, dim = 128, n_rel = 16, width = n_kv * dim;
+    const int max_k = 32768 + 1024;
+    const float scale = 1.f / std::sqrt((float) dim);
+
+    float *d_q = dev(random_vec((size_t) 1024 * n_head * dim, 0.5f)),
+          *d_r = dev(random_vec((size_t) 1024 * n_head * n_rel, 0.5f)),
+          *d_s = dev(random_vec((size_t) 1024 * n_head, 0.2f)),
+          *d_rb = dev(random_vec((size_t) 32768 * n_rel, 0.25f)),
+          *d_out = dev(std::vector<float>((size_t) 1024 * n_head * dim, 0.f));
+    uint16_t *d_kf16 = dev(std::vector<uint16_t>((size_t) max_k * width, 0x3c00)),
+             *d_vf16 = dev(std::vector<uint16_t>((size_t) max_k * width, 0x3c00));
+    int8_t *d_kc8 = dev(std::vector<int8_t>((size_t) max_k * width, 12));
+    uint8_t *d_vc4 = dev(std::vector<uint8_t>((size_t) max_k * (width / 2), 0x88));
+    uint16_t *d_ks8 = dev(std::vector<uint16_t>((size_t) max_k * (width / 32), 0x3c00)),
+             *d_vs4 = dev(std::vector<uint16_t>((size_t) max_k * (width / 32), 0x3c00));
+
+    cudaEvent_t ev0, ev1;
+    cudaEventCreate(&ev0);
+    cudaEventCreate(&ev1);
+
+    auto time_case = [&](const char* label, int rows, int pos, int window, int ring, int extent, bool k8v4) {
+        InkAttn ia;
+        ia.q = d_q;
+        ia.r = d_r;
+        ia.sink = d_s;
+        ia.keys = k8v4 ? nullptr : d_kf16;
+        ia.vals = k8v4 ? nullptr : d_vf16;
+        ia.rel_bias = d_rb;
+        ia.out = d_out;
+        ia.pos = pos;
+        ia.rows = rows;
+        ia.n_head = n_head;
+        ia.n_kv = n_kv;
+        ia.dim = dim;
+        ia.n_rel = n_rel;
+        ia.extent = extent;
+        ia.window = window;
+        ia.ring = ring;
+        ia.scale = scale;
+        if (k8v4) {
+            ia.kq8 = {d_kc8, d_ks8};
+            ia.vq4 = {d_vc4, d_vs4};
+        }
+        const int picked = ink_flash_tokens(ia);
+        std::printf("%-26s pick=%2d |", label, picked);
+        for (int sz : {64, 48, 32}) {
+            ink_attend_batch_rows(ia, nullptr, sz);
+            cudaDeviceSynchronize();
+            const int iters = pos > 8192 ? 8 : 20;
+            cudaEventRecord(ev0, nullptr);
+            for (int i = 0; i < iters; ++i) ink_attend_batch_rows(ia, nullptr, sz);
+            cudaEventRecord(ev1, nullptr);
+            cudaEventSynchronize(ev1);
+            float ms = 0.f;
+            cudaEventElapsedTime(&ms, ev0, ev1);
+            std::printf(" %d=%6.3f ms", sz, ms / iters);
+        }
+        std::printf("\n");
+    };
+
+    time_case("fp16 rows=1024 k=2048",  1024,  2048,    0,    0,  2048, false);
+    time_case("fp16 rows=1024 k=8192",  1024,  8192,    0,    0,  8192, false);
+    time_case("fp16 rows=1024 k=16384", 1024, 16384,    0,    0, 16384, false);
+    time_case("fp16 rows=1024 k=32768", 1024, 32768,    0,    0, 32768, false);
+    time_case("fp16 rows=1024 swa=1024",1024,  2048, 1024, 2048,  1024, false);
+    time_case("fp16 rows=512  k=8192",   512,  8192,    0,    0,  8192, false);
+    time_case("k8v4 rows=1024 k=2048",  1024,  2048,    0,    0,  2048, true);
+    time_case("k8v4 rows=1024 k=8192",  1024,  8192,    0,    0,  8192, true);
+    time_case("k8v4 rows=1024 k=16384", 1024, 16384,    0,    0, 16384, true);
+    time_case("k8v4 rows=1024 k=32768", 1024, 32768,    0,    0, 32768, true);
+    time_case("k8v4 rows=1024 swa=1024",1024,  2048, 1024, 2048,  1024, true);
+    time_case("k8v4 rows=512  k=8192",   512,  8192,    0,    0,  8192, true);
+
+    cudaEventDestroy(ev0);
+    cudaEventDestroy(ev1);
+    cudaFree(d_q); cudaFree(d_r); cudaFree(d_s); cudaFree(d_rb); cudaFree(d_out);
+    cudaFree(d_kf16); cudaFree(d_vf16);
+    cudaFree(d_kc8); cudaFree(d_vc4); cudaFree(d_ks8); cudaFree(d_vs4);
+    return 0;
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc > 1 && std::strcmp(argv[1], "--bench-flash") == 0) return bench_flash();
     int bad = 0;
     bad += test_situ_gpu_and_cpu();
     bad += test_mix_and_control();
@@ -2202,6 +2438,7 @@ int main() {
     bad += test_fused_and_predequant();
     bad += test_decode_fusions();
     bad += test_dspark_head_proxy();
+    bad += test_flash_sizes();
     std::printf("\n%s\n", bad ? "FAILED" : "ALL PASSED");
     return bad ? 1 : 0;
 }

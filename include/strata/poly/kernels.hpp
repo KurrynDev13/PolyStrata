@@ -600,6 +600,12 @@ struct InkAttn {
 /// when a.gate is set. Heads of 128 values, up to 4 on a key head, 16 relative values, positions on the host, no q8;
 /// a card from Ampere on. False, with nothing launched, where it does not take them.
 bool ink_attend_batch(const InkAttn& a, void* stream);
+/// ink_attend_batch() with the rows a block of ink_flash_kernel takes fixed to `tokens` (64, 48 or 32,
+/// which change no bit); any other value uses the size ink_flash_tokens() picks.
+bool ink_attend_batch_rows(const InkAttn& a, void* stream, int tokens);
+/// The rows a block ink_flash_kernel takes for this call on the current card (64, 48 or 32), or 0 where
+/// the call falls back to another path. STRATA_INK_FLASH_TOKENS=64/48/32 overrides the selection.
+int ink_flash_tokens(const InkAttn& a);
 
 /// Pick count tracking for experts routed on card.
 void count_picks(const int32_t* ids, int rr, int n_expert, int32_t* uses, void* stream);
@@ -607,7 +613,7 @@ void count_picks(const int32_t* ids, int rr, int n_expert, int32_t* uses, void* 
 /// A doorbell in pinned memory between the card and the host for a token's routed experts outside VRAM, after Strata
 /// v0.2.19's Inkling hybrid mode: the card rings it with the experts it lacks and goes on with its own, the host
 /// computes those and answers, and the card waits for the answer only where it adds their sum.
-constexpr int kBellJobs = 32;
+constexpr int kBellJobs = 64;
 struct ExpertBell {
     volatile uint32_t ring;    ///< the card's rings so far; a new value is a new job
     uint32_t pad0[15];
@@ -615,7 +621,7 @@ struct ExpertBell {
     uint32_t pad1[15];
     volatile uint32_t abort;   ///< the host gave up: every wait ends at once
     uint32_t pad2[15];
-    int32_t layer, n, tok_n;   ///< the job: layer, how many misses, and how many tokens (1..4)
+    int32_t layer, n, tok_n;   ///< the job: layer, how many misses, and how many tokens (1..8)
     int32_t e[kBellJobs];      ///< their ids
     int32_t tok[kBellJobs];    ///< which token [0, tok_n) each miss belongs to (non-decreasing)
     float w[kBellJobs];        ///< their router weights
