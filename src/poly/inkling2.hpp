@@ -34,6 +34,7 @@ protected:
     size_t recurrent_floats() const override;
     bool snaps_spread() const override { return true; }
     bool can_read_groups() const override { return true; }
+    bool supports_prompt_loan() const override { return true; }
     void save_layer(int slot, int64_t pos, uint8_t* dst) override;
     size_t extra_bytes() const override;
     void load_extra(const uint8_t* src, int64_t pos) override;

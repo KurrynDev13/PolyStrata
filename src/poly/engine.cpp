@@ -675,6 +675,7 @@ Engine::~Engine() {
     vmm_free(arena_);
     vmm_free(stage_map_);
     vmm_free(carry_map_);
+    vmm_free(prompt_map_);
     for (unsigned long long h : vpool_) cuMemRelease(h);   // the pool goes back to the card with the engine
     vpool_.clear();
     for (void* p : host_allocs_) cudaFreeHost(p);
@@ -926,7 +927,7 @@ void Engine::vmm_map(Mapped& m, size_t bytes, size_t piece, const char* what) {
         // comes zeroed from the system.  Rows nothing has written yet are read by the kernels' tiles (the causal mask
         // does not stop a NaN from them), so a piece is zeroed as it is mapped.  Not the staging buffer: its uploads
         // run on another stream, and everything it holds is written before it is read.
-        if (pool_on_ && &m != &stage_map_) zero_vram((void*) at, n);
+        if (pool_on_ && &m != &stage_map_ && &m != &prompt_map_ && &m != &arena_) zero_vram((void*) at, n);
     }
 }
 
@@ -1473,6 +1474,110 @@ float* Engine::fbuf(size_t n) {
     float* p = scratch_ ? scratch_ + scratch_at_ : nullptr;
     scratch_at_ += (n + 63) & ~size_t(63);
     return p;
+}
+
+float* Engine::sbuf(size_t n) {
+    if (!prompt_loan_ || !bind_prompt_) return fbuf(n);
+    float* p = prompt_scratch_ ? prompt_scratch_ + prompt_at_ : nullptr;
+    prompt_at_ += (n + 63) & ~size_t(63);
+    return p;
+}
+
+void* Engine::sbytes(size_t bytes) {
+    return (void*) sbuf((bytes + sizeof(float) - 1) / sizeof(float));
+}
+
+void Engine::bind_scratch(bool prompt) {
+    if (!prompt_loan_) return;
+    bind_prompt_ = prompt;
+    if (prompt) {
+        prompt_scratch_ = (float*) prompt_map_.base;
+        prompt_at_ = 0;
+    } else {
+        scratch_at_ = 0;
+    }
+    shared_scratch();
+    assign_scratch();
+    if (!prompt) bind_prompt_ = false;
+}
+
+void Engine::take_prompt_arena() {
+    if (!prompt_loan_ || prompt_lent_) return;
+    OnCard here(device_, split_);
+    if (up_) ck(cudaStreamSynchronize(cs(up_)), "prompt scratch");
+    ck(cudaStreamSynchronize(cs(st_)), "prompt scratch");
+    const size_t gran = pool_on_ ? pg_ : grain_;
+    const size_t need_p = up_to(prompt_bytes_ + 256, gran);
+    const size_t need_s = stage_map_.base ? up_to(stage_narrow_ + 256 + kTail, gran) : 0;
+    size_t want = need_p > prompt_map_.mapped ? need_p - prompt_map_.mapped : 0;
+    if (need_s > stage_map_.mapped) want += need_s - stage_map_.mapped;
+    size_t free_b = 0, total_b = 0;
+    ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
+    if (pool_on_) free_b = vpool_bytes();
+    const size_t keep_b =
+        pool_on_ ? 0
+                 : (size_t(opt_.vram_reserve_mib >= 0 || ram_tight_ ? reserve_mib_ : std::max(reserve_mib_ / 2, 128)) << 20);
+    prompt_cut_ = 0;
+    if (exp_ && want > 0 && free_b < want + keep_b) {
+        const size_t had = arena_.mapped;
+        shrink_cache(want + keep_b - free_b);
+        held_is_budget();
+        prompt_cut_ = had - arena_.mapped;
+    }
+    prompt_lent_ = true;
+    try {
+        vmm_map(prompt_map_, prompt_bytes_ + 256, SIZE_MAX, "prompt scratch");
+        if (stage_map_.base && stage_map_.mapped < need_s) {
+            vmm_map(stage_map_, stage_narrow_ + 256 + kTail, SIZE_MAX, "the expert staging buffer");
+            stage_bytes_ = stage_narrow_;
+            staged_il_ = -1;
+        }
+        bind_scratch(true);
+    } catch (const std::runtime_error&) {
+        end_read();
+        throw;
+    }
+}
+
+void Engine::end_read() {
+    if (!stage_lent_ && !carry_lent_ && !prompt_lent_) return;
+    OnCard here(device_, split_);
+    if (up_) ck(cudaStreamSynchronize(cs(up_)), "end_read");
+    ck(cudaStreamSynchronize(cs(st_)), "end_read");
+    if (stage_lent_) {
+        vmm_unmap(stage_map_, prompt_loan_ ? 0 : stage_narrow_ + 256 + kTail);
+        stage_bytes_ = stage_narrow_;
+        staged_il_ = -1;
+        stage_lent_ = false;
+    }
+    if (carry_lent_) {
+        vmm_unmap(carry_map_, 0);
+        carry_lent_ = false;
+    }
+    if (prompt_lent_) {
+        if (stage_map_.mapped > 0) vmm_unmap(stage_map_, 0);
+        if (prompt_map_.mapped > 0) vmm_unmap(prompt_map_, 0);
+        stage_bytes_ = stage_narrow_;
+        staged_il_ = -1;
+        bind_scratch(false);
+        prompt_lent_ = false;
+    }
+    const size_t total_cut = stage_cut_ + carry_cut_ + prompt_cut_;
+    stage_cut_ = carry_cut_ = prompt_cut_ = 0;
+    if (exp_ && total_cut > 0) {
+        size_t give = total_cut;
+        if (!pool_on_) {
+            size_t free_b = 0, total_b = 0;
+            ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
+            const size_t floor_b =
+                prompt_loan_
+                    ? (size_t(opt_.vram_reserve_mib >= 0 || ram_tight_ ? reserve_mib_ : std::max(reserve_mib_ / 2, 128)) << 20)
+                    : (size_t(std::max(reserve_mib_, 0)) << 20) / 4;
+            give = std::min(total_cut, free_b > floor_b ? free_b - floor_b : 0);
+        }
+        if (give > 0) grow_cache(give, true);
+        held_is_budget();
+    }
 }
 
 std::vector<std::pair<const uint8_t*, size_t>> Engine::model_views() const {
@@ -2088,13 +2193,17 @@ void Engine::ensure_stage() {
 #endif
     if (stage_wide_ > stage_narrow_) {
         vmm_reserve(stage_map_, stage_wide_ + 256 + kTail);
-        // with the pool the buffer comes out of it, and out of the expert cache when the pool lacks the room
-        if (pool_on_ && pool_claimed_ && exp_) {
-            const size_t need = up_to(stage_narrow_ + 256 + kTail, pg_);
-            if (need > vpool_bytes()) shrink_cache(need - vpool_bytes());
+        if (prompt_loan_) {
+            stage_ = (uint8_t*) stage_map_.base;
+        } else {
+            // with the pool the buffer comes out of it, and out of the expert cache when the pool lacks the room
+            if (pool_on_ && pool_claimed_ && exp_) {
+                const size_t need = up_to(stage_narrow_ + 256 + kTail, pg_);
+                if (need > vpool_bytes()) shrink_cache(need - vpool_bytes());
+            }
+            vmm_map(stage_map_, stage_narrow_ + 256 + kTail, SIZE_MAX, "the expert staging buffer");
+            stage_ = (uint8_t*) stage_map_.base;
         }
-        vmm_map(stage_map_, stage_narrow_ + 256 + kTail, SIZE_MAX, "the expert staging buffer");
-        stage_ = (uint8_t*) stage_map_.base;
     } else {
         stage_ = (uint8_t*) dmalloc(stage_bytes_ + 256 + kTail, "the expert staging buffer");
     }
@@ -2135,6 +2244,7 @@ void Engine::resize_card_cache(int mib) {
     // As shrink_cache(): a frozen answer's cache does not change under it (the vram API resizes between
     // requests; unfreeze_experts() ends the freeze before one begins).
     if (freeze_experts_) return;
+    end_read();
     OnCard here(device_, split_);
 #if defined(STRATA_GPU_METAL)
     // Every Metal graph retains its indirect resources, including in the legacy memory mode.
@@ -2394,21 +2504,95 @@ int Engine::grow_cache(size_t bytes, bool later) {
     }
     std::sort(taken.begin(), taken.end(),
               [](const Cand& a, const Cand& b) { return a.il != b.il ? a.il < b.il : a.e < b.e; });
-    for (const Cand& c : taken) {
-        Layer& L = layers_[(size_t) c.il];
-        uint8_t* s = exp_ + exp_at_;
-        exp_at_ += L.slot_bytes;
-        if (later) {
-            refill_.push_back({c.il, c.e, s});
-            coming_[(size_t) c.il * n_expert_ + c.e] = 1;
-            continue;
+    if (!later && workers_ && h_stage_[0] && h_stage_[1] && ev_stage_[0] && ev_stage_[1] && chunk_bytes_ > 0 &&
+        taken.size() >= 2) {
+        std::vector<size_t> offs;
+        offs.reserve(taken.size());
+        const auto put = [&](void* dst, const void* src, size_t bytes) {
+            if (stream_stage_) stage_copy_streaming(dst, src, bytes);
+            else std::memcpy(dst, src, bytes);
+        };
+        for (size_t j0 = 0; j0 < taken.size();) {
+            if (layers_[(size_t) taken[j0].il].slot_bytes > chunk_bytes_) {
+                const Cand& c = taken[j0];
+                Layer& L = layers_[(size_t) c.il];
+                uint8_t* s = exp_ + exp_at_;
+                exp_at_ += L.slot_bytes;
+                const size_t e = (size_t) c.e;
+                h2d(s, L.exp_gate + e * L.gu_stride, L.gu_bytes);
+                h2d(s + L.gu_bytes, L.exp_up + e * L.u_stride, L.u_bytes);
+                h2d(s + L.gu2(), L.exp_down + e * L.d_bytes, L.d_bytes);
+                L.slot[e] = s;
+                ++cached_;
+                ++j0;
+                continue;
+            }
+            offs.clear();
+            size_t batch_bytes = 0;
+            size_t j1 = j0;
+            while (j1 < taken.size()) {
+                const size_t sb = layers_[(size_t) taken[j1].il].slot_bytes;
+                if (batch_bytes + sb > chunk_bytes_) break;
+                offs.push_back(batch_bytes);
+                batch_bytes += sb;
+                ++j1;
+            }
+            const size_t count = j1 - j0;
+            uint8_t* const dst_base = exp_ + exp_at_;
+            exp_at_ += batch_bytes;
+            stage_turn_ ^= 1;
+            uint8_t* const h = h_stage_[stage_turn_];
+            const cudaEvent_t left = (cudaEvent_t) ev_stage_[stage_turn_];
+            ck(cudaEventSynchronize(left), "the expert cache");
+            const auto copy = [&](int i) {
+                const size_t k = (size_t) i / 3;
+                const Cand& c = taken[j0 + k];
+                const Layer& L = layers_[(size_t) c.il];
+                const size_t e = (size_t) c.e;
+                uint8_t* const dst = h + offs[k];
+                const uint8_t* in = pool_has(c.il, c.e);
+                const bool mapped = !pool_ || kept_[(size_t) c.il * n_expert_ + e];
+                const auto get = [&](uint8_t* p, const uint8_t* src, size_t n, size_t at) {
+                    if (in) put(p, in + at, n);
+                    else if (mapped || !read_file(p, src, n)) put(p, src, n);
+                };
+                if (i % 3 == 0) {
+                    get(dst, L.exp_gate + e * L.gu_stride, L.gu_bytes, 0);
+                } else if (i % 3 == 1) {
+                    get(dst + L.gu_bytes, L.exp_up + e * L.u_stride, L.u_bytes, L.gu_bytes);
+                } else {
+                    get(dst + L.gu2(), L.exp_down + e * L.d_bytes, L.d_bytes, L.gu2());
+                    if (L.slot_bytes > L.gu2() + L.d_bytes)
+                        std::memset(dst + L.gu2() + L.d_bytes, 0, L.slot_bytes - (L.gu2() + L.d_bytes));
+                }
+            };
+            workers_->run((int) (3 * count), copy);
+            ck(cudaMemcpyAsync(dst_base, h, batch_bytes, cudaMemcpyHostToDevice, cs(st_)), "the expert cache");
+            ck(cudaEventRecord(left, cs(st_)), "the expert cache");
+            for (size_t k = 0; k < count; ++k) {
+                const Cand& c = taken[j0 + k];
+                layers_[(size_t) c.il].slot[(size_t) c.e] = dst_base + offs[k];
+                ++cached_;
+            }
+            j0 = j1;
         }
-        const size_t e = (size_t) c.e;
-        h2d(s, L.exp_gate + e * L.gu_stride, L.gu_bytes);
-        h2d(s + L.gu_bytes, L.exp_up + e * L.u_stride, L.u_bytes);
-        h2d(s + L.gu2(), L.exp_down + e * L.d_bytes, L.d_bytes);
-        L.slot[e] = s;
-        ++cached_;
+    } else {
+        for (const Cand& c : taken) {
+            Layer& L = layers_[(size_t) c.il];
+            uint8_t* s = exp_ + exp_at_;
+            exp_at_ += L.slot_bytes;
+            if (later) {
+                refill_.push_back({c.il, c.e, s});
+                coming_[(size_t) c.il * n_expert_ + c.e] = 1;
+                continue;
+            }
+            const size_t e = (size_t) c.e;
+            h2d(s, L.exp_gate + e * L.gu_stride, L.gu_bytes);
+            h2d(s + L.gu_bytes, L.exp_up + e * L.u_stride, L.u_bytes);
+            h2d(s + L.gu2(), L.exp_down + e * L.d_bytes, L.d_bytes);
+            L.slot[e] = s;
+            ++cached_;
+        }
     }
     staged_il_ = -1;
     held_is_budget();
@@ -2926,7 +3110,9 @@ void Engine::load(const Options& o) {
         for (const Kv& k : kv_) more += k.reserved - k.mapped;
         for (const Seq& q : seqs_)
             for (const Kv& k : q.kv) more += k.reserved - k.mapped;
-        if ((int64_t) ((more + kArenaPiece) >> 20) + reserve_mib_ <= vram_free_mib()) {
+        const int64_t loan_mib =
+            prompt_loan_ ? (int64_t) ((prompt_bytes_ + stage_narrow_ + (256 + kTail)) >> 20) + 1 : 0;
+        if ((int64_t) ((more + kArenaPiece) >> 20) + reserve_mib_ + loan_mib <= vram_free_mib()) {
             for (int s = sequences() - 1; s >= 0; --s) {   // ends with the first one bound
                 if (s != bound_) {
                     park_bound();
@@ -3125,29 +3311,55 @@ void Engine::load_drafter() {
                   : out_norm_;
 }
 
-// Per-token buffers hold rows_ tokens, row after row.
+// Per-token buffers hold scratch_rows() tokens, row after row.
 void Engine::shared_scratch() {
-    const size_t n = (size_t) rows_, e = n * n_embd_;
+    const size_t n = (size_t) scratch_rows(), e = n * n_embd_;
     const size_t ff = n * std::max({n_ff_, n_ff_shexp_, 2 * n_ff_exp_});
+    const bool prompt_mode = !prompt_loan_ || binding_prompt();
+    const bool need_r2 = prompt_mode && read_rows_ > rows_;
     // the draft block works in it too (draft_input()); read() keeps two calls' rows in it
-    r_ = fbuf(std::max(streams(), draft_ ? 3 : 1) * (size_t) (read_rows_ > rows_ ? 2 : 1) * rows_ * n_embd_);
-    cur_ = fbuf(e);
-    xn_ = fbuf(e);
-    ao_ = fbuf(e);
-    fo_ = fbuf(e);
-    g_ = fbuf(ff);   // a routed expert's gate and up rows come out of one launch, back to back
-    u_ = fbuf(ff);
-    h_ = fbuf(ff);
-    d_ = fbuf((size_t) card_rows() * n_embd_);   // the routed experts of a few tokens, until they are added up
-    rl_ = fbuf(n * n_expert_);
-    logits_ = fbuf((size_t) n_vocab_);
-    if (rows_ >= kStageRows && bf16_max_ > 0) wf_ = fbuf(bf16_max_);   // a BF16 matrix as floats, for lin()
-    if (mmq_) {
+    r_ = sbuf(std::max(streams(), draft_ ? 3 : 1) * (size_t) (need_r2 ? 2 : 1) * n * n_embd_);
+    cur_ = sbuf(e);
+    xn_ = sbuf(e);
+    ao_ = sbuf(e);
+    fo_ = sbuf(e);
+    g_ = sbuf(ff);   // a routed expert's gate and up rows come out of one launch, back to back
+    u_ = sbuf(ff);
+    h_ = sbuf(ff);
+    if (!binding_prompt()) {
+        d_ = fbuf((size_t) card_rows() * n_embd_);   // permanent: the routed experts of decode/card_moe tokens
+        logits_ = fbuf((size_t) n_vocab_);
+    }
+    rl_ = sbuf(n * n_expert_);
+    if (prompt_mode && rows_ >= kStageRows && bf16_max_ > 0) wf_ = sbuf(bf16_max_);   // a BF16 matrix as floats, for lin()
+    else if (!prompt_mode) wf_ = nullptr;
+    if (mmq_ && prompt_mode) {
         const size_t rr = n * n_used_;
-        gu_ = fbuf(rr * 2 * n_ff_exp_);
-        hx_ = fbuf(rr * n_ff_exp_);
-        dx_ = fbuf(rr * n_embd_);
-        hf_ = fbuf(rr);
+        gu_ = sbuf(rr * 2 * n_ff_exp_);
+        hx_ = sbuf(rr * n_ff_exp_);
+        dx_ = sbuf(rr * n_embd_);
+        hf_ = sbuf(rr);
+    } else if (mmq_) {
+        gu_ = hx_ = dx_ = hf_ = nullptr;
+    }
+    if (prompt_loan_) {
+        xq_ = sbytes(n * kernels::native_q8_1_bytes(n_embd_));
+        q8_ = sbytes(n * kernels::native_q8_1_bytes((q_max_ + 255) / 256 * 256));
+        if (mmq_ && binding_prompt()) {
+            const size_t rr = n * n_used_;
+            mq_ = sbytes(Mmq::q8_bytes((int64_t) rr, n_embd_));
+            mq2_ = sbytes(Mmq::q8_bytes((int64_t) rr, n_ff_exp_));
+            mqu_ = mixed_tiles_ ? sbytes(Mmq::q8_bytes((int64_t) rr, n_embd_)) : nullptr;
+            mqx_ = sbytes(Mmq::q8_bytes(rows_, q_max_));
+            if (opt_moe_dedup_) {
+                mq_tokens_ = sbytes(Mmq::q8_bytes(rows_, n_embd_));
+                mqu_tokens_ = mixed_tiles_ ? sbytes(Mmq::q8_bytes(rows_, n_embd_)) : nullptr;
+            } else {
+                mq_tokens_ = mqu_tokens_ = nullptr;
+            }
+        } else if (mmq_) {
+            mq_ = mq2_ = mqu_ = mqx_ = mq_tokens_ = mqu_tokens_ = nullptr;
+        }
     }
 }
 
@@ -3220,16 +3432,43 @@ void Engine::alloc() {
     }
     if (tiles) mmq_ = std::make_unique<Mmq>();
 
-    shared_scratch();   // the first pass only counts
+    mixed_tiles_ = mixed_tiles;
+    q_max_ = std::max({n_embd_, n_ff_, n_ff_exp_, n_ff_shexp_, widest(), 256});
+    const char* dedup_env = mmq_ ? std::getenv("STRATA_MOE_DEDUP") : nullptr;
+    opt_moe_dedup_ = dedup_env && (std::strcmp(dedup_env, "1") == 0 || std::strcmp(dedup_env, "true") == 0 ||
+                                   std::strcmp(dedup_env, "on") == 0);
+    const char* pl_env = std::getenv("STRATA_POLY_PROMPT_LOAN");
+    prompt_loan_ = supports_prompt_loan() && vmm_ && !split_ && mmq_ && rows_ >= kStageRows &&
+                   !freeze_experts_ && !(pl_env && pl_env[0] == '0');
+    dec_rows_ = std::min(rows_, kStageRows - 1);
+
+    bind_prompt_ = false;
+    scratch_ = nullptr;
+    scratch_at_ = 0;
+    shared_scratch();   // the first pass only counts permanent / decode scratch
     assign_scratch();
     scratch_ = (float*) dmalloc(scratch_at_ * sizeof(float), "scratch");
+    const size_t decode_scratch_bytes = scratch_at_ * sizeof(float);
     scratch_at_ = 0;
     shared_scratch();
     assign_scratch();
 
-    const int q_max = std::max({n_embd_, n_ff_, n_ff_exp_, n_ff_shexp_, widest(), 256});
-    xq_ = dmalloc(n * kernels::native_q8_1_bytes(n_embd_), "scratch");
-    q8_ = dmalloc(n * kernels::native_q8_1_bytes((q_max + 255) / 256 * 256), "scratch");
+    if (prompt_loan_) {
+        bind_prompt_ = true;
+        prompt_scratch_ = nullptr;
+        prompt_at_ = 0;
+        shared_scratch();
+        assign_scratch();
+        prompt_bytes_ = prompt_at_ * sizeof(float);
+        vmm_reserve(prompt_map_, prompt_bytes_ + 256);
+        bind_scratch(false);
+        std::fprintf(stderr,
+                     "strata-poly: decode prompt-arena VRAM loan enabled (%.1f MiB prompt arena + %.1f MiB decode scratch; STRATA_POLY_PROMPT_LOAN=0 disables)\n",
+                     double(prompt_bytes_) / double(1ull << 20), double(decode_scratch_bytes) / double(1ull << 20));
+    } else {
+        xq_ = dmalloc(n * kernels::native_q8_1_bytes(n_embd_), "scratch");
+        q8_ = dmalloc(n * kernels::native_q8_1_bytes((q_max_ + 255) / 256 * 256), "scratch");
+    }
 
     h_r_ = (float*) hmalloc(n * streams() * n_embd_ * sizeof(float), "pinned memory");
     const size_t at_rows = (size_t) std::max({opt_.window, short_read_step(), opt_.batch + 1});   // window()'s, short_read's, step()'s
@@ -3244,18 +3483,17 @@ void Engine::alloc() {
         const size_t rr = n * n_used_,
                      tab = (3 * rr + 3 * (size_t) n_expert_ + 3 + kClasses * ((size_t) n_expert_ + 1) +
                             2 * kMaxStagedTiles * (2 * (size_t) n_expert_ + 2)) * sizeof(int32_t);
-        mq_ = dmalloc(Mmq::q8_bytes((int64_t) rr, n_embd_), "scratch");
-        mq2_ = dmalloc(Mmq::q8_bytes((int64_t) rr, n_ff_exp_), "scratch");
-        if (mixed_tiles) mqu_ = dmalloc(Mmq::q8_bytes((int64_t) rr, n_embd_), "scratch");
-        mqx_ = dmalloc(Mmq::q8_bytes(rows_, q_max), "scratch");
-        const char* dedup_env = std::getenv("STRATA_MOE_DEDUP");
-        opt_moe_dedup_ = dedup_env && (std::strcmp(dedup_env, "1") == 0 || std::strcmp(dedup_env, "true") == 0 ||
-                                       std::strcmp(dedup_env, "on") == 0);
-        if (opt_moe_dedup_) {
-            mq_tokens_ = dmalloc(Mmq::q8_bytes(rows_, n_embd_), "scratch");
-            if (mixed_tiles) mqu_tokens_ = dmalloc(Mmq::q8_bytes(rows_, n_embd_), "scratch");
-            std::fprintf(stderr, "strata-poly: MoE activation deduplication enabled\n");
+        if (!prompt_loan_) {
+            mq_ = dmalloc(Mmq::q8_bytes((int64_t) rr, n_embd_), "scratch");
+            mq2_ = dmalloc(Mmq::q8_bytes((int64_t) rr, n_ff_exp_), "scratch");
+            if (mixed_tiles) mqu_ = dmalloc(Mmq::q8_bytes((int64_t) rr, n_embd_), "scratch");
+            mqx_ = dmalloc(Mmq::q8_bytes(rows_, q_max_), "scratch");
+            if (opt_moe_dedup_) {
+                mq_tokens_ = dmalloc(Mmq::q8_bytes(rows_, n_embd_), "scratch");
+                if (mixed_tiles) mqu_tokens_ = dmalloc(Mmq::q8_bytes(rows_, n_embd_), "scratch");
+            }
         }
+        if (opt_moe_dedup_) std::fprintf(stderr, "strata-poly: MoE activation deduplication enabled\n");
         d_ids_ = (int32_t*) dmalloc(rr * sizeof(int32_t), "scratch");
         d_wts_ = (float*) dmalloc(rr * sizeof(float), "scratch");
         h_ids_ = (int32_t*) hmalloc(rr * sizeof(int32_t), "pinned memory");
@@ -5071,6 +5309,8 @@ void Engine::run(const int32_t* tokens, int n) {
     if (pos_ + n > opt_.max_context)
         throw std::runtime_error("the context is full (" + std::to_string(opt_.max_context) + " tokens)");
     cover(pos_ + n);
+    if (n >= kStageRows && prompt_loan_ && !prompt_lent_) take_prompt_arena();
+    else if (n < kStageRows && prompt_lent_ && !in_read_) end_read();
 
     // h_r_ and h_cpu_ may still be the source of the previous call's copies
     ck(cudaStreamSynchronize(cs(st_)), "eval");
@@ -5109,7 +5349,7 @@ void Engine::run(const int32_t* tokens, int n) {
     // when the rows outgrow what it was sized for (head_key()).  A short prompt chunk with doorbell (short_pass)
     // is recorded whole via passes_ with snap_bits_ == 0, without polluting the per-layer head/tail graphs.
     const bool short_pass = !windowed_ && !block_pass_ && n > 1 && n <= short_read_step() && bell_on(n);
-    bool replay = opt_.graphs && !opt_.dump &&
+    bool replay = !prompt_lent_ && opt_.graphs && !opt_.dump &&
                   ((n <= opt_.window && (windowed_ || block_pass_ || n == 1)) || short_pass);
     for (int t = 0; t < n && replay; ++t) replay = !image_at(pos_ + t);
     const auto replayed = [&](std::vector<void*>& made, size_t key, auto&& work) {
@@ -5902,6 +6142,20 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
     }
     const int n_calls = (int) calls_.size();
     OnCard here(device_, split_);
+    struct ReadScope {
+        Engine& e;
+        bool ok = false;
+        explicit ReadScope(Engine& eng) : e(eng) { e.in_read_ = true; }
+        ~ReadScope() {
+            e.in_read_ = false;
+            if (!ok && e.prompt_lent_) {
+                try {
+                    e.end_read();
+                } catch (...) {}
+            }
+        }
+    } read_scope(*this);
+    if (prompt_loan_ && n >= kStageRows && !short_window_read) take_prompt_arena();
     cover(pos_ + n);
     // On several cards, each reads through its own layers and hands the rows on, and `turn` hears of a card's
     // turns as its share of the model's layers: [lo_, to).
@@ -5941,6 +6195,7 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
             }
         }
         behind.wait();
+        read_scope.ok = true;
         return true;
     }
     widen_stage();
@@ -5950,7 +6205,10 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
 
     ck(cudaStreamSynchronize(cs(st_)), "read");
     if (n_swap_ > 0) follow(0);
-    if (groups) return read_groups(marks, n_marks, turn, n, tokens);
+    if (groups) {
+        read_scope.ok = read_groups(marks, n_marks, turn, n, tokens);
+        return read_scope.ok;
+    }
     const size_t e_row = (size_t) n_embd_, r_row = (size_t) streams() * e_row, r_bytes = r_row * sizeof(float);
     const size_t part = (size_t) std::max(streams(), draft_ ? 3 : 1) * rows_ * e_row;   // a call's rows of r_
     float* const r0 = r_;
@@ -6067,6 +6325,7 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
     }
     pos_ = pos0 + n;
     stats_.tokens += n;
+    read_scope.ok = true;
     return true;
 }
 

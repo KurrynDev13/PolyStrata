@@ -275,12 +275,9 @@ public:
     /// window layer's rows among it.  The caller goes back to a state saved before (load_state()) or resets.
     bool read(const int32_t* tokens, int n, const Mark* marks = nullptr, int n_marks = 0,
               const std::function<bool(int, int)>* turn = nullptr);
-    /// The prompt's reads are done: the expert cache takes back what Options::stage_read_mib lent the staging
-    /// buffer.  window() and step() do it too, if the caller has not.
-    void end_read() {
-        if (stage_lent_) narrow_stage();
-        if (carry_lent_) carry_give();
-    }
+    /// The prompt's reads are done: the expert cache takes back what Options::stage_read_mib and the decode prompt
+    /// loan lent the staging and prompt buffers.  window() and step() do it too, if the caller has not.
+    void end_read();
 
     /// Whether the architecture reads pictures.
     virtual bool sees() const { return false; }
@@ -559,6 +556,8 @@ protected:
     virtual void save_run(int step, int64_t pos, uint8_t* dst) { save_layer(step, pos, dst); }
     /// Text-only embedding normalization applied inside input() when the row is not an image.
     virtual void norm_text_embed(float* dst) const { (void) dst; }
+    /// Whether the architecture supports loaning idle prompt-batch scratch & staging VRAM to experts during decode.
+    virtual bool supports_prompt_loan() const { return false; }
 
     // ---- what it builds on ----
     /// Whether layer il is this engine's: one of [lo_, hi_), or the draft block on the card that ends the model.
@@ -633,6 +632,10 @@ protected:
     void embed(int32_t token, float* dst) const;
     void dbg(const char* name, int il, const float* dev, int n);
     float* fbuf(size_t n);
+    float* sbuf(size_t n);
+    void* sbytes(size_t bytes);
+    int scratch_rows() const { return prompt_loan_ && !bind_prompt_ ? dec_rows_ : rows_; }
+    bool binding_prompt() const { return bind_prompt_; }
     int room(int n) const;
     int room_key(int n) const;
     void* dmalloc(size_t bytes, const char* what);
@@ -960,6 +963,19 @@ protected:
     bool carry_lent_ = false;
     float* carry_take(size_t bytes, size_t most);
     void carry_give();
+    bool prompt_loan_ = false;                    ///< decode loans prompt-batch scratch + stage_narrow_ VRAM to experts
+    bool prompt_lent_ = false;                    ///< prompt_map_ + stage_map_ are currently mapped for a prompt
+    bool bind_prompt_ = false;                    ///< sbuf()/sbytes() target prompt_map_ instead of permanent decode scratch_
+    bool in_read_ = false;                        ///< inside Engine::read()
+    int dec_rows_ = 1;                            ///< decode scratch row capacity (< kStageRows)
+    bool mixed_tiles_ = false;
+    int q_max_ = 256;
+    Mapped prompt_map_;                           ///< VMM reservation for prompt-only + prompt-sized scratch
+    size_t prompt_bytes_ = 0, prompt_cut_ = 0;
+    size_t prompt_at_ = 0;
+    float* prompt_scratch_ = nullptr;
+    void bind_scratch(bool prompt);
+    void take_prompt_arena();
     bool read_groups(const Mark* marks, int n_marks, const std::function<bool(int, int)>* turn, int n, const int32_t* tokens);
     void embed_rows(const int32_t* tokens, int64_t pos, int m, float* dst);
     std::vector<int32_t> ids_, count_, first_, group_, round_, round_row_;

@@ -648,7 +648,7 @@ void Inkling2::alloc_caches() {
     chunk_batch_ = std::min(rows_, 64);
     chunk_dec_ = (int) std::clamp<size_t>(
         (size_t(8) << 20) / std::max<size_t>(1, (size_t) n_head_ * n_splits_max * (head_dim_ + 2)), 1,
-        (size_t) std::min(rows_, kStageRows - 1));
+        (size_t) std::min({rows_, kStageRows - 1, 16}));
 }
 
 int Inkling2::widest() const {
@@ -658,90 +658,99 @@ int Inkling2::widest() const {
 }
 
 void Inkling2::assign_scratch() {
-    const size_t n = (size_t) rows_;
+    const size_t n = (size_t) scratch_rows();
+    const bool prompt_mode = !prompt_loan_ || binding_prompt();
     const size_t n_d = dspark_ ? std::max(n, (size_t) dspark_block_) : n;
     const size_t heads = n_d * n_head_ * head_dim_;
     const size_t kv = n_d * n_kv_ * head_dim_;
-    inputs_buf_ = fbuf(3 * n * n_embd_);
-    msg_ = fbuf(4 * n * n_embd_);
+    inputs_buf_ = sbuf(3 * n * n_embd_);
+    msg_ = sbuf(4 * n * n_embd_);
     const size_t max_fused = std::min<size_t>(n, (size_t) kStageRows - 1);
     const size_t qf_cols = 2 * (size_t) n_head_ * head_dim_ + (size_t) n_rel_ * n_head_ + (size_t) n_head_;
     const size_t qf_stride = (qf_cols + 63) & ~size_t(63);
     const size_t ctrl_n = std::max(4 * n * n_embd_, max_fused * (qf_stride + 2 * (size_t) n_kv_ * head_dim_));
-    float* ctrl_arena = fbuf(ctrl_n);
+    float* ctrl_arena = sbuf(ctrl_n);
     ctrl_cat_ = ctrl_arena;
     ctrl_g_ = ctrl_arena + n * 2 * n_embd_;
-    ctrl_r_ = fbuf(3 * n * gate_rank_);
-    ctrl_f_ = fbuf(n * n_embd_);
+    ctrl_r_ = sbuf(3 * n * gate_rank_);
+    ctrl_f_ = sbuf(n * n_embd_);
     q_fused_buf_ = ctrl_arena;
     kv_fused_buf_ = ctrl_arena + max_fused * qf_stride;
 
-    qraw_ = fbuf(heads);
-    q_ = fbuf(heads);
-    kraw_ = fbuf(kv);
-    k_ = fbuf(kv);
-    v_ = fbuf(kv);
-    r_raw_ = fbuf(n * n_head_ * n_rel_);
-    r_cur_ = fbuf(n * n_head_ * n_rel_);
-    dyn_ = fbuf(n * l_conv_ * n_kv_);
-    sinks_ = fbuf(n * n_head_);
-    gate_ = fbuf(heads);
-    att_ = fbuf(heads);
+    qraw_ = sbuf(heads);
+    q_ = sbuf(heads);
+    kraw_ = sbuf(kv);
+    k_ = sbuf(kv);
+    v_ = sbuf(kv);
+    r_raw_ = sbuf(n * n_head_ * n_rel_);
+    r_cur_ = sbuf(n * n_head_ * n_rel_);
+    dyn_ = sbuf(n * l_conv_ * n_kv_);
+    sinks_ = sbuf(n * n_head_);
+    gate_ = sbuf(heads);
+    att_ = sbuf(heads);
 
     const size_t max_ext = (size_t) std::max(window_, n_rel_extent_);
-    table_ = fbuf((size_t) chunk_batch_ * n_head_ * max_ext);
+    const bool direct_only = head_dim_ == 128 && n_head_ == n_kv_ * 3 && n_rel_ == 16;
+    if (prompt_mode) table_ = sbuf((size_t) chunk_batch_ * n_head_ * max_ext);
+    else if (!direct_only) table_ = sbuf((size_t) chunk_dec_ * n_head_ * max_ext);
+    else table_ = nullptr;
 
     const size_t n_splits_max = (size_t) std::clamp((opt_.max_context + 127) / 128, 1, 64);
-    score_n_ = std::max((size_t) chunk_dec_ * n_head_ * n_splits_max * (head_dim_ + 2),
-                        (size_t) chunk_batch_ * n_head_ * 1536);
+    score_n_ = (size_t) chunk_dec_ * n_head_ * n_splits_max * (head_dim_ + 2);
+    if (prompt_mode) score_n_ = std::max(score_n_, (size_t) chunk_batch_ * n_head_ * 1536);
     if (dspark_) {
         score_n_ = std::max(score_n_, (size_t) dspark_block_ * dspark_heads_ *
                                           std::max<size_t>(1536, n_splits_max * (dspark_head_dim_ + 2)));
     }
-    score_ = fbuf(score_n_);
+    score_ = sbuf(score_n_);
 
-    const size_t ch_base = rows_ >= kStageRows ? (size_t) chunk_batch_ * n_head_ : 0;
+    const size_t ch_base = (prompt_mode && rows_ >= kStageRows) ? (size_t) chunk_batch_ * n_head_ : 0;
     const size_t ch = dspark_ ? std::max(ch_base, (size_t) dspark_block_ * dspark_heads_) : ch_base;
-    if (ch > 0) awork_ = fbuf(ch * (head_dim_ + head_dim_ / 2 + 3) + 1);
-    if (rows_ >= kStageRows &&
+    awork_ = ch > 0 ? sbuf(ch * (head_dim_ + head_dim_ / 2 + 3) + 1) : nullptr;
+    if (prompt_mode && rows_ >= kStageRows &&
         (opt_.kv_format == KvFmt::kQ8_0 || opt_.kv_format == KvFmt::kQ4_0 || opt_.kv_format == KvFmt::kK8V4)) {
         work_halves_ = kQ8WorkRows * (size_t) n_kv_ * head_dim_;
-        q8w_ = fbuf((2 * work_halves_ + 1) / 2);
+        q8w_ = sbuf((2 * work_halves_ + 1) / 2);
+    } else {
+        work_halves_ = 0;
+        q8w_ = nullptr;
     }
     if (dspark_) {
         const size_t blk = (size_t) dspark_block_;
         const size_t q_dim = (size_t) dspark_heads_ * dspark_head_dim_;
         const size_t kv_dim = (size_t) dspark_kv_ * dspark_head_dim_;
         const int dv = draft_rows();
-        d_taps_ = fbuf((size_t) std::max(rows_, opt_.window) * 3 * n_embd_);
-        d_f_rnn_ = fbuf((size_t) n_embd_);
-        d_blk_x_ = fbuf(blk * n_embd_);
-        d_blk_xn_ = fbuf(blk * n_embd_);
-        d_blk_h_ = fbuf((blk - 1) * n_embd_);
-        d_blk_qkv_ = fbuf(blk * (q_dim + 2 * kv_dim));
-        d_blk_qraw_ = fbuf(blk * q_dim);
-        d_blk_kraw_ = fbuf(blk * kv_dim);
-        d_blk_attn_ = fbuf(blk * n_embd_);
-        d_blk_gate_ = fbuf(blk * 2 * dspark_ff_);
-        dspark_mask_tiled_ = fbuf((blk - 1) * n_embd_);
-        if (dspark_proxy_) {
-            d_head_approx_ = fbuf((blk - 1) * (size_t) inkling_dspark_screen_rows(dv));
-            d_head_scr_ = (void*) fbuf((inkling_dspark_head_scratch_bytes(dv) + 3) / 4);
-            d_rnn_lat_q_ = (void*) fbuf(((blk - 1) * kernels::native_q8_1_bytes(dspark_rank_) + 3) / 4);
-            d_w1_row_ = (uint16_t*) fbuf(((size_t) dspark_rank_ * sizeof(uint16_t) + 3) / 4);
-        } else {
-            d_base_logits_ = fbuf((blk - 1) * (size_t) dv);
-            d_markov_bias_ = fbuf((size_t) dv);
+        d_taps_ = sbuf((size_t) std::max(n, (size_t) opt_.window) * 3 * n_embd_);
+        if (!binding_prompt()) {
+            d_f_rnn_ = fbuf((size_t) n_embd_);
+            d_blk_x_ = fbuf(blk * n_embd_);
+            d_blk_xn_ = fbuf(blk * n_embd_);
+            d_blk_h_ = fbuf((blk - 1) * n_embd_);
+            d_blk_qkv_ = fbuf(blk * (q_dim + 2 * kv_dim));
+            d_blk_qraw_ = fbuf(blk * q_dim);
+            d_blk_kraw_ = fbuf(blk * kv_dim);
+            d_blk_attn_ = fbuf(blk * n_embd_);
+            d_blk_gate_ = fbuf(blk * 2 * dspark_ff_);
+            dspark_mask_tiled_ = fbuf((blk - 1) * n_embd_);
+            if (dspark_proxy_) {
+                d_head_approx_ = fbuf((blk - 1) * (size_t) inkling_dspark_screen_rows(dv));
+                d_head_scr_ = (void*) fbuf((inkling_dspark_head_scratch_bytes(dv) + 3) / 4);
+                d_rnn_lat_q_ = (void*) fbuf(((blk - 1) * kernels::native_q8_1_bytes(dspark_rank_) + 3) / 4);
+                d_w1_row_ = (uint16_t*) fbuf(((size_t) dspark_rank_ * sizeof(uint16_t) + 3) / 4);
+            } else {
+                d_base_logits_ = fbuf((blk - 1) * (size_t) dv);
+                d_markov_bias_ = fbuf((size_t) dv);
+            }
+            d_rnn_in_ = fbuf((size_t) (2 * dspark_rank_));
+            d_rnn_gates_ = fbuf((size_t) (3 * dspark_rank_));
+            d_rnn_h_gates_ = fbuf((blk - 1) * (size_t) (3 * dspark_rank_));
+            d_rnn_f_gates_ = fbuf((size_t) (3 * dspark_rank_));
+            d_rnn_state_ = fbuf((size_t) dspark_rank_);
+            d_rnn_latent_ = fbuf((size_t) dspark_rank_);
+            d_blk_xq_ = (void*) fbuf((blk * kernels::native_q8_1_bytes(n_embd_) + 3) / 4);
+            d_blk_q8ff_ = (void*) fbuf((blk * kernels::native_q8_1_bytes(dspark_ff_) + 3) / 4);
+            d_block_picks_ = (Likeliest*) fbuf(2 * blk);
         }
-        d_rnn_in_ = fbuf((size_t) (2 * dspark_rank_));
-        d_rnn_gates_ = fbuf((size_t) (3 * dspark_rank_));
-        d_rnn_h_gates_ = fbuf((blk - 1) * (size_t) (3 * dspark_rank_));
-        d_rnn_f_gates_ = fbuf((size_t) (3 * dspark_rank_));
-        d_rnn_state_ = fbuf((size_t) dspark_rank_);
-        d_rnn_latent_ = fbuf((size_t) dspark_rank_);
-        d_blk_xq_ = (void*) fbuf((blk * kernels::native_q8_1_bytes(n_embd_) + 3) / 4);
-        d_blk_q8ff_ = (void*) fbuf((blk * kernels::native_q8_1_bytes(dspark_ff_) + 3) / 4);
-        d_block_picks_ = (Likeliest*) fbuf(2 * blk);
     }
 }
 
