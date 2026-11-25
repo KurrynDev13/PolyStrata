@@ -1945,11 +1945,17 @@ void store_q4_at(const float* x, uint8_t* codes, uint16_t* scales, int n, const 
 }
 
 static bool ink_mma_dec_enabled();
+static bool ink_mma_v2_enabled();
 static void launch_inkling_attend_mma(bool whole, const float* q, const uint16_t* kcache, const uint16_t* vcache,
                                       const float* sinks, int n_extent, long long pos, int rows, float* partials,
                                       int n_splits, int dim, int n_head, int kv_heads, float scale, int window,
                                       int ring, const long long* at, Kvq8 kq8, Kvq8 vq8, Kvq4 kq4, Kvq4 vq4,
                                       const float* r_cur, const float* rel_bias, void* stream);
+static bool launch_inkling_attend_mma_v2(bool whole, const float* q, const uint16_t* kcache, const uint16_t* vcache,
+                                         const float* sinks, int n_extent, long long pos, int rows, float* partials,
+                                         int n_splits, int dim, int n_head, int kv_heads, float scale, int window,
+                                         int ring, const long long* at, Kvq8 kq8, Kvq8 vq8, Kvq4 kq4, Kvq4 vq4,
+                                         const float* r_cur, const float* rel_bias, void* stream);
 
 void inkling_attend(const float* q, const uint16_t* kcache, const uint16_t* vcache, const float* table,
                     const float* sinks, int n_extent, int64_t pos, int rows, float* score, int chunk, float* out,
@@ -1967,9 +1973,14 @@ void inkling_attend(const float* q, const uint16_t* kcache, const uint16_t* vcac
         if (!r_cur || !rel_bias)
             throw std::invalid_argument("inkling_attend: direct relative bias requires dim=128, n_head=3*kv_heads, n_rel=16");
         const int n_splits_mma = std::clamp((span_mma + 63) / 64, 1, MAX_SPLITS);
-        launch_inkling_attend_mma(false, q, kcache, vcache, sinks, n_extent, (long long) pos, rows, score,
-                                  n_splits_mma, dim, n_head, kv_heads, scale, window, ring, at, kq8, vq8, kq4, vq4,
-                                  r_cur, rel_bias, stream);
+        if (!ink_mma_v2_enabled() ||
+            !launch_inkling_attend_mma_v2(false, q, kcache, vcache, sinks, n_extent, (long long) pos, rows, score,
+                                          n_splits_mma, dim, n_head, kv_heads, scale, window, ring, at, kq8, vq8,
+                                          kq4, vq4, r_cur, rel_bias, stream)) {
+            launch_inkling_attend_mma(false, q, kcache, vcache, sinks, n_extent, (long long) pos, rows, score,
+                                      n_splits_mma, dim, n_head, kv_heads, scale, window, ring, at, kq8, vq8, kq4,
+                                      vq4, r_cur, rel_bias, stream);
+        }
         inkling_attend_join_kernel<true, false, true><<<dim3(n_head, rows), dim, 0, cs(stream)>>>(
             score, out, n_splits_mma, dim, n_head, (long long) pos, window, at, gate, (Q81Block*) out_q8);
         ck("inkling_attend");
@@ -2008,9 +2019,14 @@ void inkling_dspark_attend(const float* q, const uint16_t* kcache, const uint16_
     const int span = window > 0 ? std::min<int>((int) (max_pos + 1), window + rows - 1) : (int) (max_pos + 1);
     if (rows >= 2 && span >= 64 && dim == 128 && n_head == kv_heads * 3 && ink_mma_dec_enabled()) {
         const int n_splits_mma = std::clamp((span + 63) / 64, 1, MAX_SPLITS);
-        launch_inkling_attend_mma(true, q, kcache, vcache, nullptr, 0, (long long) pos, rows, score,
-                                  n_splits_mma, dim, n_head, kv_heads, scale, window, ring, at, kq8, vq8, kq4, vq4,
-                                  nullptr, nullptr, stream);
+        if (!ink_mma_v2_enabled() ||
+            !launch_inkling_attend_mma_v2(true, q, kcache, vcache, nullptr, 0, (long long) pos, rows, score,
+                                          n_splits_mma, dim, n_head, kv_heads, scale, window, ring, at, kq8, vq8,
+                                          kq4, vq4, nullptr, nullptr, stream)) {
+            launch_inkling_attend_mma(true, q, kcache, vcache, nullptr, 0, (long long) pos, rows, score,
+                                      n_splits_mma, dim, n_head, kv_heads, scale, window, ring, at, kq8, vq8, kq4,
+                                      vq4, nullptr, nullptr, stream);
+        }
         inkling_attend_join_kernel<false, true, true><<<dim3(n_head, rows), dim, 0, cs(stream)>>>(
             score, out, n_splits_mma, dim, n_head, (long long) pos, window, at, nullptr, nullptr);
         ck("inkling_dspark_attend");
@@ -2407,6 +2423,376 @@ static void launch_inkling_attend_mma(bool whole, const float* q, const uint16_t
             q, kcache, vcache, sinks, n_extent, pos, rows, partials, n_splits, dim, n_head, kv_heads, scale, window,
             ring, at, kq8, vq8, kq4, vq4, r_cur, rel_bias);
     }
+}
+
+enum class InkKvKind { kFp16 = 0, kQ8 = 1, kQ4 = 2 };
+
+template <bool WHOLE, int NTILES, InkKvKind KFMT, InkKvKind VFMT>
+__global__ void __launch_bounds__(NTILES * 64, NTILES == 1 ? 5 : 3) inkling_attend_split_mma_v2_kernel(
+    const float* __restrict__ q, const uint16_t* __restrict__ kcache, const uint16_t* __restrict__ vcache,
+    const float* __restrict__ sinks, int n_extent, long long pos, int rows, float* __restrict__ partials,
+    int n_splits, int dim, int n_head, int kv_heads, float scale, int window, int ring,
+    const long long* __restrict__ at, Kvq8 kq8, Kvq8 vq8, Kvq4 kq4, Kvq4 vq4,
+    const float* __restrict__ r_cur, const float* __restrict__ rel_bias) {
+#if INK_FLASH
+    (void) dim;
+    constexpr int DIM = 128;
+    constexpr int CHUNK = 32;
+    constexpr int LD = DIM + 8;
+    constexpr int BM = NTILES * 16;
+    constexpr int THREADS = NTILES * 64;
+    const int s = blockIdx.x;
+    const int kv_h = blockIdx.y;
+    const int m0 = blockIdx.z * BM;
+    const int M = rows * 3;
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int gid = lane >> 2;
+    const int tig = lane & 3;
+    const int tile = warp >> 1;
+    const int d_half = warp & 1;
+    const int d0 = d_half * 64;
+
+    const long long p0 = at ? at[0] : pos;
+    long long p_min = pos;
+    long long p_max = pos + rows - 1;
+    if (at) {
+        p_min = at[0];
+        p_max = at[0];
+        for (int t = 1; t < rows; ++t) {
+            const long long qp = at[2 * t];
+            p_min = min(p_min, qp);
+            p_max = max(p_max, qp);
+        }
+    }
+    const long long lo_all = (window > 0 && p_min >= window) ? p_min - window + 1 : 0;
+    const long long hi_all = WHOLE ? (p0 + rows - 1) : p_max;
+    const int total_all = int(hi_all - lo_all) + 1;
+    const int per_split = max(CHUNK, (total_all + n_splits - 1) / n_splits);
+    const int k_begin = s * per_split;
+    const int k_end = min(total_all, k_begin + per_split);
+
+    if (k_begin >= total_all) {
+        if (tid < BM) {
+            const int m = m0 + tid;
+            if (m < M) {
+                const int t = m / 3;
+                const int h = kv_h * 3 + (m % 3);
+                float* dst = partials + (((size_t(t) * n_head + h) * n_splits + s) * (DIM + 2));
+                dst[DIM] = -INFINITY;
+                dst[DIM + 1] = 0.0f;
+            }
+        }
+        return;
+    }
+
+    __shared__ __align__(16) __half ks[CHUNK][LD];
+    __shared__ __align__(16) __half vs[CHUNK][LD];
+    __shared__ float sm_r[BM][16];
+
+    if constexpr (!WHOLE) {
+        for (int i = tid; i < BM * 16; i += THREADS) {
+            const int rm = m0 + (i >> 4);
+            const int col = i & 15;
+            float val = 0.0f;
+            if (rm < M) {
+                const int t = rm / 3;
+                const int h = kv_h * 3 + (rm % 3);
+                val = r_cur[(size_t(t) * n_head + h) * 16 + col];
+            }
+            sm_r[i >> 4][col] = val;
+        }
+    }
+
+    int q_off[2] = {0, 0};
+    int lo_off[2] = {0, 0};
+    int hi_off[2] = {-1, -1};
+    float neg_sink[2] = {0.0f, 0.0f};
+    uint32_t qa[8][4];
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int mr = m0 + tile * 16 + gid + 8 * i;
+        const float* qp = nullptr;
+        if (mr < M) {
+            const int t = mr / 3;
+            const int h = kv_h * 3 + (mr % 3);
+            const long long qp_i = at ? at[2 * t] : pos + t;
+            const long long lo_i = (window > 0 && qp_i >= window) ? qp_i - window + 1 : 0;
+            const long long hi_i = WHOLE ? (p0 + rows - 1) : qp_i;
+            q_off[i] = int(qp_i - lo_all);
+            lo_off[i] = int(lo_i - lo_all);
+            hi_off[i] = int(hi_i - lo_all);
+            if constexpr (!WHOLE) neg_sink[i] = -sinks[size_t(t) * n_head + h];
+            qp = q + (size_t(t) * n_head + h) * DIM;
+        }
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+#pragma unroll
+            for (int hi = 0; hi < 2; ++hi) {
+                const float2 x = qp ? *reinterpret_cast<const float2*>(qp + 16 * k + 8 * hi + 2 * tig)
+                                    : make_float2(0.0f, 0.0f);
+                qa[k][i + 2 * hi] = ink_h2(x.x, x.y);
+            }
+        }
+    }
+
+    float o[8][4];
+    float m[2] = {-INFINITY, -INFINITY};
+    float l[2] = {0.0f, 0.0f};
+#pragma unroll
+    for (int n = 0; n < 8; ++n) o[n][0] = o[n][1] = o[n][2] = o[n][3] = 0.0f;
+
+    const __half* kc = reinterpret_cast<const __half*>(kcache);
+    const __half* vc = reinterpret_cast<const __half*>(vcache);
+    const bool fast_ring = ring == 0 || ring >= CHUNK;
+    size_t ring_base = fast_ring ? (ring > 0 ? (size_t) ((lo_all + k_begin) % ring) : (size_t) (lo_all + k_begin)) : 0;
+
+    for (int off = k_begin; off < k_end; off += CHUNK) {
+        for (int i = tid; i < CHUNK * (DIM / 8); i += THREADS) {
+            const int r = i >> 4;
+            const int s_blk = i & 15;
+            const int blk = s_blk >> 2;
+            const int off_in_blk = (s_blk & 3) * 4;
+            const int off_key = off + r;
+            const bool valid_key = off_key < k_end;
+            size_t row_idx = 0;
+            if (valid_key) {
+                if (fast_ring) {
+                    row_idx = ring_base + (size_t) r;
+                    if (ring > 0 && row_idx >= (size_t) ring) row_idx -= (size_t) ring;
+                } else {
+                    const long long key = lo_all + off_key;
+                    row_idx = (size_t) (ring > 0 ? key % ring : key);
+                }
+            }
+            const size_t head_row = row_idx * (size_t) kv_heads + (size_t) kv_h;
+            const size_t scale_idx = head_row * (DIM >> 5) + blk;
+
+            __half* k_dst = ks[r];
+            if constexpr (KFMT == InkKvKind::kFp16) {
+                ink_cp16(k_dst + s_blk * 8, kc + head_row * DIM + s_blk * 8, valid_key);
+            } else if (!valid_key) {
+                *reinterpret_cast<uint4*>(k_dst + s_blk * 8) = make_uint4(0, 0, 0, 0);
+            } else if constexpr (KFMT == InkKvKind::kQ8) {
+                const float sc = __half2float(__ushort_as_half(kq8.scales[scale_idx]));
+                const char4 c0 = *reinterpret_cast<const char4*>(kq8.codes + head_row * DIM + s_blk * 8);
+                const char4 c1 = *reinterpret_cast<const char4*>(kq8.codes + head_row * DIM + s_blk * 8 + 4);
+                half2* h2 = reinterpret_cast<half2*>(k_dst + s_blk * 8);
+                h2[0] = __floats2half2_rn(float(c0.x) * sc, float(c0.y) * sc);
+                h2[1] = __floats2half2_rn(float(c0.z) * sc, float(c0.w) * sc);
+                h2[2] = __floats2half2_rn(float(c1.x) * sc, float(c1.y) * sc);
+                h2[3] = __floats2half2_rn(float(c1.z) * sc, float(c1.w) * sc);
+            } else {
+                const float sc = __half2float(__ushort_as_half(kq4.scales[scale_idx]));
+                const uint32_t p4 =
+                    *reinterpret_cast<const uint32_t*>(kq4.codes + head_row * (DIM >> 1) + blk * 16 + off_in_blk);
+                const int b0 = int(p4 & 0xffu), b1 = int((p4 >> 8) & 0xffu), b2 = int((p4 >> 16) & 0xffu),
+                          b3 = int(p4 >> 24);
+                half2* lo_h2 = reinterpret_cast<half2*>(k_dst + blk * 32 + off_in_blk);
+                half2* hi_h2 = reinterpret_cast<half2*>(k_dst + blk * 32 + off_in_blk + 16);
+                lo_h2[0] = __floats2half2_rn(float((b0 & 0x0f) - 8) * sc, float((b1 & 0x0f) - 8) * sc);
+                lo_h2[1] = __floats2half2_rn(float((b2 & 0x0f) - 8) * sc, float((b3 & 0x0f) - 8) * sc);
+                hi_h2[0] = __floats2half2_rn(float((b0 >> 4) - 8) * sc, float((b1 >> 4) - 8) * sc);
+                hi_h2[1] = __floats2half2_rn(float((b2 >> 4) - 8) * sc, float((b3 >> 4) - 8) * sc);
+            }
+
+            __half* v_dst = vs[r];
+            if constexpr (VFMT == InkKvKind::kFp16) {
+                ink_cp16(v_dst + s_blk * 8, vc + head_row * DIM + s_blk * 8, valid_key);
+            } else if (!valid_key) {
+                *reinterpret_cast<uint4*>(v_dst + s_blk * 8) = make_uint4(0, 0, 0, 0);
+            } else if constexpr (VFMT == InkKvKind::kQ8) {
+                const float sc = __half2float(__ushort_as_half(vq8.scales[scale_idx]));
+                const char4 c0 = *reinterpret_cast<const char4*>(vq8.codes + head_row * DIM + s_blk * 8);
+                const char4 c1 = *reinterpret_cast<const char4*>(vq8.codes + head_row * DIM + s_blk * 8 + 4);
+                half2* h2 = reinterpret_cast<half2*>(v_dst + s_blk * 8);
+                h2[0] = __floats2half2_rn(float(c0.x) * sc, float(c0.y) * sc);
+                h2[1] = __floats2half2_rn(float(c0.z) * sc, float(c0.w) * sc);
+                h2[2] = __floats2half2_rn(float(c1.x) * sc, float(c1.y) * sc);
+                h2[3] = __floats2half2_rn(float(c1.z) * sc, float(c1.w) * sc);
+            } else {
+                const float sc = __half2float(__ushort_as_half(vq4.scales[scale_idx]));
+                const uint32_t p4 =
+                    *reinterpret_cast<const uint32_t*>(vq4.codes + head_row * (DIM >> 1) + blk * 16 + off_in_blk);
+                const int b0 = int(p4 & 0xffu), b1 = int((p4 >> 8) & 0xffu), b2 = int((p4 >> 16) & 0xffu),
+                          b3 = int(p4 >> 24);
+                half2* lo_h2 = reinterpret_cast<half2*>(v_dst + blk * 32 + off_in_blk);
+                half2* hi_h2 = reinterpret_cast<half2*>(v_dst + blk * 32 + off_in_blk + 16);
+                lo_h2[0] = __floats2half2_rn(float((b0 & 0x0f) - 8) * sc, float((b1 & 0x0f) - 8) * sc);
+                lo_h2[1] = __floats2half2_rn(float((b2 & 0x0f) - 8) * sc, float((b3 & 0x0f) - 8) * sc);
+                hi_h2[0] = __floats2half2_rn(float((b0 >> 4) - 8) * sc, float((b1 >> 4) - 8) * sc);
+                hi_h2[1] = __floats2half2_rn(float((b2 >> 4) - 8) * sc, float((b3 >> 4) - 8) * sc);
+            }
+        }
+        if constexpr (KFMT == InkKvKind::kFp16 || VFMT == InkKvKind::kFp16) {
+            ink_cp_commit();
+            ink_cp_wait<0>();
+        }
+        __syncthreads();
+
+        float s_reg[4][4];
+#pragma unroll
+        for (int n = 0; n < 4; ++n) {
+            s_reg[n][0] = s_reg[n][1] = s_reg[n][2] = s_reg[n][3] = 0.0f;
+#pragma unroll
+            for (int k = 0; k < 8; k += 2) {
+                uint32_t b[4];
+                ink_ldsm4(b, &ks[8 * n + (lane & 7)][16 * k + 8 * (lane >> 3)], false);
+                ink_mma(s_reg[n], qa[k], b);
+                ink_mma(s_reg[n], qa[k + 1], b + 2);
+            }
+        }
+
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const bool row_live = (m0 + tile * 16 + gid + 8 * i) < M;
+            float mx = -INFINITY;
+#pragma unroll
+            for (int n = 0; n < 4; ++n) {
+#pragma unroll
+                for (int j = 2 * i; j < 2 * i + 2; ++j) {
+                    const int off_key = off + 8 * n + 2 * tig + (j & 1);
+                    float v = -INFINITY;
+                    if (row_live && off_key < k_end && off_key >= lo_off[i] && off_key <= hi_off[i]) {
+                        v = s_reg[n][j] * scale;
+                        if constexpr (!WHOLE) {
+                            const int dist = q_off[i] - off_key;
+                            float add = 0.0f;
+                            if (dist < n_extent) {
+                                const float4* col = reinterpret_cast<const float4*>(rel_bias + size_t(dist) * 16);
+                                const float* rr = sm_r[tile * 16 + gid + 8 * i];
+#pragma unroll
+                                for (int q4i = 0; q4i < 4; ++q4i) {
+                                    const float4 c4 = __ldg(col + q4i);
+                                    add += c4.x * rr[4 * q4i] + c4.y * rr[4 * q4i + 1] + c4.z * rr[4 * q4i + 2] +
+                                           c4.w * rr[4 * q4i + 3];
+                                }
+                            }
+                            v += add + neg_sink[i];
+                        }
+                    }
+                    s_reg[n][j] = v;
+                    mx = fmaxf(mx, v);
+                }
+            }
+            mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 1));
+            mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 2));
+            const float now = fmaxf(m[i], mx);
+            const float base = now == -INFINITY ? 0.0f : now;
+            const float f = expf(m[i] - base);
+            m[i] = now;
+            l[i] *= f;
+            if (__any_sync(0xffffffffu, f != 1.0f)) {
+#pragma unroll
+                for (int n = 0; n < 8; ++n) {
+                    o[n][2 * i] *= f;
+                    o[n][2 * i + 1] *= f;
+                }
+            }
+#pragma unroll
+            for (int n = 0; n < 4; ++n) {
+#pragma unroll
+                for (int j = 2 * i; j < 2 * i + 2; ++j) {
+                    s_reg[n][j] = __half2float(__float2half(expf(s_reg[n][j] - base)));
+                    l[i] += s_reg[n][j];
+                }
+            }
+        }
+        const uint32_t pa[2][4] = {
+            {ink_h2(s_reg[0][0], s_reg[0][1]), ink_h2(s_reg[0][2], s_reg[0][3]),
+             ink_h2(s_reg[1][0], s_reg[1][1]), ink_h2(s_reg[1][2], s_reg[1][3])},
+            {ink_h2(s_reg[2][0], s_reg[2][1]), ink_h2(s_reg[2][2], s_reg[2][3]),
+             ink_h2(s_reg[3][0], s_reg[3][1]), ink_h2(s_reg[3][2], s_reg[3][3])},
+        };
+
+#pragma unroll
+        for (int kk = 0; kk < 2; ++kk) {
+#pragma unroll
+            for (int n = 0; n < 8; n += 2) {
+                uint32_t b[4];
+                ink_ldsm4(b, &vs[16 * kk + (lane & 7) + 8 * ((lane >> 3) & 1)][d0 + 8 * n + 8 * (lane >> 4)], true);
+                ink_mma(o[n], pa[kk], b);
+                ink_mma(o[n + 1], pa[kk], b + 2);
+            }
+        }
+        if (fast_ring) {
+            ring_base += CHUNK;
+            if (ring > 0 && ring_base >= (size_t) ring) ring_base -= (size_t) ring;
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        l[i] += __shfl_xor_sync(0xffffffffu, l[i], 1);
+        l[i] += __shfl_xor_sync(0xffffffffu, l[i], 2);
+        const int mr = m0 + tile * 16 + gid + 8 * i;
+        if (mr < M) {
+            const int t = mr / 3;
+            const int h = kv_h * 3 + (mr % 3);
+            float* dst = partials + (((size_t(t) * n_head + h) * n_splits + s) * (DIM + 2));
+#pragma unroll
+            for (int n = 0; n < 8; ++n) {
+                *reinterpret_cast<float2*>(&dst[d0 + 8 * n + 2 * tig]) = make_float2(o[n][2 * i], o[n][2 * i + 1]);
+            }
+            if (d_half == 0 && tig == 0) *reinterpret_cast<float2*>(dst + DIM) = make_float2(m[i], l[i]);
+        }
+    }
+#else
+    (void) q; (void) kcache; (void) vcache; (void) sinks; (void) n_extent; (void) pos; (void) rows;
+    (void) partials; (void) n_splits; (void) dim; (void) n_head; (void) kv_heads; (void) scale;
+    (void) window; (void) ring; (void) at; (void) kq8; (void) vq8; (void) kq4; (void) vq4;
+    (void) r_cur; (void) rel_bias;
+#endif
+}
+
+static std::atomic<int> g_mma_v2_override{-1};
+void inkling_set_mma_v2(int mode) { g_mma_v2_override.store(mode, std::memory_order_relaxed); }
+
+static bool ink_mma_v2_enabled() {
+#if defined(__HIPCC__)
+    return false;
+#else
+    const int ov = g_mma_v2_override.load(std::memory_order_relaxed);
+    if (ov >= 0) return ov > 0;
+    static const bool enabled = [] {
+        const char* v = std::getenv("STRATA_INK_MMA_V2");
+        if (v && v[0] == '0') return false;
+        cudaFuncAttributes f{};
+        return cudaFuncGetAttributes(&f, inkling_attend_split_mma_v2_kernel<false, 1, InkKvKind::kQ8, InkKvKind::kQ4>) ==
+                   cudaSuccess &&
+               f.ptxVersion >= 80;
+    }();
+    return enabled;
+#endif
+}
+
+static bool launch_inkling_attend_mma_v2(bool whole, const float* q, const uint16_t* kcache, const uint16_t* vcache,
+                                         const float* sinks, int n_extent, long long pos, int rows, float* partials,
+                                         int n_splits, int dim, int n_head, int kv_heads, float scale, int window,
+                                         int ring, const long long* at, Kvq8 kq8, Kvq8 vq8, Kvq4 kq4, Kvq4 vq4,
+                                         const float* r_cur, const float* rel_bias, void* stream) {
+    const InkKvKind kf = kq8.codes ? InkKvKind::kQ8 : (kq4.codes ? InkKvKind::kQ4 : InkKvKind::kFp16);
+    const InkKvKind vf = vq8.codes ? InkKvKind::kQ8 : (vq4.codes ? InkKvKind::kQ4 : InkKvKind::kFp16);
+    const bool two_tiles = rows >= 6;
+    const dim3 g(n_splits, kv_heads, (rows * 3 + (two_tiles ? 31 : 15)) / (two_tiles ? 32 : 16));
+    const int threads = two_tiles ? 128 : 64;
+    auto go = [&]<bool W, int NT, InkKvKind K, InkKvKind V>() {
+        inkling_attend_split_mma_v2_kernel<W, NT, K, V><<<g, threads, 0, cs(stream)>>>(
+            q, kcache, vcache, W ? nullptr : sinks, n_extent, pos, rows, partials, n_splits, dim, n_head, kv_heads,
+            scale, window, ring, at, kq8, vq8, kq4, vq4, W ? nullptr : r_cur, W ? nullptr : rel_bias);
+    };
+    auto disp_fmt = [&]<bool W, int NT>() -> bool {
+        if (kf == InkKvKind::kQ8 && vf == InkKvKind::kQ4) go.template operator()<W, NT, InkKvKind::kQ8, InkKvKind::kQ4>();
+        else if (kf == InkKvKind::kFp16 && vf == InkKvKind::kFp16) go.template operator()<W, NT, InkKvKind::kFp16, InkKvKind::kFp16>();
+        else if (kf == InkKvKind::kQ8 && vf == InkKvKind::kQ8) go.template operator()<W, NT, InkKvKind::kQ8, InkKvKind::kQ8>();
+        else if (kf == InkKvKind::kQ4 && vf == InkKvKind::kQ4) go.template operator()<W, NT, InkKvKind::kQ4, InkKvKind::kQ4>();
+        else return false;
+        return true;
+    };
+    if (whole) return two_tiles ? disp_fmt.template operator()<true, 2>() : disp_fmt.template operator()<true, 1>();
+    return two_tiles ? disp_fmt.template operator()<false, 2>() : disp_fmt.template operator()<false, 1>();
 }
 
 constexpr int kMaxPer = 4;

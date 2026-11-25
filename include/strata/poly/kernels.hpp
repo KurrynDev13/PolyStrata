@@ -671,6 +671,8 @@ void inkling_dspark_attend(const float* q, const uint16_t* kcache, const uint16_
                            float* score, float* out, int dim, int n_head, int kv_heads, float scale, void* stream,
                            int window = 0, int ring = 0, const long long* at = nullptr, int room = 0,
                            Kvq8 kq8 = {}, Kvq8 vq8 = {}, Kvq4 kq4 = {}, Kvq4 vq4 = {});
+/// Override F8 v2 two-tile register-softmax MMA decode path (-1 = STRATA_INK_MMA_V2 env default, 0 = v1, 1 = v2).
+void inkling_set_mma_v2(int mode);
 
 /// 2-bit head screening proxy + mapped pinned-host fold/w1 exact rescore for Inkling 2 DSpark (Basalt head_proxy).
 struct DsparkHeadArgs {

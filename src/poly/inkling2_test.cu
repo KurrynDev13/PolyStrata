@@ -1943,7 +1943,7 @@ int test_decode_fusions() {
     // F8. Shared-KV MMA multi-row decode attention (inkling_attend table == nullptr vs scalar table != nullptr)
     {
         auto run_f8 = [&](const char* label, int rows, int pos, int window, int ring, int n_extent, bool use_at,
-                          int kv_mode) {
+                          int kv_mode, int v2_mode, bool whole = false) {
             const int n_head = 24, kv_heads = 8, dim = 128, n_rel = 16;
             const int width = kv_heads * dim;
             const float scale = 1.0f / std::sqrt((float) dim);
@@ -1961,7 +1961,7 @@ int test_decode_fusions() {
             float *d_kr = dev(k_raw), *d_vr = dev(v_raw);
             uint16_t *d_k16 = nullptr, *d_v16 = nullptr;
             int8_t *d_kc = nullptr, *d_vc = nullptr;
-            uint8_t *d_v4 = nullptr;
+            uint8_t *d_k4 = nullptr, *d_v4 = nullptr;
             uint16_t *d_ks = nullptr, *d_vs = nullptr;
             if (kv_mode == 0) {
                 cudaMalloc(&d_k16, (size_t) kv_len * width * sizeof(uint16_t));
@@ -1969,21 +1969,29 @@ int test_decode_fusions() {
                 store_f16(d_kr, d_k16, width, 0, kv_len, nullptr);
                 store_f16(d_vr, d_v16, width, 0, kv_len, nullptr);
             } else {
-                cudaMalloc(&d_kc, (size_t) kv_len * width);
                 cudaMalloc(&d_ks, (size_t) kv_len * (width / 32) * sizeof(uint16_t));
                 cudaMalloc(&d_vs, (size_t) kv_len * (width / 32) * sizeof(uint16_t));
-                store_q8(d_kr, d_kc, d_ks, width, 0, kv_len, nullptr);
-                if (kv_mode == 1) {
-                    cudaMalloc(&d_vc, (size_t) kv_len * width);
-                    store_q8(d_vr, d_vc, d_vs, width, 0, kv_len, nullptr);
-                } else {
+                if (kv_mode == 3) {
+                    cudaMalloc(&d_k4, (size_t) kv_len * (width / 2));
                     cudaMalloc(&d_v4, (size_t) kv_len * (width / 2));
+                    store_q4(d_kr, d_k4, d_ks, width, 0, kv_len, nullptr);
                     store_q4(d_vr, d_v4, d_vs, width, 0, kv_len, nullptr);
+                } else {
+                    cudaMalloc(&d_kc, (size_t) kv_len * width);
+                    store_q8(d_kr, d_kc, d_ks, width, 0, kv_len, nullptr);
+                    if (kv_mode == 1) {
+                        cudaMalloc(&d_vc, (size_t) kv_len * width);
+                        store_q8(d_vr, d_vc, d_vs, width, 0, kv_len, nullptr);
+                    } else {
+                        cudaMalloc(&d_v4, (size_t) kv_len * (width / 2));
+                        store_q4(d_vr, d_v4, d_vs, width, 0, kv_len, nullptr);
+                    }
                 }
             }
-            Kvq8 kq8 = kv_mode >= 1 ? Kvq8{d_kc, d_ks} : Kvq8{};
+            Kvq8 kq8 = (kv_mode == 1 || kv_mode == 2) ? Kvq8{d_kc, d_ks} : Kvq8{};
             Kvq8 vq8 = kv_mode == 1 ? Kvq8{d_vc, d_vs} : Kvq8{};
-            Kvq4 vq4 = kv_mode == 2 ? Kvq4{d_v4, d_vs} : Kvq4{};
+            Kvq4 kq4 = kv_mode == 3 ? Kvq4{d_k4, d_ks} : Kvq4{};
+            Kvq4 vq4 = (kv_mode == 2 || kv_mode == 3) ? Kvq4{d_v4, d_vs} : Kvq4{};
 
             const size_t score_n = (size_t) rows * n_head * 64 * (dim + 2);
             float* d_tbl = dev(std::vector<float>((size_t) rows * n_head * n_extent, 0.f));
@@ -1995,26 +2003,51 @@ int test_decode_fusions() {
             long long* d_at = use_at ? dev(at_v) : nullptr;
             const int rm = d_at ? (window > 0 ? std::min(window + rows - 1, pos + rows) : pos + rows) : 0;
 
-            inkling_rel_table(d_r, d_rb, d_snk, d_tbl, n_rel, n_extent, n_head, rows, nullptr, false);
-            inkling_attend(d_q, d_k16, d_v16, d_tbl, d_snk, n_extent, pos, rows, d_sc, rows, d_ref, dim, n_head,
-                           kv_heads, scale, nullptr, window, ring, d_at, rm, kq8, vq8, {}, vq4);
-            mul_sigmoid(d_ref, d_g, n_head * dim, rows, n_head * dim, false, nullptr);
+            if (whole) {
+                inkling_set_mma_v2(0);
+                inkling_dspark_attend(d_q, d_k16, d_v16, pos, rows, d_sc, d_ref, dim, n_head, kv_heads, scale, nullptr,
+                                      window, ring, d_at, rm, kq8, vq8, kq4, vq4);
+                inkling_set_mma_v2(v2_mode);
+                inkling_dspark_attend(d_q, d_k16, d_v16, pos, rows, d_sc, d_got, dim, n_head, kv_heads, scale, nullptr,
+                                      window, ring, d_at, rm, kq8, vq8, kq4, vq4);
+            } else {
+                inkling_rel_table(d_r, d_rb, d_snk, d_tbl, n_rel, n_extent, n_head, rows, nullptr, false);
+                inkling_attend(d_q, d_k16, d_v16, d_tbl, d_snk, n_extent, pos, rows, d_sc, rows, d_ref, dim, n_head,
+                               kv_heads, scale, nullptr, window, ring, d_at, rm, kq8, vq8, kq4, vq4);
+                mul_sigmoid(d_ref, d_g, n_head * dim, rows, n_head * dim, false, nullptr);
 
-            inkling_attend(d_q, d_k16, d_v16, nullptr, d_snk, n_extent, pos, rows, d_sc, rows, d_got, dim, n_head,
-                           kv_heads, scale, nullptr, window, ring, d_at, rm, kq8, vq8, {}, vq4, d_r, d_rb, n_rel,
-                           d_g);
+                inkling_set_mma_v2(v2_mode);
+                inkling_attend(d_q, d_k16, d_v16, nullptr, d_snk, n_extent, pos, rows, d_sc, rows, d_got, dim, n_head,
+                               kv_heads, scale, nullptr, window, ring, d_at, rm, kq8, vq8, kq4, vq4, d_r, d_rb, n_rel,
+                               d_g);
+            }
+            inkling_set_mma_v2(-1);
             cudaDeviceSynchronize();
             bad += report(label, host(d_got, q.size()), host(d_ref, q.size()), 2e-4);
 
             cudaFree(d_q); cudaFree(d_r); cudaFree(d_rb); cudaFree(d_snk); cudaFree(d_g);
             cudaFree(d_kr); cudaFree(d_vr); cudaFree(d_k16); cudaFree(d_v16);
-            cudaFree(d_kc); cudaFree(d_vc); cudaFree(d_v4); cudaFree(d_ks); cudaFree(d_vs);
+            cudaFree(d_kc); cudaFree(d_vc); cudaFree(d_k4); cudaFree(d_v4); cudaFree(d_ks); cudaFree(d_vs);
             cudaFree(d_tbl); cudaFree(d_sc); cudaFree(d_ref); cudaFree(d_got); cudaFree(d_at);
         };
-        run_f8("F8 MMA attend SWA wrap K8V4 at r=4", 4, 1022, 1024, 1024, 1024, true, 2);
-        run_f8("F8 MMA attend Global K8V4 r=4", 4, 2050, 0, 0, 1024, false, 2);
-        run_f8("F8 MMA attend Global FP16 r=5", 5, 1500, 0, 0, 1024, false, 0);
-        run_f8("F8 MMA attend small SWA Q8 r=2", 2, 90, 1024, 1024, 1024, false, 1);
+        for (int v2m : {0, 1}) {
+            const char* tag = v2m ? "F8v2" : "F8v1";
+            char lbl[64];
+            std::snprintf(lbl, sizeof(lbl), "%s MMA attend SWA wrap K8V4 at r=4", tag);
+            run_f8(lbl, 4, 1022, 1024, 1024, 1024, true, 2, v2m);
+            std::snprintf(lbl, sizeof(lbl), "%s MMA attend Global K8V4 r=4", tag);
+            run_f8(lbl, 4, 2050, 0, 0, 1024, false, 2, v2m);
+            std::snprintf(lbl, sizeof(lbl), "%s MMA attend Global FP16 r=5", tag);
+            run_f8(lbl, 5, 1500, 0, 0, 1024, false, 0, v2m);
+            std::snprintf(lbl, sizeof(lbl), "%s MMA attend small SWA Q8 r=2", tag);
+            run_f8(lbl, 2, 90, 1024, 1024, 1024, false, 1, v2m);
+        }
+        run_f8("F8v2 MMA attend SWA wrap K8V4 at r=8", 8, 1022, 1024, 1024, 1024, true, 2, 1);
+        run_f8("F8v2 MMA attend Global K8V4 r=8", 8, 2050, 0, 0, 1024, false, 2, 1);
+        run_f8("F8v2 MMA attend Global FP16 r=6", 6, 1500, 0, 0, 1024, false, 0, 1);
+        run_f8("F8v2 MMA attend Global Q4_0 r=4", 4, 1500, 0, 0, 1024, false, 3, 1);
+        run_f8("F8v2 DSpark SWA wrap FP16 r=4", 4, 1022, 1024, 1024, 1024, true, 0, 1, true);
+        run_f8("F8v2 DSpark Global K8V4 r=8", 8, 2050, 0, 0, 1024, false, 2, 1, true);
     }
     return bad;
 }
@@ -2423,10 +2456,89 @@ int bench_flash() {
     return 0;
 }
 
+int bench_f8() {
+    const int n_kv = 8, n_head = 24, dim = 128, n_rel = 16, width = n_kv * dim, max_rows = 8;
+    const int max_k = 32768 + 64, extent = 1024;
+    const float scale = 1.f / std::sqrt((float) dim);
+
+    float *d_q = dev(random_vec((size_t) max_rows * n_head * dim, 0.5f)),
+          *d_r = dev(random_vec((size_t) max_rows * n_head * n_rel, 0.5f)),
+          *d_s = dev(random_vec((size_t) max_rows * n_head, 0.2f)),
+          *d_rb = dev(random_vec((size_t) extent * n_rel, 0.25f)),
+          *d_g = dev(random_vec((size_t) max_rows * n_head * dim, 0.8f)),
+          *d_sc = dev(std::vector<float>((size_t) max_rows * n_head * 64 * (dim + 2), 0.f)),
+          *d_out = dev(std::vector<float>((size_t) max_rows * n_head * dim, 0.f));
+    uint16_t *d_kf16 = dev(std::vector<uint16_t>((size_t) max_k * width, 0x3c00)),
+             *d_vf16 = dev(std::vector<uint16_t>((size_t) max_k * width, 0x3c00));
+    int8_t *d_kc8 = dev(std::vector<int8_t>((size_t) max_k * width, 12));
+    uint8_t *d_vc4 = dev(std::vector<uint8_t>((size_t) max_k * (width / 2), 0x88));
+    uint16_t *d_ks8 = dev(std::vector<uint16_t>((size_t) max_k * (width / 32), 0x3c00)),
+             *d_vs4 = dev(std::vector<uint16_t>((size_t) max_k * (width / 32), 0x3c00));
+
+    cudaEvent_t ev0, ev1;
+    cudaEventCreate(&ev0);
+    cudaEventCreate(&ev1);
+
+    auto run_case = [&](const char* label, int rows, int pos, int window, int ring, bool k8v4, bool whole) {
+        Kvq8 kq8 = k8v4 ? Kvq8{d_kc8, d_ks8} : Kvq8{};
+        Kvq4 vq4 = k8v4 ? Kvq4{d_vc4, d_vs4} : Kvq4{};
+        const uint16_t* kptr = k8v4 ? nullptr : d_kf16;
+        const uint16_t* vptr = k8v4 ? nullptr : d_vf16;
+        float us[2] = {};
+        for (int m = 0; m < 2; ++m) {
+            inkling_set_mma_v2(m);
+            auto invoke = [&] {
+                if (whole)
+                    inkling_dspark_attend(d_q, kptr, vptr, pos, rows, d_sc, d_out, dim, n_head, n_kv, scale, nullptr,
+                                          window, ring, nullptr, 0, kq8, {}, {}, vq4);
+                else
+                    inkling_attend(d_q, kptr, vptr, nullptr, d_s, extent, pos, rows, d_sc, rows, d_out, dim, n_head,
+                                   n_kv, scale, nullptr, window, ring, nullptr, 0, kq8, {}, {}, vq4, d_r, d_rb,
+                                   n_rel, d_g, nullptr);
+            };
+            for (int i = 0; i < 8; ++i) invoke();
+            cudaDeviceSynchronize();
+            const int iters = 100;
+            cudaEventRecord(ev0, nullptr);
+            for (int i = 0; i < iters; ++i) invoke();
+            cudaEventRecord(ev1, nullptr);
+            cudaEventSynchronize(ev1);
+            float ms = 0.f;
+            cudaEventElapsedTime(&ms, ev0, ev1);
+            us[m] = (ms * 1000.f) / iters;
+        }
+        inkling_set_mma_v2(-1);
+        const float spd = 100.f * (us[0] / us[1] - 1.f);
+        std::printf("%-30s  v1=%7.2f us  v2=%7.2f us  (%+6.1f%%)\n", label, us[0], us[1], spd);
+    };
+
+    run_case("target SWA 1024 K8V4 r=4",   4,  2048, 1024, 1024, true,  false);
+    run_case("target Glob 2K  K8V4 r=4",   4,  2048,    0,    0, true,  false);
+    run_case("target Glob 8K  K8V4 r=4",   4,  8192,    0,    0, true,  false);
+    run_case("target Glob 16K K8V4 r=4",   4, 16384,    0,    0, true,  false);
+    run_case("target Glob 32K K8V4 r=4",   4, 32768,    0,    0, true,  false);
+    run_case("target SWA 1024 FP16 r=4",   4,  2048, 1024, 1024, false, false);
+    run_case("target Glob 8K  FP16 r=4",   4,  8192,    0,    0, false, false);
+    run_case("target SWA 1024 K8V4 r=8",   8,  2048, 1024, 1024, true,  false);
+    run_case("target Glob 8K  K8V4 r=8",   8,  8192,    0,    0, true,  false);
+    run_case("target Glob 32K K8V4 r=8",   8, 32768,    0,    0, true,  false);
+    run_case("target Glob 8K  FP16 r=8",   8,  8192,    0,    0, false, false);
+    run_case("dspark SWA 1024 K8V4 r=4",   4,  2048, 1024, 1024, true,  true);
+    run_case("dspark Glob 8K  K8V4 r=4",   4,  8192,    0,    0, true,  true);
+    run_case("dspark Glob 8K  K8V4 r=8",   8,  8192,    0,    0, true,  true);
+
+    cudaEventDestroy(ev0);
+    cudaEventDestroy(ev1);
+    cudaFree(d_q); cudaFree(d_r); cudaFree(d_s); cudaFree(d_rb); cudaFree(d_g); cudaFree(d_sc); cudaFree(d_out);
+    cudaFree(d_kf16); cudaFree(d_vf16); cudaFree(d_kc8); cudaFree(d_vc4); cudaFree(d_ks8); cudaFree(d_vs4);
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     if (argc > 1 && std::strcmp(argv[1], "--bench-flash") == 0) return bench_flash();
+    if (argc > 1 && std::strcmp(argv[1], "--bench-f8") == 0) return bench_f8();
     int bad = 0;
     bad += test_situ_gpu_and_cpu();
     bad += test_mix_and_control();
