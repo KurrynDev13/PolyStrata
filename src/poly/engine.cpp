@@ -834,6 +834,64 @@ bool Engine::vpool_claim_to_budget(size_t margin, size_t limit, size_t& claimed)
     return true;
 }
 
+size_t Engine::vram_keep_bytes() const {
+    if (pool_on_) return 0;
+    return size_t(opt_.vram_reserve_mib >= 0 || ram_tight_ ? reserve_mib_ : std::max(reserve_mib_ / 2, 128)) << 20;
+}
+
+size_t Engine::vram_free_budget_bytes(size_t* total_out) {
+    size_t free_b = 0, total_b = 0;
+    ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
+    if (total_out) *total_out = total_b;
+    if (pool_on_) return free_b;
+    static const bool off = [] {
+        const char* v = std::getenv("STRATA_POLY_WDDM_BUDGET");
+        return v && v[0] == '0';
+    }();
+    if (!off) {
+        if (!luid_checked_) {
+            luid_checked_ = true;
+#if !defined(STRATA_GPU_METAL)
+            cudaDeviceProp p{};
+            if (cudaGetDeviceProperties(&p, device_) == cudaSuccess) {
+                std::memcpy(luid_, p.luid, sizeof(luid_));
+                has_luid_ = true;
+            } else {
+                (void) cudaGetLastError();
+            }
+#endif
+        }
+        if (has_luid_) {
+            uint64_t budget = 0, usage = 0;
+            std::string why;
+            if (strata::platform::gpu_local_memory_budget(luid_, budget, usage, why)) {
+                const size_t dxgi_free = budget > usage ? (size_t) (budget - usage) : 0;
+                return std::min(free_b, dxgi_free);
+            }
+        }
+    }
+    return free_b;
+}
+
+void Engine::vmm_map_budgeted(Mapped& m, size_t target_bytes, size_t piece, size_t keep_b, const char* what) {
+    if (pool_on_) {
+        vmm_map(m, target_bytes, piece, what);
+        return;
+    }
+    target_bytes = std::min(up_to(target_bytes, grain_), m.reserved);
+    const size_t step = std::max(grain_, piece / grain_ * grain_);
+    while (m.mapped < target_bytes) {
+        const size_t next = std::min(target_bytes, m.mapped + step);
+        const size_t need = next - m.mapped;
+        if (vram_free_budget_bytes() < keep_b + need) break;
+        try {
+            vmm_map(m, next, step, what);
+        } catch (const std::runtime_error&) {
+            break;
+        }
+    }
+}
+
 // What the attention caches take for one step of their growth (cover() maps kKvGrow rows at a time, in handles of the
 // pool's size): the room the pool keeps for the next one.
 size_t Engine::kv_step_bytes() const {
@@ -1349,11 +1407,10 @@ void Engine::cover(int64_t end) {
         // maps below throw: the context does not fit the VRAM this engine has.
         if (more > vpool_bytes()) shrink_cache(more - vpool_bytes());
     } else if (exp_) {
-        size_t free_b = 0, total_b = 0;
-        ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
-        const size_t quarter = (size_t(std::max(reserve_mib_, 0)) << 20) / 4;
+        const size_t free_b = vram_free_budget_bytes();
+        const size_t keep_b = vram_keep_bytes();
         size_t cut = held + more > budget_ ? held + more - budget_ : 0;
-        if (free_b < more + quarter) cut = std::max(cut, more + quarter - free_b);
+        if (free_b < more + keep_b) cut = std::max(cut, more + keep_b - free_b);
         if (cut) shrink_cache(cut);
     }
     // in pieces of kKvGrow rows, so that trim_card_kv() can give back what a long read mapped in one go
@@ -1511,12 +1568,8 @@ void Engine::take_prompt_arena() {
     const size_t need_s = stage_map_.base ? up_to(stage_narrow_ + 256 + kTail, gran) : 0;
     size_t want = need_p > prompt_map_.mapped ? need_p - prompt_map_.mapped : 0;
     if (need_s > stage_map_.mapped) want += need_s - stage_map_.mapped;
-    size_t free_b = 0, total_b = 0;
-    ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
-    if (pool_on_) free_b = vpool_bytes();
-    const size_t keep_b =
-        pool_on_ ? 0
-                 : (size_t(opt_.vram_reserve_mib >= 0 || ram_tight_ ? reserve_mib_ : std::max(reserve_mib_ / 2, 128)) << 20);
+    const size_t free_b = pool_on_ ? vpool_bytes() : vram_free_budget_bytes();
+    const size_t keep_b = vram_keep_bytes();
     prompt_cut_ = 0;
     if (exp_ && want > 0 && free_b < want + keep_b) {
         const size_t had = arena_.mapped;
@@ -1567,12 +1620,8 @@ void Engine::end_read() {
     if (exp_ && total_cut > 0) {
         size_t give = total_cut;
         if (!pool_on_) {
-            size_t free_b = 0, total_b = 0;
-            ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
-            const size_t floor_b =
-                prompt_loan_
-                    ? (size_t(opt_.vram_reserve_mib >= 0 || ram_tight_ ? reserve_mib_ : std::max(reserve_mib_ / 2, 128)) << 20)
-                    : (size_t(std::max(reserve_mib_, 0)) << 20) / 4;
+            const size_t free_b = vram_free_budget_bytes();
+            const size_t floor_b = vram_keep_bytes();
             give = std::min(total_cut, free_b > floor_b ? free_b - floor_b : 0);
         }
         if (give > 0) grow_cache(give, true);
@@ -1998,8 +2047,8 @@ int64_t Engine::vram_free_mib() const {
 // the line moved with them, so that the same PC in the same state keeps the reserve it had.
 void Engine::fill_expert_cache() {
     if (!opt_.gpu_experts || n_moe_ == 0) return;
-    size_t free_b = 0, total_b = 0;
-    ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
+    size_t total_b = 0;
+    size_t free_b = vram_free_budget_bytes(&total_b);
     const size_t ram = ram_available(), files = gg_->bytes() + (dg_ ? dg_->bytes() : 0);
     ram_tight_ = ram > 0 && files + (5ULL << 30) > ram;
     // 256 MiB at least, whatever was asked: the launches recorded later take theirs out of the reserve (mind_vram())
@@ -2111,14 +2160,22 @@ void Engine::fill_expert_cache() {
     if (arena == 0) return;
     if (vmm_) {   // in pieces, so that it can give some up to the attention caches (shrink_cache()) and grow
         if (!arena_.base) vmm_reserve(arena_, most + 256);   // addresses only: grow_cache() maps more of them
-        try {
-            vmm_map(arena_, arena + 256, kArenaPiece, "the expert cache");
-        } catch (const std::runtime_error&) {   // the card may not have it all (grow_cache() is just as tolerant)
+        if (pool_on_) {
+            try {
+                vmm_map(arena_, arena + 256, kArenaPiece, "the expert cache");
+            } catch (const std::runtime_error&) {   // the card may not have it all (grow_cache() is just as tolerant)
+            }
             arena = arena_.mapped > 256 ? arena_.mapped - 256 : 0;
             if (arena == 0) return;
+            exp_ = (uint8_t*) arena_.base;
+            budget_ = free_b - reserve + other_rows();   // when it holds every expert, the rest goes to the rows first
+        } else {
+            vmm_map_budgeted(arena_, arena + 256, kArenaPiece, reserve, "the expert cache");
+            arena = arena_.mapped > 256 ? std::min(arena, arena_.mapped - 256) : 0;
+            if (arena == 0) return;
+            exp_ = (uint8_t*) arena_.base;
+            budget_ = arena_.mapped + other_rows();
         }
-        exp_ = (uint8_t*) arena_.base;
-        budget_ = free_b - reserve + other_rows();   // when it holds every expert, the rest goes to the rows first
         for (const Kv& k : kv_) budget_ += k.mapped;
     } else {
         exp_ = (uint8_t*) dmalloc(arena + 256, "the expert cache");
@@ -2314,8 +2371,7 @@ bool Engine::mind_card_vram() {
         const size_t have = vpool_bytes(), slack = 2 * kv_step_bytes();
         return have >= slack + (16u << 20) && grow_cache(have - slack) > 0;
     }
-    size_t free_b = 0, total_b = 0;
-    ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
+    const size_t free_b = vram_free_budget_bytes();
     const int64_t free = (int64_t) (free_b >> 20);   // this card's
     if (!vmm_) {   // a cache in one allocation is filled again
         if (free >= reserve_mib_ / 4) return false;
@@ -2323,7 +2379,7 @@ bool Engine::mind_card_vram() {
         return true;
     }
     if (minds_++ == 0) return false;   // nothing is recorded before the first request
-    const int64_t keep = opt_.vram_reserve_mib >= 0 || ram_tight_ ? reserve_mib_ : std::max(reserve_mib_ / 2, 128);
+    const int64_t keep = (int64_t) (vram_keep_bytes() >> 20);
     if (free < keep / 2) {
         shrink_cache(size_t(keep - free) << 20);
         held_is_budget();
@@ -2342,14 +2398,12 @@ void Engine::widen_stage() {
     if (up_) ck(cudaStreamSynchronize(cs(up_)), "the expert staging buffer");
     ck(cudaStreamSynchronize(cs(st_)), "the expert staging buffer");
     const size_t want = up_to(stage_wide_ + 256 + kTail, pool_on_ ? pg_ : grain_) - stage_map_.mapped;
-    size_t free_b = 0, total_b = 0;
-    ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
-    if (pool_on_) free_b = vpool_bytes();   // what the card has is the pool's
-    const size_t quarter = pool_on_ ? 0 : (size_t(std::max(reserve_mib_, 0)) << 20) / 4;
+    const size_t free_b = pool_on_ ? vpool_bytes() : vram_free_budget_bytes();
+    const size_t keep_b = vram_keep_bytes();
     stage_cut_ = 0;
-    if (exp_ && free_b < want + quarter) {
+    if (exp_ && free_b < want + keep_b) {
         const size_t had = arena_.mapped;
-        shrink_cache(want + quarter - free_b);
+        shrink_cache(want + keep_b - free_b);
         held_is_budget();
         stage_cut_ = had - arena_.mapped;
     }
@@ -2374,7 +2428,15 @@ void Engine::narrow_stage() {
     stage_bytes_ = stage_narrow_;
     staged_il_ = -1;
     stage_lent_ = false;
-    if (exp_ && stage_cut_ > 0) grow_cache(stage_cut_, true);
+    if (exp_ && stage_cut_ > 0) {
+        size_t give = stage_cut_;
+        if (!pool_on_) {
+            const size_t free_b = vram_free_budget_bytes();
+            const size_t floor_b = vram_keep_bytes();
+            give = std::min(give, free_b > floor_b ? free_b - floor_b : 0);
+        }
+        if (give > 0) grow_cache(give, true);
+    }
     stage_cut_ = 0;
 }
 
@@ -2387,13 +2449,11 @@ float* Engine::carry_take(size_t bytes, size_t most) {
     if (up_) ck(cudaStreamSynchronize(cs(up_)), "a read's rows");
     ck(cudaStreamSynchronize(cs(st_)), "a read's rows");
     const size_t want = up_to(bytes, pool_on_ ? pg_ : grain_) - carry_map_.mapped;
-    size_t free_b = 0, total_b = 0;
-    ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
-    if (pool_on_) free_b = vpool_bytes();
-    const size_t quarter = pool_on_ ? 0 : (size_t(std::max(reserve_mib_, 0)) << 20) / 4;
-    if (exp_ && free_b < want + quarter) {
+    const size_t free_b = pool_on_ ? vpool_bytes() : vram_free_budget_bytes();
+    const size_t keep_b = vram_keep_bytes();
+    if (exp_ && free_b < want + keep_b) {
         const size_t had = arena_.mapped;
-        shrink_cache(want + quarter - free_b);
+        shrink_cache(want + keep_b - free_b);
         held_is_budget();
         carry_cut_ += had - arena_.mapped;
     }
@@ -2413,7 +2473,15 @@ void Engine::carry_give() {
     ck(cudaStreamSynchronize(cs(st_)), "a read's rows");
     vmm_unmap(carry_map_, 0);
     carry_lent_ = false;
-    if (exp_ && carry_cut_ > 0) grow_cache(carry_cut_, true);
+    if (exp_ && carry_cut_ > 0) {
+        size_t give = carry_cut_;
+        if (!pool_on_) {
+            const size_t free_b = vram_free_budget_bytes();
+            const size_t floor_b = vram_keep_bytes();
+            give = std::min(give, free_b > floor_b ? free_b - floor_b : 0);
+        }
+        if (give > 0) grow_cache(give, true);
+    }
     carry_cut_ = 0;
 }
 
@@ -2486,10 +2554,8 @@ int Engine::grow_cache(size_t bytes, bool later) {
         }
     }
     if (cands.empty()) return 0;
-    try {
-        vmm_map(arena_, std::min(arena_.mapped + bytes, arena_.reserved), kArenaPiece, "the expert cache");
-    } catch (const std::runtime_error&) {
-    }
+    vmm_map_budgeted(arena_, std::min(arena_.mapped + bytes, arena_.reserved), kArenaPiece, vram_keep_bytes(),
+                     "the expert cache");
     if (arena_.mapped < exp_at_ + kTail) return 0;
     zero_vram(exp_ + exp_at_, arena_.mapped - exp_at_);   // the new slots' tails
     std::stable_sort(cands.begin(), cands.end(),
@@ -6004,11 +6070,9 @@ bool Engine::read_groups(const Mark* marks, int n_marks, const std::function<boo
     const int n_calls = (int) calls_.size();
     float* const r0 = r_;
     const int64_t pos0 = pos_;
-    size_t free_b = 0, total_b = 0;
-    ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
-    if (pool_on_) free_b = vpool_bytes();
-    const size_t quarter = pool_on_ ? 0 : (size_t(std::max(reserve_mib_, 0)) << 20) / 4;
-    const size_t room = (free_b > quarter ? free_b - quarter : 0) +
+    const size_t free_b = pool_on_ ? vpool_bytes() : vram_free_budget_bytes();
+    const size_t keep_b = vram_keep_bytes();
+    const size_t room = (free_b > keep_b ? free_b - keep_b : 0) +
                         (exp_ && arena_.mapped > kArenaPiece ? arena_.mapped - kArenaPiece : 0);
     int g = (int) std::min<size_t>((size_t) n_calls, room / (per * sizeof(float)));
     float* base = nullptr;

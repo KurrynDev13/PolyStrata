@@ -668,9 +668,12 @@ protected:
     };
     void vmm_reserve(Mapped& m, size_t bytes);
     void vmm_map(Mapped& m, size_t bytes, size_t piece, const char* what);
+    void vmm_map_budgeted(Mapped& m, size_t target_bytes, size_t piece, size_t keep_b, const char* what);
     void vmm_unmap(Mapped& m, size_t bytes);
     void vmm_settle();
     void vmm_free(Mapped& m);
+    size_t vram_free_budget_bytes(size_t* total_out = nullptr);
+    size_t vram_keep_bytes() const;
     /// The pool (Options::vram_pool): handles of pg_ bytes, claimed once, that the maps take from and the unmaps give to.
     void vpool_claim(size_t bytes);
     bool vpool_claim_to_budget(size_t margin, size_t limit, size_t& claimed);
@@ -857,6 +860,9 @@ protected:
     size_t budget_ = 0;          ///< their VRAM and the expert cache's together, as the cache was filled
     int asked_reserve_mib_ = -1; ///< Options::vram_reserve_mib as load() got it
     int reserve_mib_ = 0;        ///< what the cache was sized to leave free
+    bool luid_checked_ = false;
+    bool has_luid_ = false;
+    char luid_[8] = {};
     bool ram_tight_ = false;     ///< the machine's RAM is within 5 GiB of the model's files (fill_expert_cache())
     int minds_ = 0;              ///< mind_vram()'s calls
     int full_cached_ = 0;        ///< the cache as load() filled it: its experts and their bytes
