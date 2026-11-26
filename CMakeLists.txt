@@ -2143,7 +2143,7 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
     add_executable(poly_gdn_mma_state_test src/poly/gdn_mma_state_test.cpp src/poly/engine.cpp src/poly/glm5next.cpp
                    src/poly/qwen35.cpp src/poly/gemma4.cpp src/poly/deepseek4.cpp src/poly/lfm2moe.cpp
                    src/poly/flint.cpp src/poly/kolibri1.cpp src/poly/inkling2.cpp src/poly/cpu_experts.cpp
-                   src/poly/kernels.cu src/poly/kernels_dsv4.cu src/poly/kernels_inkling2.cu
+                   src/poly/kernels.cu src/poly/kernels_dsv4.cu src/poly/kernels_inkling2.cu src/poly/inkling2_zha.cu
                    src/core/conversation_memory.cpp)
     target_include_directories(poly_gdn_mma_state_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
     target_link_libraries(poly_gdn_mma_state_test PRIVATE strata_poly_mmq strata_kernels strata_spec ggml-cpu ggml-base
@@ -2153,7 +2153,7 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
   add_executable(strata-poly src/poly/main.cpp src/poly/engine.cpp src/poly/glm5next.cpp src/poly/qwen35.cpp
                             src/poly/gemma4.cpp src/poly/deepseek4.cpp src/poly/lfm2moe.cpp src/poly/flint.cpp
                             src/poly/kolibri1.cpp src/poly/inkling2.cpp src/poly/cpu_experts.cpp src/poly/kernels.cu
-                            src/poly/kernels_dsv4.cu src/poly/kernels_inkling2.cu src/poly/spill.cpp
+                            src/poly/kernels_dsv4.cu src/poly/kernels_inkling2.cu src/poly/inkling2_zha.cu src/poly/spill.cpp
                             src/core/conversation_memory.cpp src/core/conversation_file.cpp)
   target_include_directories(strata-poly PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
   # the driver's virtual memory calls: the attention caches grow with the conversation; on HIP they are HIP's
@@ -2180,7 +2180,7 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
                                       src/poly/qwen35.cpp src/poly/gemma4.cpp src/poly/deepseek4.cpp
                                       src/poly/lfm2moe.cpp src/poly/flint.cpp src/poly/kolibri1.cpp
                                       src/poly/inkling2.cpp src/poly/cpu_experts.cpp src/poly/kernels.cu
-                                      src/poly/kernels_dsv4.cu src/poly/kernels_inkling2.cu
+                                      src/poly/kernels_dsv4.cu src/poly/kernels_inkling2.cu src/poly/inkling2_zha.cu
                                       src/core/conversation_memory.cpp)
   target_include_directories(poly_draft_race_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
                                                          ${_strata_gpu_include_directories})

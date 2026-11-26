@@ -558,6 +558,9 @@ protected:
     virtual void norm_text_embed(float* dst) const { (void) dst; }
     /// Whether the architecture supports loaning idle prompt-batch scratch & staging VRAM to experts during decode.
     virtual bool supports_prompt_loan() const { return false; }
+    /// Called just before a prompt read (>= kStageRows) acquires prompt scratch and before it ends.
+    virtual void prompt_begins() {}
+    virtual void prompt_ends() {}
 
     // ---- what it builds on ----
     /// Whether layer il is this engine's: one of [lo_, hi_), or the draft block on the card that ends the model.
@@ -979,6 +982,7 @@ protected:
     Mapped prompt_map_;                           ///< VMM reservation for prompt-only + prompt-sized scratch
     size_t prompt_bytes_ = 0, prompt_cut_ = 0;
     size_t prompt_at_ = 0;
+    int64_t read_end_ = 0;   ///< end position of the prompt read currently under way (0 when none)
     float* prompt_scratch_ = nullptr;
     void bind_scratch(bool prompt);
     void take_prompt_arena();

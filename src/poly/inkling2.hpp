@@ -8,7 +8,9 @@
 #pragma once
 
 #include "engine.hpp"
+#include "inkling2_zha.hpp"
 
+#include <utility>
 #include <vector>
 
 namespace strata::poly {
@@ -35,6 +37,11 @@ protected:
     bool snaps_spread() const override { return true; }
     bool can_read_groups() const override { return true; }
     bool supports_prompt_loan() const override { return true; }
+    void prompt_begins() override {
+        if (zgrow_) zha_room_all(std::max<int64_t>(pos_, read_end_));
+        if (zlend_) zha_widen(std::max<int64_t>(pos_, read_end_) >= zkeep_from_);
+    }
+    void prompt_ends() override { if (zlend_) zha_narrow(); }
     void save_layer(int slot, int64_t pos, uint8_t* dst) override;
     size_t extra_bytes() const override;
     void load_extra(const uint8_t* src, int64_t pos) override;
@@ -129,7 +136,8 @@ private:
     void apply_ctrl(const float* cur, const float* msg, const Block& B, int ctrl, float* out, int n,
                     const float* ctrl_r_in = nullptr);
     void store(const float* x, const SlotCache& sc, int64_t pos, int n, bool value);
-    void attn(const Step& st, Block& B, SlotCache& sc, int64_t pos, int n, bool fuse_post = false);
+    void attn_part(const Step& st, Block& B, SlotCache& sc, int64_t pos, int n, bool fuse_post, int part);
+    void head_part(Layer& L, int slot, int n, int part);
     template <class F>
     void window_runs(int64_t pos, F&& f) const;
 
@@ -203,6 +211,57 @@ private:
     std::vector<void*> dspark_stage_graph_;
     void* dspark_head_graph_ = nullptr;
     void* dspark_markov_graph_ = nullptr;
+
+    // STRATA_INK_ZHA=REFS: ZHA index over the global layers' keys/values (inkling2_zha.cu).
+    struct ZSlot {
+        int8_t *kc = nullptr, *vc = nullptr;      ///< 4-bit leaves in pinned host RAM
+        uint16_t *ksc = nullptr, *vsc = nullptr;  ///< fp16 leaf scales per 32 values
+        int8_t *rkc = nullptr, *rvc = nullptr;    ///< recent-row Q8_0 ring in VRAM
+        uint16_t *rks = nullptr, *rvs = nullptr;
+        float* zrefs = nullptr;                   ///< reference queries [kv][R][128]
+        uint16_t *zk = nullptr, *zv = nullptr;    ///< chunk summaries in VRAM
+        float* zb = nullptr;
+        int zbuilt = 0;                           ///< chunks summarized so far
+        int zcap = 0;                             ///< summary capacity (chunks/KV-head)
+        int64_t zpos = -1;                        ///< end position of last call (-1: rebuild)
+        ink::ZhaCache zcache;                     ///< per-KV-head LRU chunk cache in VRAM
+    };
+    std::vector<ZSlot> zs_;
+    ink::Zha zha_;
+    bool zha_on_ = false;
+    int zha_pool_ = 0, zha_max_chunks_ = 0;
+    int64_t zring_ = 0;
+    std::vector<float> zha_refs_;
+    std::vector<std::pair<int, int>> zha_ids_;
+    ink::ZhaWork zw_;
+    const void* zw_owner_ = nullptr;
+    int64_t zw_next_ = -1;
+    bool zha_full(const Block& B) const { return zha_on_ && !B.swa; }
+    size_t zha_leaf_codes() const { return (size_t) n_kv_ * head_dim_ / 2; }
+    size_t zha_leaf_scales() const { return (size_t) n_kv_ * head_dim_ / 32 * sizeof(uint16_t); }
+    size_t zha_q8n(int cap) const {
+        return ink::zha_q8n_make((size_t) n_kv_ * cap * zha_.R, cap, true);
+    }
+    bool zgrow_ = false;
+    int zcap0_ = 0;
+    bool zread_full_ = false;
+    void zha_recap(ZSlot& S, int cap);
+    void zha_room(ZSlot& S, int need);
+    void zha_room_all(int64_t end);
+    void zha_load();
+    void zha_alloc(int slot, int il, int pass);
+    void zha_scratch();
+    void zha_attention(int slot, int n, int64_t pos, const float* sink_p);
+    Mapped zmap_[8];
+    size_t zfull_[8] = {};
+    bool zlend_ = false, zwide_ = false;
+    int zkeep_now_ = 1;
+    size_t zcut_ = 0;
+    ink::ZhaWork zwd_;
+    static constexpr int64_t zkeep_from_ = 131072;
+    void zha_widen(bool keep);
+    void zha_narrow();
+    std::vector<void*> zgraph_;
 };
 
 }  // namespace strata::poly

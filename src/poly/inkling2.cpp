@@ -24,6 +24,16 @@ namespace {
 constexpr float kMinWeightSum = 6.103515625e-5f;
 constexpr size_t kQ8WorkRows = 2048;
 
+double env_num(const char* key, double fallback) {
+    const char* v = std::getenv(key);
+    return v && *v ? std::atof(v) : fallback;
+}
+
+std::string zha_file() {
+    const char* v = std::getenv("STRATA_INK_ZHA");
+    return v ? v : "";
+}
+
 const Names kInkling2MetaAliases[] = {
     {"loop.start", {"loop.core_start", nullptr}},
     {"loop.end", {"loop.core_end", nullptr}},
@@ -247,6 +257,12 @@ void Inkling2::load_geometry() {
                      dspark_block_, dspark_rank_, dspark_window_, dspark_taps_[0], dspark_taps_[1], dspark_taps_[2],
                      exec_steps());
     }
+    zha_load();
+    if (zha_on_ && dspark_) {
+        if (opt_.window == 0) opt_.window = 4;
+        need(opt_.window <= 4, "the ZHA index (STRATA_INK_ZHA) with --draft-model supports --window 1 to 4");
+    }
+    need(!zha_on_ || opt_.batch <= 0, "the ZHA index (STRATA_INK_ZHA) runs on one sequence (--batch 0)");
 }
 
 void Inkling2::load_layer(int il) {
@@ -319,7 +335,7 @@ void Inkling2::load_layer(int il) {
         }
     };
 
-    L.fixed = true;
+    L.fixed = !zha_full(B);
     L.ffn_norm = f32("ffn_norm.weight", n_embd_);
     {
         const TensorInfo* tq = tensor(il, "attn_q.weight");
@@ -496,6 +512,13 @@ size_t Inkling2::recurrent_floats() const {
 Inkling2::~Inkling2() {
     if (device_ >= 0) cudaSetDevice(device_);
     if (st_) cudaStreamSynchronize(cs(st_));
+    for (ZSlot& z : zs_) {
+        for (void* p : {(void*) z.zk, (void*) z.zv, (void*) z.zb})
+            if (p) cudaFree(p);
+        for (void* p : {(void*) z.kc, (void*) z.ksc, (void*) z.vc, (void*) z.vsc})
+            if (p) cudaFreeHost(p);
+    }
+    for (Mapped& m : zmap_) vmm_free(m);
     if (h_dspark_w1_) cudaFreeHost(h_dspark_w1_);
     if (h_dspark_fold_w_) cudaFreeHost(h_dspark_fold_w_);
 }
@@ -583,6 +606,10 @@ void Inkling2::alloc_caches() {
                           : nullptr;
 
     slots_.assign(schedule_.size(), SlotCache{});
+    if (zha_on_) {
+        zring_ = std::max<int64_t>(zring_, (int64_t) zha_.recent + 2 * zha_.C + std::max(rows_, 64) + 64);
+        if (zs_.size() != slots_.size()) zs_.assign(slots_.size(), ZSlot{});
+    }
     int swa_idx = 0;
     for (size_t s = 0; s < schedule_.size(); ++s) {
         SlotCache& sc = slots_[s];
@@ -608,6 +635,8 @@ void Inkling2::alloc_caches() {
                 sc.vals = kv;
                 kv += (size_t) ring_ * row;
             }
+        } else if (zha_on_) {
+            zha_alloc((int) s, schedule_[s].phys, schedule_[s].pass);
         } else if (quant) {
             if (k_q4) sc.k_q4 = (uint8_t*) kv_alloc(k_code, 1);
             else sc.k_codes = (int8_t*) kv_alloc(k_code, 1);
@@ -695,12 +724,14 @@ void Inkling2::assign_scratch() {
     else if (!direct_only) table_ = sbuf((size_t) chunk_dec_ * n_head_ * max_ext);
     else table_ = nullptr;
 
-    const size_t n_splits_max = (size_t) std::clamp((opt_.max_context + 127) / 128, 1, 64);
+    const int64_t att_ctx = zha_on_ ? std::min<int64_t>(opt_.max_context, (int64_t) window_ + rows_) : opt_.max_context;
+    const size_t n_splits_max = (size_t) std::clamp((att_ctx + 127) / 128, (int64_t) 1, (int64_t) 64);
     score_n_ = (size_t) chunk_dec_ * n_head_ * n_splits_max * (head_dim_ + 2);
     if (prompt_mode) score_n_ = std::max(score_n_, (size_t) chunk_batch_ * n_head_ * 1536);
     if (dspark_) {
+        const size_t n_splits_dspark = (size_t) std::clamp((opt_.max_context + 127) / 128, 1, 64);
         score_n_ = std::max(score_n_, (size_t) dspark_block_ * dspark_heads_ *
-                                          std::max<size_t>(1536, n_splits_max * (dspark_head_dim_ + 2)));
+                                          std::max<size_t>(1536, n_splits_dspark * (dspark_head_dim_ + 2)));
     }
     score_ = sbuf(score_n_);
 
@@ -715,6 +746,7 @@ void Inkling2::assign_scratch() {
         work_halves_ = 0;
         q8w_ = nullptr;
     }
+    if (zha_on_) zha_scratch();
     if (dspark_) {
         const size_t blk = (size_t) dspark_block_;
         const size_t q_dim = (size_t) dspark_heads_ * dspark_head_dim_;
@@ -755,13 +787,21 @@ void Inkling2::assign_scratch() {
 }
 
 size_t Inkling2::card_row_bytes() const {
-    const size_t k_code = kv_code_row_bytes(false);
-    const size_t v_code = kv_code_row_bytes(true);
-    const size_t scale_row = kv_scale_row_bytes();
-    size_t layers = 0;
-    for (const SlotCache& sc : slots_)
-        if (!sc.swa && slot_k_codes(sc) != nullptr) ++layers;
-    size_t bytes = layers * (k_code + v_code + 2 * scale_row);
+    size_t bytes = 0;
+    if (zha_on_) {
+        size_t layers = 0;
+        for (const SlotCache& sc : slots_)
+            if (!sc.swa) ++layers;
+        bytes = layers * 2 * (zha_leaf_codes() + zha_leaf_scales());
+    } else {
+        const size_t k_code = kv_code_row_bytes(false);
+        const size_t v_code = kv_code_row_bytes(true);
+        const size_t scale_row = kv_scale_row_bytes();
+        size_t layers = 0;
+        for (const SlotCache& sc : slots_)
+            if (!sc.swa && slot_k_codes(sc) != nullptr) ++layers;
+        bytes = layers * (k_code + v_code + 2 * scale_row);
+    }
     if (dspark_) {
         const size_t dk_code = dspark_kv_code_row_bytes(false);
         const size_t dv_code = dspark_kv_code_row_bytes(true);
@@ -783,6 +823,18 @@ void Inkling2::save_card_rows(int64_t first, int64_t n, uint8_t* dst) {
     const size_t scale_row = kv_scale_row_bytes();
     const size_t at_kc = (size_t) first * k_code, at_vc = (size_t) first * v_code, at_s = (size_t) first * scale_row;
     const size_t n_kc = (size_t) n * k_code, n_vc = (size_t) n * v_code, n_s = (size_t) n * scale_row;
+    for (size_t i = 0; i < slots_.size() && zha_on_ && n > 0; ++i) {
+        const ZSlot& z = zs_[i];
+        if (slots_[i].swa || !z.kc) continue;
+        const size_t codes = zha_leaf_codes(), scales = zha_leaf_scales();
+        const std::pair<const int8_t*, const uint16_t*> parts[2] = {{z.kc, z.ksc}, {z.vc, z.vsc}};
+        for (const auto& [c, sc_ptr] : parts) {
+            std::memcpy(dst, c + (size_t) first * codes, (size_t) n * codes);
+            dst += (size_t) n * codes;
+            std::memcpy(dst, (const uint8_t*) sc_ptr + (size_t) first * scales, (size_t) n * scales);
+            dst += (size_t) n * scales;
+        }
+    }
     for (const SlotCache& sc : slots_) {
         const uint8_t* kptr = slot_k_codes(sc);
         const uint8_t* vptr = slot_v_codes(sc);
@@ -836,6 +888,7 @@ void Inkling2::load_card_rows(const uint8_t* src, int64_t from, int64_t count, i
     if (from < 0 || first < from || n < 0 || first + n > from + count || first + n > opt_.max_context)
         throw std::logic_error("load_rows: the rows are outside what was saved");
     cover(first + n);
+    for (ZSlot& z : zs_) z.zpos = -1;
     ck(cudaStreamSynchronize(cs(st_)), "load rows");
     const bool quant =
         opt_.kv_format == KvFmt::kQ8_0 || opt_.kv_format == KvFmt::kQ4_0 || opt_.kv_format == KvFmt::kK8V4;
@@ -847,6 +900,20 @@ void Inkling2::load_card_rows(const uint8_t* src, int64_t from, int64_t count, i
     const size_t sk_kc = (size_t) (first - from) * k_code, sk_vc = (size_t) (first - from) * v_code,
                  sk_s = (size_t) (first - from) * scale_row;
     const size_t all_kc = (size_t) count * k_code, all_vc = (size_t) count * v_code, all_s = (size_t) count * scale_row;
+    for (size_t i = 0; i < slots_.size() && zha_on_ && n > 0; ++i) {
+        ZSlot& z = zs_[i];
+        if (slots_[i].swa || !z.kc) continue;
+        const size_t codes = zha_leaf_codes(), scales = zha_leaf_scales();
+        const std::pair<int8_t*, uint16_t*> parts[2] = {{z.kc, z.ksc}, {z.vc, z.vsc}};
+        for (const auto& [c, sc_ptr] : parts) {
+            std::memcpy(c + (size_t) first * codes, src + (size_t) (first - from) * codes, (size_t) n * codes);
+            src += (size_t) count * codes;
+            std::memcpy((uint8_t*) sc_ptr + (size_t) first * scales, src + (size_t) (first - from) * scales,
+                        (size_t) n * scales);
+            src += (size_t) count * scales;
+        }
+        z.zbuilt = std::min(z.zbuilt, (int) (first / zha_.C));
+    }
     for (const SlotCache& sc : slots_) {
         uint8_t* kptr = slot_k_codes(sc);
         uint8_t* vptr = slot_v_codes(sc);
@@ -957,6 +1024,7 @@ void Inkling2::save_layer(int slot, int64_t pos, uint8_t* dst) {
 }
 
 void Inkling2::load_extra(const uint8_t* src, int64_t pos) {
+    for (ZSlot& z : zs_) z.zpos = -1;
     const bool quant =
         opt_.kv_format == KvFmt::kQ8_0 || opt_.kv_format == KvFmt::kQ4_0 || opt_.kv_format == KvFmt::kK8V4;
     const size_t k_code = kv_code_row_bytes(false);
@@ -1078,7 +1146,7 @@ void Inkling2::store(const float* x, const SlotCache& sc, int64_t pos, int n, bo
     if (head < n) store_f16(x + (size_t) head * width, cache, width, 0, n - head, st_);
 }
 
-void Inkling2::attn(const Step& st, Block& B, SlotCache& sc, int64_t pos, int n, bool fuse_post) {
+void Inkling2::attn_part(const Step& st, Block& B, SlotCache& sc, int64_t pos, int n, bool fuse_post, int part) {
     const int ip = st.phys, pass = st.pass;
     const long long* at = recording_ ? at_ : nullptr;
     const int threads = sum_threads(n_embd_);
@@ -1089,6 +1157,15 @@ void Inkling2::attn(const Step& st, Block& B, SlotCache& sc, int64_t pos, int n,
 
     const int ns_all = streams();
     const bool share_swa = B.swa && pass == 0;
+    const float *qraw_p = qraw_, *gate_p = gate_, *r_raw_p = r_raw_, *sinks_p = sinks_;
+    if (n == 1 && B.wq_fused.p) {
+        qraw_p = q_fused_buf_;
+        gate_p = q_fused_buf_ + (size_t) n_head_ * head_dim_;
+        if (B.wq_fuse_flags & 2) r_raw_p = q_fused_buf_ + B.wq_rel_off;
+        if (B.wq_fuse_flags & 4) sinks_p = q_fused_buf_ + B.wq_sink_off;
+    }
+
+    if (part & 1) {
     bool normed = false;
     // 1. Attention Residual mix over blocks so far + current stream 0
     if (ip == 0) {
@@ -1159,16 +1236,11 @@ void Inkling2::attn(const Step& st, Block& B, SlotCache& sc, int64_t pos, int n,
         kernels::native_add_rms_norm_q8_1(in0, nullptr, fp(nq), xn_, xq_, n_embd_, n, rms_eps_, threads, st_);
     }
 
-    const float *qraw_p = qraw_, *gate_p = gate_, *r_raw_p = r_raw_, *sinks_p = sinks_;
     if (n < kStageRows && B.wq_fused.p) {
         lin(B.wq_fused, xn_, q_fused_buf_, n, xq_);
         if (n == 1) {
-            qraw_p = q_fused_buf_;
-            gate_p = q_fused_buf_ + (size_t) n_head_ * head_dim_;
-            if (B.wq_fuse_flags & 2) r_raw_p = q_fused_buf_ + B.wq_rel_off;
-            else lin(B.attn_rel, xn_, r_raw_, 1, xq_);
-            if (B.wq_fuse_flags & 4) sinks_p = q_fused_buf_ + B.wq_sink_off;
-            else lin(B.attn_sink_proj, xn_, sinks_, 1, xq_);
+            if (!(B.wq_fuse_flags & 2)) lin(B.attn_rel, xn_, r_raw_, 1, xq_);
+            if (!(B.wq_fuse_flags & 4)) lin(B.attn_sink_proj, xn_, sinks_, 1, xq_);
         } else {
             inkling_unpack_q_fused(q_fused_buf_, qraw_, gate_, (B.wq_fuse_flags & 2) ? r_raw_ : nullptr,
                                    (B.wq_fuse_flags & 4) ? sinks_ : nullptr, n_head_ * head_dim_, n_head_ * n_rel_,
@@ -1224,7 +1296,7 @@ void Inkling2::attn(const Step& st, Block& B, SlotCache& sc, int64_t pos, int n,
     }
 
     // 4-5. L2 clip + global tau(pos) on Q & R, L2 clip on K + store K, RMSNorm on V + store V
-    if (head_dim_ == 128 && n_rel_ <= 32) {
+    if (!zha_full(B) && head_dim_ == 128 && n_rel_ <= 32) {
         InkClipsStore cs;
         cs.q_in = qraw_p;
         cs.q_scale = fp(B.attn_q_clip);
@@ -1278,11 +1350,22 @@ void Inkling2::attn(const Step& st, Block& B, SlotCache& sc, int64_t pos, int n,
                         (float) log_floor_, log_alpha_, n, at, st_);
 
         // 5. Store K and V into slot cache
-        store(k_, sc, pos, n, false);
-        store(v_, sc, pos, n, true);
+        if (!zha_full(B)) {
+            store(k_, sc, pos, n, false);
+            store(v_, sc, pos, n, true);
+        }
     }
+    }   // part & 1
+    if (!(part & 2)) return;
 
     // 6. Relative-bias attention + virtual zero sink
+    bool quant_wo = false;
+    if (part == 2) {
+        mul_sigmoid(att_, gate_p, n_head_ * head_dim_, n, n_head_ * head_dim_, false, st_);
+    } else if (zha_full(B)) {
+        zha_attention(st.slot, n, pos, sinks_p);
+        mul_sigmoid(att_, gate_p, n_head_ * head_dim_, n, n_head_ * head_dim_, false, st_);
+    } else {
     const float scale = 1.f / std::sqrt((float) head_dim_);
     const int window = B.swa ? window_ : 0, ring = B.swa ? ring_ : 0;
     const int n_extent = B.swa ? window_ : n_rel_extent_;
@@ -1329,7 +1412,6 @@ void Inkling2::attn(const Step& st, Block& B, SlotCache& sc, int64_t pos, int n,
         ia.vq4 = vq4;
         flash_done = ink_attend_batch(ia, st_);
     }
-    bool quant_wo = false;
     if (!flash_done) {
         if (pre_dq) {
             inkling_dequant_kv_span(lo_all, (int) keys_all_64, kv_width, ring, kq, vq, kq4, vq4, kw, vw, st_);
@@ -1377,6 +1459,7 @@ void Inkling2::attn(const Step& st, Block& B, SlotCache& sc, int64_t pos, int n,
         // 7. Sigmoid gate -> wo -> post-conv4
         if (!direct_dec) mul_sigmoid(att_, gate_p, n_head_ * head_dim_, n, n_head_ * head_dim_, false, st_);
     }
+    }
 
     lin(B.wo, att_, cur_, n, quant_wo ? q8_ : nullptr);
     if (fuse_post && n < 16) {
@@ -1391,8 +1474,29 @@ void Inkling2::attn(const Step& st, Block& B, SlotCache& sc, int64_t pos, int n,
 }
 
 void Inkling2::layer_head(Layer& L, int slot, int n) {
+    const Step& st = schedule_[(size_t) slot];
+    Block& B = blocks_[(size_t) st.phys];
+    const bool use_zgraph =
+        zha_full(B) && n >= 1 && n <= 4 && !rows_of_ && opt_.graphs && !opt_.dump && !recording_ && !prompt_lent_ &&
+        !in_read_ && !image_at(pos_) &&
+        (n == 1 ? snap_bits_ == 0 : (windowed_ && snap_bits_ == snap_tokens(n) && snap_at_ == snap_));
+    if (use_zgraph) {
+        if (zgraph_.size() != schedule_.size() * 8) zgraph_.assign(schedule_.size() * 8, nullptr);
+        const size_t at = ((size_t) slot * 4 + (size_t) (n - 1)) * 2;
+        if (!zgraph_[at]) zgraph_[at] = record_fn([&] { head_part(L, slot, n, 1); });
+        ck(cudaGraphLaunch((cudaGraphExec_t) zgraph_[at], cs(st_)), "zha head part 1");
+        const float* sinks_p = (n == 1 && B.wq_fused.p && (B.wq_fuse_flags & 4)) ? (q_fused_buf_ + B.wq_sink_off) : sinks_;
+        zha_attention(slot, n, pos_, sinks_p);
+        if (!zgraph_[at + 1]) zgraph_[at + 1] = record_fn([&] { head_part(L, slot, n, 2); });
+        ck(cudaGraphLaunch((cudaGraphExec_t) zgraph_[at + 1], cs(st_)), "zha head part 2");
+        return;
+    }
+    head_part(L, slot, n, 3);
+}
+
+void Inkling2::head_part(Layer& L, int slot, int n, int part) {
     const int ns_all = streams();
-    if (dspark_) {
+    if ((part & 1) && dspark_) {
         for (int t = 0; t < 3; ++t)
             if (slot == dspark_taps_[t]) inkling_copy_stream(r_, ns_all, 6 + t, 0, n_embd_, n, st_);
     }
@@ -1401,13 +1505,14 @@ void Inkling2::layer_head(Layer& L, int slot, int n) {
     Block& B = blocks_[(size_t) ip];
     SlotCache& sc = slots_[(size_t) slot];
 
-    if (pass > 0) {
+    if ((part & 1) && pass > 0) {
         const MixSlots bank_slots{{5, 4, 0, 0, 0, 0}};
         inkling_mix(r_, ns_all, bank_slots, 2, fp(B.loop_msg_query), 4, msg_, n_embd_, n, 1e-6f, st_);
     }
 
     const bool fuse_post = !opt_.dump && n < 16;
-    attn(st, B, sc, pos_, n, fuse_post);
+    attn_part(st, B, sc, pos_, n, fuse_post, part);
+    if (!(part & 2)) return;
     dbg("attn", slot, ao_, n_embd_);
 
     // Block AttnRes update: at ip % block_size_ == 0 push inpSA (stream 0) and replace stream 0 = ao_ (no add).
@@ -1811,6 +1916,15 @@ void Inkling2::reset_drafter() {
 
 void Inkling2::draft_commit(int64_t pos, int n) {
     if (!dspark_ || n <= 0) return;
+    if (zha_on_ && !in_read_ && win_ > 0) {
+        const int64_t committed = pos + n;
+        for (ZSlot& z : zs_) {
+            if (z.zpos > committed) {
+                z.zpos = committed;
+                z.zbuilt = std::min(z.zbuilt, (int) (committed / zha_.C));
+            }
+        }
+    }
     cover(pos + n);
     inkling_dspark_mix_norm(d_taps_ + (size_t) (n - 1) * 3 * n_embd_, hn_ + (size_t) n * n_embd_, dspark_fuse_[3][0],
                             dspark_fuse_[3][1], dspark_fuse_[3][2], dspark_fuse_[3][3], fp(dspark_rnn_norm_), d_f_rnn_,
@@ -2079,6 +2193,370 @@ void Inkling2::save_draft_extra(int64_t pos, uint8_t* dst) {
         save_d_ring(dl.dk);
         save_d_ring(dl.dv);
     }
+}
+
+// ---- ZHA index over global layers ----------------------------------------------------------------------------------
+
+void Inkling2::zha_load() {
+    const std::string path = zha_file();
+    if (path.empty()) return;
+#if defined(STRATA_GPU_METAL) || defined(STRATA_USE_HIP)
+    throw std::runtime_error("STRATA_INK_ZHA: the ZHA index runs on NVIDIA cards only");
+#else
+    const auto need = [](bool ok, const char* what) {
+        if (!ok) throw std::runtime_error(what);
+    };
+    {
+        int dev = 0, major = 0, minor = 0;
+        const bool known = cudaGetDevice(&dev) == cudaSuccess &&
+                           cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
+                           cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) == cudaSuccess;
+        need(known && major * 10 + minor >= 75, "STRATA_INK_ZHA: the ZHA index needs an NVIDIA card from Turing on");
+    }
+    need(!split_ && opt_.layer_split.empty(), "STRATA_INK_ZHA: the ZHA index runs on one card");
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) throw std::runtime_error("STRATA_INK_ZHA: cannot open " + path);
+    int32_t h[4];
+    if (std::fread(h, sizeof h, 1, f) != 1 || h[0] != 0x5A484152) {
+        std::fclose(f);
+        throw std::runtime_error("STRATA_INK_ZHA: not a ZHAR file");
+    }
+    zha_.C = h[1];
+    zha_.R = h[2];
+    if (head_dim_ != 128 || zha_.R != 4 || zha_.C != 64) {
+        std::fclose(f);
+        throw std::runtime_error("STRATA_INK_ZHA: heads of 128, chunks of 64 and 4 references");
+    }
+    const size_t per = (size_t) n_kv_ * zha_.R * head_dim_;
+    zha_refs_.resize(per * (size_t) h[3]);
+    for (int k = 0; k < h[3]; ++k) {
+        int32_t id[2];
+        if (std::fread(id, sizeof id, 1, f) != 1 ||
+            std::fread(zha_refs_.data() + k * per, sizeof(float), per, f) != per) {
+            std::fclose(f);
+            throw std::runtime_error("STRATA_INK_ZHA: the file ends early");
+        }
+        zha_ids_.push_back({id[0], id[1]});
+    }
+    std::fclose(f);
+    zha_.budget = (float) env_num("STRATA_INK_ZHA_BUDGET", 0.16);
+    zha_.max_sel = (int) env_num("STRATA_INK_ZHA_MAX", 256);
+    zha_pool_ = (int) env_num("STRATA_INK_ZHA_POOL", 600);
+    need(zha_.budget > 0.f && zha_.budget <= 1.f && zha_.max_sel >= 1 && zha_pool_ >= 0,
+         "STRATA_INK_ZHA: _BUDGET in (0, 1], _MAX 1 or more, _POOL 0 or more");
+    zring_ = (int64_t) zha_.recent + 2 * zha_.C + std::max(opt_.prompt_batch, 64) + 64;
+    zha_max_chunks_ = (int) ((opt_.max_context + zha_.C - 1) / zha_.C + 31) / 32 * 32;
+    zha_on_ = true;
+    std::fprintf(stderr,
+                 "strata-poly: ZHA index: chunks of %d, %d references, budget %.3f (at most %d), a pool of %d "
+                 "chunks a KV head\n",
+                 zha_.C, zha_.R, zha_.budget, zha_.max_sel, zha_pool_);
+#endif
+}
+
+void Inkling2::zha_alloc(int slot, int il, int pass) {
+    ZSlot& S = zs_[(size_t) slot];
+    if (S.kc) return;
+    const size_t codes = (size_t) n_kv_ * head_dim_, scales = codes / 32 * sizeof(uint16_t);
+    const size_t rows = (size_t) opt_.max_context;
+    const auto host = [&](size_t bytes) {
+        void* p = nullptr;
+        ck(cudaHostAlloc(&p, bytes, cudaHostAllocMapped | cudaHostAllocPortable), "the index's leaves (pinned RAM)");
+        return p;
+    };
+    S.kc = (int8_t*) host(rows * codes / 2);
+    S.ksc = (uint16_t*) host(rows * scales);
+    S.vc = (int8_t*) host(rows * codes / 2);
+    S.vsc = (uint16_t*) host(rows * scales);
+    S.rkc = (int8_t*) dmalloc((size_t) zring_ * codes, "the index's ring");
+    S.rks = (uint16_t*) dmalloc((size_t) zring_ * scales, "the index's ring");
+    S.rvc = (int8_t*) dmalloc((size_t) zring_ * codes, "the index's ring");
+    S.rvs = (uint16_t*) dmalloc((size_t) zring_ * scales, "the index's ring");
+    if (zha_pool_ > 0) {
+        ink::ZhaCache& Z = S.zcache;
+        const size_t keys = (size_t) n_kv_ * zha_pool_ * zha_.C, per_key = head_dim_ / 2;
+        Z.P = zha_pool_;
+        Z.pool.row = head_dim_;
+        Z.pool.headed = 0;
+        Z.pool.q4 = 1;
+        Z.pool.kc = (int8_t*) dmalloc(keys * per_key, "the index's chunk cache");
+        Z.pool.vc = (int8_t*) dmalloc(keys * per_key, "the index's chunk cache");
+        Z.pool.ks = (uint16_t*) dmalloc(keys * head_dim_ / 32 * sizeof(uint16_t), "the index's chunk cache");
+        Z.pool.vs = (uint16_t*) dmalloc(keys * head_dim_ / 32 * sizeof(uint16_t), "the index's chunk cache");
+        Z.owner = (int*) dmalloc((size_t) n_kv_ * Z.P * sizeof(int), "the index's chunk cache");
+        Z.stamp = (int*) dmalloc((size_t) n_kv_ * Z.P * sizeof(int), "the index's chunk cache");
+        Z.pmap = (int*) dmalloc((size_t) n_kv_ * zha_max_chunks_ * sizeof(int), "the index's chunk cache");
+        Z.aux = (int*) dmalloc((size_t) n_kv_ * (Z.P + 2) * sizeof(int), "the index's chunk cache");
+        ink::zha_cache_clear(Z, n_kv_, zha_max_chunks_, st_);
+    }
+    size_t k = 0;
+    while (k < zha_ids_.size() && zha_ids_[k] != std::make_pair(il, pass)) ++k;
+    if (k == zha_ids_.size())
+        throw std::runtime_error("STRATA_INK_ZHA: no references for layer " + std::to_string(il) + " pass " +
+                                 std::to_string(pass));
+    const size_t refs = (size_t) n_kv_ * zha_.R * head_dim_;
+    S.zrefs = (float*) dmalloc(refs * sizeof(float), "the index");
+    ck(cudaMemcpy(S.zrefs, zha_refs_.data() + k * refs, refs * sizeof(float), cudaMemcpyHostToDevice), "the index");
+    if (zcap0_ == 0) {
+        zgrow_ = vmm_ && !pool_on_ && !freeze_experts_;
+        zcap0_ = zgrow_ ? std::min(zha_max_chunks_, 1024) : zha_max_chunks_;
+    }
+    S.zcap = 0;
+    S.zbuilt = 0;
+    S.zpos = -1;
+    zha_recap(S, zcap0_);
+}
+
+void Inkling2::zha_recap(ZSlot& S, int cap) {
+    if (cap == S.zcap) return;
+    const size_t R = (size_t) zha_.R, kv = (size_t) n_kv_;
+    const size_t code = head_dim_ / 2, scale = head_dim_ / 32 * sizeof(uint16_t);
+    const size_t rows_new = kv * (size_t) cap * R, rows_old = kv * (size_t) S.zcap * R;
+    const size_t bytes_new = 2 * rows_new * (code + scale) + rows_new * sizeof(float);
+    const size_t bytes_old = 2 * rows_old * (code + scale) + rows_old * sizeof(float);
+    ck(cudaStreamSynchronize(cs(st_)), "the index's summaries");
+    if (S.zk && exp_ && bytes_new > bytes_old) {
+        const size_t free_b = pool_on_ ? vpool_bytes() : vram_free_budget_bytes();
+        const size_t keep_b = pool_on_ ? 0 : vram_keep_bytes();
+        if (free_b < bytes_new + keep_b) {
+            shrink_cache(bytes_new + keep_b - free_b);
+            held_is_budget();
+        }
+    }
+    void* p[3] = {};
+    const size_t sizes[3] = {rows_new * (code + scale), rows_new * (code + scale), rows_new * sizeof(float)};
+    for (int i = 0; i < 3; ++i)
+        if (cudaMalloc(&p[i], std::max<size_t>(sizes[i], 256)) != cudaSuccess) {
+            cudaGetLastError();
+            for (int k = 0; k < i; ++k) cudaFree(p[k]);
+            throw std::runtime_error("no VRAM for the index's summaries (" + std::to_string(cap) + " chunks a head)");
+        }
+    const int keep = std::min(S.zbuilt, std::min(cap, S.zcap));
+    if (S.zk && keep > 0) {
+        const size_t w = (size_t) keep * R;
+        uint16_t* const olds[2] = {S.zk, S.zv};
+        for (int i = 0; i < 2; ++i) {
+            uint8_t* d = (uint8_t*) p[i];
+            const uint8_t* s = (const uint8_t*) olds[i];
+            ck(cudaMemcpy2DAsync(d, (size_t) cap * R * code, s, (size_t) S.zcap * R * code, w * code, kv,
+                                 cudaMemcpyDeviceToDevice, cs(st_)),
+               "the index's summaries");
+            ck(cudaMemcpy2DAsync(d + rows_new * code, (size_t) cap * R * scale, s + rows_old * code,
+                                 (size_t) S.zcap * R * scale, w * scale, kv, cudaMemcpyDeviceToDevice, cs(st_)),
+               "the index's summaries");
+        }
+        ck(cudaMemcpy2DAsync(p[2], (size_t) cap * R * sizeof(float), S.zb, (size_t) S.zcap * R * sizeof(float),
+                             w * sizeof(float), kv, cudaMemcpyDeviceToDevice, cs(st_)),
+           "the index's summaries");
+        ck(cudaStreamSynchronize(cs(st_)), "the index's summaries");
+    }
+    for (void* o : {(void*) S.zk, (void*) S.zv, (void*) S.zb})
+        if (o) cudaFree(o);
+    const bool had = S.zk != nullptr;
+    S.zk = (uint16_t*) p[0], S.zv = (uint16_t*) p[1], S.zb = (float*) p[2];
+    S.zbuilt = keep;
+    S.zcap = cap;
+    if (had && exp_ && bytes_old > bytes_new + kArenaPiece) {
+        size_t give = bytes_old - bytes_new;
+        if (!pool_on_) {
+            const size_t free_b = vram_free_budget_bytes();
+            const size_t floor_b = vram_keep_bytes();
+            give = std::min(give, free_b > floor_b ? free_b - floor_b : 0);
+        }
+        if (give > 0) grow_cache(give, true);
+        held_is_budget();
+    }
+}
+
+void Inkling2::zha_room_all(int64_t end) {
+    int need = (int) ((end + zha_.C - 1) / zha_.C) + 1;
+    zread_full_ = end - pos_ >= read_rows_;
+    if (zread_full_) need = zha_max_chunks_;
+    for (ZSlot& S : zs_)
+        if (S.zk) zha_room(S, need);
+}
+
+void Inkling2::zha_room(ZSlot& S, int need) {
+    if (!zgrow_ || need <= S.zcap) return;
+    int cap = S.zcap;
+    while (cap < need && cap < zha_max_chunks_) cap = std::min(zha_max_chunks_, cap * 2);
+    zha_recap(S, cap);
+}
+
+void Inkling2::zha_scratch() {
+    if (zw_.S) return;
+    const int per = n_head_ / n_kv_;
+    const size_t sub = (size_t) rows_, extent = (size_t) std::max(window_, 1024);
+    zlend_ = vmm_;
+    const size_t need = (size_t) per * sub * extent + 65536 + (sub / 64 + 1) * (size_t) zha_max_chunks_ +
+                        sub * per * 9 * (head_dim_ + 2) + (size_t) n_head_ * 128 * (head_dim_ + 2);
+    zw_.s_floats = std::max<size_t>(size_t(4) << 20, need + (size_t(1) << 20));
+    zfull_[7] = zw_.s_floats * sizeof(float);
+    if (zlend_) {
+        vmm_reserve(zmap_[7], zfull_[7]);
+        zw_.S = (float*) zmap_[7].base;
+    } else {
+        zw_.S = (float*) dmalloc(zfull_[7], "the index");
+    }
+    const size_t hs = sub * zha_max_chunks_;
+    zw_.heads = zlend_ ? n_kv_ : 1;
+    zw_.cmap = (int*) dmalloc((size_t) n_kv_ * zha_max_chunks_ * sizeof(int), "the index");
+    zw_.count = (int*) dmalloc((size_t) n_kv_ * sizeof(int), "the index");
+    zw_.glist = (int*) dmalloc((size_t) n_kv_ * (zha_max_chunks_ + 1) * sizeof(int), "the index");
+    const size_t keys = (size_t) zw_.heads * zha_max_chunks_ * zha_.C, per_key = head_dim_ / 2;
+    zw_.stage.row = head_dim_;
+    zw_.stage.headed = 0;
+    zw_.stage.q4 = 1;
+    zfull_[0] = (size_t) (per + 1) * hs * sizeof(float);
+    zfull_[1] = zfull_[2] = (size_t) per * hs;
+    zfull_[3] = zfull_[4] = keys * per_key;
+    zfull_[5] = zfull_[6] = keys * head_dim_ / 32 * sizeof(uint16_t);
+    void* p[7];
+    for (int i = 0; i < 7; ++i) {
+        if (zlend_) {
+            vmm_reserve(zmap_[i], zfull_[i]);
+            p[i] = (void*) zmap_[i].base;
+        } else {
+            p[i] = dmalloc(zfull_[i], "the index");
+        }
+    }
+    zw_.score = (float*) p[0];
+    zw_.rstar = (uint8_t*) p[1];
+    zw_.sel = (uint8_t*) p[2];
+    zw_.stage.kc = (int8_t*) p[3];
+    zw_.stage.vc = (int8_t*) p[4];
+    zw_.stage.ks = (uint16_t*) p[5];
+    zw_.stage.vs = (uint16_t*) p[6];
+    if (zlend_) {
+        const size_t hd = (size_t) 4 * zha_max_chunks_;
+        zwd_ = zw_;
+        zwd_.s_floats = size_t(2) << 20;
+        zwd_.S = (float*) dmalloc(zwd_.s_floats * sizeof(float), "the index");
+        zwd_.score = (float*) dmalloc((size_t) (n_head_ + n_kv_) * hd * sizeof(float), "the index");
+        zwd_.rstar = (uint8_t*) dmalloc((size_t) n_head_ * hd, "the index");
+        zwd_.sel = (uint8_t*) dmalloc((size_t) n_head_ * hd, "the index");
+        zwd_.heads = 1;
+    }
+}
+
+void Inkling2::zha_widen(bool keep) {
+    const int heads = keep && zw_.heads == n_kv_ ? n_kv_ : 1;
+    size_t want[8] = {};
+    const int nm = zmap_[7].base ? 8 : 7;
+    for (int i = 0; i < nm; ++i)
+        want[i] = i >= 3 && i < 7 && zw_.heads > 1 ? zfull_[i] / zw_.heads * heads : zfull_[i];
+    bool enough = zwide_;
+    for (int i = 0; i < nm && enough; ++i) enough = zmap_[i].mapped >= want[i];
+    if (enough) {
+        zkeep_now_ = std::max(zkeep_now_, heads);
+        return;
+    }
+    ck(cudaStreamSynchronize(cs(st_)), "the index's prompt buffers");
+    const size_t grain = pool_on_ ? pg_ : grain_;
+    const auto whole = [&](size_t x) { return (x + grain - 1) / grain * grain; };
+    size_t more = 0;
+    for (int i = 0; i < nm; ++i) more += whole(want[i]) > zmap_[i].mapped ? whole(want[i]) - zmap_[i].mapped : 0;
+    const size_t free_b = pool_on_ ? vpool_bytes() : vram_free_budget_bytes();
+    const size_t keep_b = pool_on_ ? 0 : vram_keep_bytes();
+    if (exp_ && free_b < more + keep_b) {
+        const size_t had = arena_.mapped;
+        shrink_cache(more + keep_b - free_b);
+        held_is_budget();
+        zcut_ += had - arena_.mapped;
+    }
+    int mapped_heads = heads;
+    try {
+        for (int i = 0; i < nm; ++i) vmm_map(zmap_[i], want[i], SIZE_MAX, "the index's prompt buffers");
+    } catch (const std::runtime_error&) {
+        if (heads == 1) throw;
+        mapped_heads = 1;
+        for (int i = 0; i < nm; ++i)
+            vmm_map(zmap_[i], i >= 3 && i < 7 ? zfull_[i] / zw_.heads : zfull_[i], SIZE_MAX,
+                    "the index's prompt buffers");
+    }
+    zwide_ = true;
+    zkeep_now_ = mapped_heads;
+    zw_owner_ = nullptr;
+}
+
+void Inkling2::zha_narrow() {
+    if (!zwide_) return;
+    ck(cudaStreamSynchronize(cs(st_)), "the index's prompt buffers");
+    for (int i = 0; i < (zmap_[7].base ? 8 : 7); ++i) vmm_unmap(zmap_[i], 0);
+    zwide_ = false;
+    zkeep_now_ = 1;
+    zw_owner_ = nullptr;
+    if (exp_ && zcut_ > 0) {
+        size_t give = zcut_;
+        if (!pool_on_) {
+            const size_t free_b = vram_free_budget_bytes();
+            const size_t floor_b = vram_keep_bytes();
+            give = std::min(give, free_b > floor_b ? free_b - floor_b : 0);
+        }
+        if (give > 0) grow_cache(give, true);
+        held_is_budget();
+    }
+    zcut_ = 0;
+}
+
+void Inkling2::zha_attention(int slot, int n, int64_t pos, const float* sink_p) {
+    const Block& B = blocks_[(size_t) schedule_[(size_t) slot].phys];
+    ZSlot& S = zs_[(size_t) slot];
+    const int hk = n_kv_ * head_dim_, C = zha_.C;
+    ink::store_q4(k_, S.kc, S.ksc, hk, pos, n, 0, st_);
+    ink::store_q4(v_, S.vc, S.vsc, hk, pos, n, 0, st_);
+    {
+        const int64_t first = pos % zring_;
+        const int head = (int) std::min<int64_t>(n, zring_ - first);
+        store_q8(k_, S.rkc, S.rks, hk, first, head, st_);
+        store_q8(v_, S.rvc, S.rvs, hk, first, head, st_);
+        if (head < n) {
+            store_q8(k_ + (size_t) head * hk, S.rkc, S.rks, hk, 0, n - head, st_);
+            store_q8(v_ + (size_t) head * hk, S.rvc, S.rvs, hk, 0, n - head, st_);
+        }
+    }
+    ink::ZhaKv leaves, ring;
+    leaves.kc = S.kc, leaves.ks = S.ksc, leaves.vc = S.vc, leaves.vs = S.vsc;
+    leaves.q4 = 1;
+    ring.kc = S.rkc, ring.ks = S.rks, ring.vc = S.rvc, ring.vs = S.rvs;
+    leaves.row = ring.row = (long long) hk;
+    const int64_t n_ring = zring_;
+    if (pos != S.zpos) {
+        const int64_t refill = std::max<int64_t>(0, pos - (zring_ - rows_));
+        if (refill < pos) {
+            ink::q4_to_q8(S.kc, S.ksc, refill, S.rkc, S.rks, refill, zring_, hk, (int) (pos - refill), st_);
+            ink::q4_to_q8(S.vc, S.vsc, refill, S.rvc, S.rvs, refill, zring_, hk, (int) (pos - refill), st_);
+        }
+        S.zbuilt = std::min(S.zbuilt, (int) (pos / C));
+        ink::zha_cache_clear(S.zcache, n_kv_, zha_max_chunks_, st_);
+        const int want = (int) (std::max<int64_t>(pos + n, read_end_) / C) + 1;
+        if (zgrow_ && !zread_full_ && S.zcap > zcap0_ && 4 * want <= S.zcap) {
+            int cap = zcap0_;
+            while (cap < want) cap *= 2;
+            zha_recap(S, std::min(cap, zha_max_chunks_));
+        }
+        zha_room(S, (int) (pos / C));
+        ink::zha_build(S.zrefs, leaves, (int64_t) opt_.max_context + 1, S.zbuilt, (int) (pos / C), C, zha_.R, n_kv_,
+                       zha_max_chunks_, S.zk, S.zv, S.zb, st_, zha_q8n(S.zcap));
+        S.zbuilt = (int) (pos / C);
+    }
+    const int done = (int) ((pos + n) / C);
+    zha_room(S, done);
+    ink::zha_build(S.zrefs, ring, n_ring, S.zbuilt, done, C, zha_.R, n_kv_, zha_max_chunks_, S.zk, S.zv, S.zb, st_,
+                   zha_q8n(S.zcap));
+    S.zbuilt = std::max(S.zbuilt, done);
+    S.zpos = pos + n;
+    const bool small = zlend_ && n <= 4 && zha_pool_ > 0;
+    if (zlend_ && !small && !zwide_) zha_widen(false);
+    ink::ZhaWork wkp = zw_;
+    if (zlend_) wkp.heads = zkeep_now_;
+    const ink::ZhaWork& wk = small ? zwd_ : wkp;
+    const bool keep = n >= kStageRows && zw_owner_ == &S && zw_next_ == pos;
+    ink::zha_attend(blas_, zha_, q_, leaves, ring, n_ring, S.zk, S.zv, S.zb, S.zbuilt, zha_max_chunks_, pos, n, n_head_,
+                    n_kv_, r_cur_, fp(B.attn_rel_bias), n_rel_extent_, n_rel_, sink_p, wk, att_, st_, &S.zcache, keep,
+                    S.zcap);
+    zw_owner_ = &S;
+    zw_next_ = n >= kStageRows ? pos + n : -1;
 }
 
 }  // namespace strata::poly

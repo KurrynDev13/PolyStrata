@@ -1593,6 +1593,8 @@ void Engine::take_prompt_arena() {
 }
 
 void Engine::end_read() {
+    read_end_ = 0;
+    prompt_ends();
     if (!stage_lent_ && !carry_lent_ && !prompt_lent_) return;
     OnCard here(device_, split_);
     if (up_) ck(cudaStreamSynchronize(cs(up_)), "end_read");
@@ -5375,8 +5377,13 @@ void Engine::run(const int32_t* tokens, int n) {
     if (pos_ + n > opt_.max_context)
         throw std::runtime_error("the context is full (" + std::to_string(opt_.max_context) + " tokens)");
     cover(pos_ + n);
-    if (n >= kStageRows && prompt_loan_ && !prompt_lent_) take_prompt_arena();
-    else if (n < kStageRows && prompt_lent_ && !in_read_) end_read();
+    if (n >= kStageRows) {
+        if (!in_read_) read_end_ = std::max<int64_t>(read_end_, pos_ + n);
+        prompt_begins();
+        if (prompt_loan_ && !prompt_lent_) take_prompt_arena();
+    } else if (n < kStageRows && !in_read_) {
+        end_read();
+    }
 
     // h_r_ and h_cpu_ may still be the source of the previous call's copies
     ck(cudaStreamSynchronize(cs(st_)), "eval");
@@ -5604,19 +5611,45 @@ void Engine::run(const int32_t* tokens, int n) {
         if (bell_) bell_serve();
         return;
     }
-    for (int s = step0; s < step1; ++s) {
-        const auto [phys, slot] = step_ps(s);
-        Layer& L = layers_[(size_t) phys];
-        up(phys, slot, n, (size_t) n - 1);
-        if (!L.moe) continue;
-        if (batched(L, n)) {
-            moe_rows(L, phys, n);
-        } else if (!on_card(phys, n, (size_t) n - 1)) {
-            if (moe(L, phys, n)) moe_add(n);
-        } else if (bell_) {
+    bool bell_pending = false;
+    const auto flush_bell = [&] {
+        if (bell_pending) {
             bell_serve();
+            bell_pending = false;
         }
-        tail(phys, slot, n, (size_t) n - 1);
+    };
+    const auto need_rec = [](const std::vector<void*>& v, size_t k) { return k >= v.size() || !v[k]; };
+    try {
+        for (int s = step0; s < step1; ++s) {
+            const auto [phys, slot] = step_ps(s);
+            Layer& L = layers_[(size_t) phys];
+            const size_t rec = (size_t) n - 1;
+            const size_t head = (size_t) head_key(slot, n) * recs + rec;
+            const bool will_capture =
+                replay &&
+                (L.card != 1 || !L.fixed || need_rec(heads_of(slot), head) ||
+                 (L.moe && !batched(L, n) && (need_rec(L.shared, rec) || need_rec(L.card_moe, rec))) ||
+                 need_rec(tail_of(slot), rec));
+            if (bell_pending && will_capture) flush_bell();
+            up(phys, slot, n, rec);
+            if (!L.moe) continue;
+            if (batched(L, n)) {
+                flush_bell();
+                moe_rows(L, phys, n);
+            } else if (!on_card(phys, n, rec)) {
+                flush_bell();
+                if (moe(L, phys, n)) moe_add(n);
+            } else if (bell_) {
+                if (!replay || !L.fixed || L.card != 1) flush_bell();
+                if (replay && L.fixed && L.card == 1) bell_pending = true;
+                else bell_serve();
+            }
+            tail(phys, slot, n, rec);
+        }
+        flush_bell();
+    } catch (...) {
+        bell_pending = false;
+        throw;
     }
 }
 
@@ -6073,6 +6106,7 @@ bool Engine::read_groups(const Mark* marks, int n_marks, const std::function<boo
     const size_t free_b = pool_on_ ? vpool_bytes() : vram_free_budget_bytes();
     const size_t keep_b = vram_keep_bytes();
     const size_t room = (free_b > keep_b ? free_b - keep_b : 0) +
+                        (carry_lent_ ? carry_map_.mapped : 0) +
                         (exp_ && arena_.mapped > kArenaPiece ? arena_.mapped - kArenaPiece : 0);
     int g = (int) std::min<size_t>((size_t) n_calls, room / (per * sizeof(float)));
     float* base = nullptr;
@@ -6212,14 +6246,18 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
         explicit ReadScope(Engine& eng) : e(eng) { e.in_read_ = true; }
         ~ReadScope() {
             e.in_read_ = false;
-            if (!ok && e.prompt_lent_) {
+            if (!ok) {
                 try {
                     e.end_read();
                 } catch (...) {}
             }
         }
     } read_scope(*this);
-    if (prompt_loan_ && n >= kStageRows && !short_window_read) take_prompt_arena();
+    read_end_ = pos_ + n;
+    if (n >= kStageRows && !short_window_read) {
+        prompt_begins();
+        if (prompt_loan_) take_prompt_arena();
+    }
     cover(pos_ + n);
     // On several cards, each reads through its own layers and hands the rows on, and `turn` hears of a card's
     // turns as its share of the model's layers: [lo_, to).
