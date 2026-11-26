@@ -10,6 +10,20 @@ class Tokenizer(ByteTokenizer):
         return self.SPECIALS[token - 256].encode() if token >= 256 else bytes([token])
 
 
+class InklingTokenizer(Tokenizer):
+    pre = "inkling2"
+    SPECIALS = Tokenizer.SPECIALS + [
+        "<|message_user|>",
+        "<|message_model|>",
+        "<|message_system|>",
+        "<|content_thinking|>",
+        "<|content_text|>",
+        "<|content_invoke_tool_json|>",
+        "<|end_message|>",
+        "<|content_model_end_sampling|>",
+    ]
+
+
 class RecordingEngine(MockEngine):
     def __init__(self, tokenizer, scripts):
         super().__init__(tokenizer, scripts, max_context=100000)
@@ -219,6 +233,27 @@ class ReasoningLoopRecovery(unittest.TestCase):
         self.assertEqual(retained, self.tok.encode(self.loop)[:len(retained)])
         self.assertEqual(engine.calls[1][1], 40000 - len(retained))
         self.assertNotIn('</think>', self.tok.decode(engine.calls[1][0]))
+
+    def test_inkling2_loop_wraps_up_thinking_and_preserves_prefix(self):
+        tok = InklingTokenizer()
+        ids = tok.encode('<|message_system|>Solve task<|end_message|><|message_user|>Egg<|end_message|>',
+                         parse_special=True)
+        loop_script = '<|message_model|><|content_thinking|>' + ('Nest — the actual.\n\n' * 600)
+        answer_script = 'Complete solution.<|end_message|><|content_model_end_sampling|>'
+        engine = RecordingEngine(tok, [loop_script, answer_script])
+        service = Service(engine, tok, None)
+        service.answer_room = False
+        service.reasoning_loop_recovery = 'recover'
+        request = {'temperature': 1.0, 'top_p': 1.0, 'presence_penalty': 0.4, 'penalty_last_n': 256}
+        events = list(service.run(ids, True, [], 40000, request, threading.Event()))
+        self.assertEqual(len(engine.calls), 2)
+        self.assertEqual(engine.calls[1][0][:len(ids)], ids)
+        self.assertGreaterEqual(engine.sampling_calls[1]['presence_penalty'], 1.0)
+        self.assertEqual(request['presence_penalty'], 0.4)
+        self.assertEqual(events[-1][1]['reasoning_recoveries'], 1)
+        self.assertEqual(events[-1][1]['finish'], 'stop')
+        content = ''.join(e.text or '' for kind, e in events if kind == 'event' and e.kind == 'content')
+        self.assertEqual(content, 'Complete solution.')
 
 
 if __name__ == '__main__':

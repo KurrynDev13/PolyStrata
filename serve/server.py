@@ -5134,6 +5134,7 @@ class Service:
                         gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb) if emb \
                             else self.engine.generate(prompt, max_new - n, sampling, cancel)
                         recover_prompt = None
+                        loop_wrap = False
                         seg, wrap, leaving = [], False, False   # this pass's tokens; the budget is reached; closed
                         nonfinite = False               # #879: the engine ended this pass on non-finite logits
                         opens = False                   # the thinking is over: write the forced call's opening
@@ -5199,6 +5200,9 @@ class Service:
                                         if not emb:              # "recover": not for a request with pictures
                                             recover_prompt = focused_recovery_prompt(self.tok, ids, raw_ids)
                                             if recover_prompt is not None:
+                                                break
+                                            if parser.think_end == INKLING_END:
+                                                loop_wrap = True
                                                 break
                                 if budget and parser.state == "reasoning":
                                     thought += 1
@@ -5280,6 +5284,37 @@ class Service:
                                   f"(coverage={repeat_coverage:.3f}); resuming the same output with the low-effort "
                                   "instruction (reasoning_loop_recovery)", flush=True)
                             continue
+                        if loop_wrap and not cancel.is_set() and n < max_new:
+                            text = closed_with(REASONING_WRAP_UP, parser.think_end) + (force or "")
+                            extra = self.tok.encode(text, parse_special=True)
+                            if max_new - n - len(extra) >= 1:
+                                recovery_count += 1
+                                budget = st["thinking_budget"] = None
+                                force = None
+                                want_pp = max(1.0, float((sampling or {}).get("presence_penalty") or 0))
+                                if want_pp != float((sampling or {}).get("presence_penalty") or 0):
+                                    sampling = {**(sampling or {}), "presence_penalty": want_pp}
+                                with self.status_lock:
+                                    st["reasoning_recoveries"] = recovery_count
+                                if trace is not None:
+                                    trace["reasoning_recoveries"] = recovery_count
+                                    trace["reasoning_repeat_coverage"] = round(repeat_coverage, 3)
+                                print(f"[strata] repeated reasoning detected at {n} tokens "
+                                      f"(coverage={repeat_coverage:.3f}); wrapping up Inkling 2 thinking to force an "
+                                      "answer (reasoning_loop_recovery)", flush=True)
+                                for t in extra:
+                                    n += 1
+                                    raw_ids.append(t)
+                                    thinking_n += parser.state in ("reasoning", "rcall")
+                                    evs = cut(parser.feed(detok.push(t)))
+                                    self._note(n, evs, st, rate)
+                                    for ev in evs:
+                                        yield "event", ev
+                                if stops is not None and stops.hit is not None:
+                                    finish = "stop"
+                                    break
+                                prompt = prompt + seg + extra
+                                continue
                         if (self.reasoning_close_retry and thinking and finish == "stop" and not close_retried
                                 and not answered and not wrap and not opens and parser.state == "reasoning"
                                 and parser.buf != parser.think_end  # #537: not after a held </think>, the end
