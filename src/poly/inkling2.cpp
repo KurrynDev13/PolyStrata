@@ -17,6 +17,7 @@
 #include <cstring>
 #include <initializer_list>
 #include <stdexcept>
+#include <type_traits>
 
 namespace strata::poly {
 namespace {
@@ -826,6 +827,8 @@ void Inkling2::save_card_rows(int64_t first, int64_t n, uint8_t* dst) {
     for (size_t i = 0; i < slots_.size() && zha_on_ && n > 0; ++i) {
         const ZSlot& z = zs_[i];
         if (slots_[i].swa || !z.kc) continue;
+        if (first + n > z.zleaf_cap)
+            throw std::logic_error("save_rows: the rows are outside the ZHA leaf capacity");
         const size_t codes = zha_leaf_codes(), scales = zha_leaf_scales();
         const std::pair<const int8_t*, const uint16_t*> parts[2] = {{z.kc, z.ksc}, {z.vc, z.vsc}};
         for (const auto& [c, sc_ptr] : parts) {
@@ -903,6 +906,8 @@ void Inkling2::load_card_rows(const uint8_t* src, int64_t from, int64_t count, i
     for (size_t i = 0; i < slots_.size() && zha_on_ && n > 0; ++i) {
         ZSlot& z = zs_[i];
         if (slots_[i].swa || !z.kc) continue;
+        zha_leaf_room(z, first + n);
+        z.zleaf_used = std::max<int64_t>(z.zleaf_used, first + n);
         const size_t codes = zha_leaf_codes(), scales = zha_leaf_scales();
         const std::pair<int8_t*, uint16_t*> parts[2] = {{z.kc, z.ksc}, {z.vc, z.vsc}};
         for (const auto& [c, sc_ptr] : parts) {
@@ -1922,6 +1927,7 @@ void Inkling2::draft_commit(int64_t pos, int n) {
             if (z.zpos > committed) {
                 z.zpos = committed;
                 z.zbuilt = std::min(z.zbuilt, (int) (committed / zha_.C));
+                z.zleaf_used = std::min<int64_t>(z.zleaf_used, committed);
             }
         }
     }
@@ -2249,25 +2255,21 @@ void Inkling2::zha_load() {
     zha_on_ = true;
     std::fprintf(stderr,
                  "strata-poly: ZHA index: chunks of %d, %d references, budget %.3f (at most %d), a pool of %d "
-                 "chunks a KV head\n",
-                 zha_.C, zha_.R, zha_.budget, zha_.max_sel, zha_pool_);
+                 "chunks a KV head%s\n",
+                 zha_.C, zha_.R, zha_.budget, zha_.max_sel, zha_pool_,
+                 (opt_.kv_grow && opt_.max_context > 65536) ? ", leaves grow from 64K" : "");
 #endif
 }
 
 void Inkling2::zha_alloc(int slot, int il, int pass) {
     ZSlot& S = zs_[(size_t) slot];
     if (S.kc) return;
+    if (zleaf_cap0_ == 0)
+        zleaf_cap0_ = opt_.kv_grow ? std::min<int64_t>(opt_.max_context, (int64_t) 65536) : opt_.max_context;
+    S.zleaf_cap = 0;
+    S.zleaf_used = 0;
+    zha_leaf_recap(S, zleaf_cap0_);
     const size_t codes = (size_t) n_kv_ * head_dim_, scales = codes / 32 * sizeof(uint16_t);
-    const size_t rows = (size_t) opt_.max_context;
-    const auto host = [&](size_t bytes) {
-        void* p = nullptr;
-        ck(cudaHostAlloc(&p, bytes, cudaHostAllocMapped | cudaHostAllocPortable), "the index's leaves (pinned RAM)");
-        return p;
-    };
-    S.kc = (int8_t*) host(rows * codes / 2);
-    S.ksc = (uint16_t*) host(rows * scales);
-    S.vc = (int8_t*) host(rows * codes / 2);
-    S.vsc = (uint16_t*) host(rows * scales);
     S.rkc = (int8_t*) dmalloc((size_t) zring_ * codes, "the index's ring");
     S.rks = (uint16_t*) dmalloc((size_t) zring_ * scales, "the index's ring");
     S.rvc = (int8_t*) dmalloc((size_t) zring_ * codes, "the index's ring");
@@ -2372,8 +2374,11 @@ void Inkling2::zha_room_all(int64_t end) {
     int need = (int) ((end + zha_.C - 1) / zha_.C) + 1;
     zread_full_ = end - pos_ >= read_rows_;
     if (zread_full_) need = zha_max_chunks_;
-    for (ZSlot& S : zs_)
+    const int64_t leaf_need = std::min<int64_t>(opt_.max_context, end + 256);
+    for (ZSlot& S : zs_) {
         if (S.zk) zha_room(S, need);
+        if (S.kc) zha_leaf_room(S, leaf_need);
+    }
 }
 
 void Inkling2::zha_room(ZSlot& S, int need) {
@@ -2381,6 +2386,36 @@ void Inkling2::zha_room(ZSlot& S, int need) {
     int cap = S.zcap;
     while (cap < need && cap < zha_max_chunks_) cap = std::min(zha_max_chunks_, cap * 2);
     zha_recap(S, cap);
+}
+
+void Inkling2::zha_leaf_recap(ZSlot& S, int64_t cap) {
+    cap = std::clamp<int64_t>(cap, 1, opt_.max_context);
+    if (cap == S.zleaf_cap) return;
+    if (S.kc) ck(cudaStreamSynchronize(cs(st_)), "the index's leaves");
+    const int64_t keep = std::min<int64_t>(S.zleaf_used, std::min<int64_t>(cap, S.zleaf_cap));
+    const size_t codes = zha_leaf_codes(), scales = zha_leaf_scales();
+    auto realloc_pinned = [&](auto*& ptr, size_t row_bytes) {
+        using T = std::remove_pointer_t<std::remove_reference_t<decltype(ptr)>>;
+        void* np = nullptr;
+        ck(cudaHostAlloc(&np, (size_t) cap * row_bytes, cudaHostAllocMapped | cudaHostAllocPortable),
+           "the index's leaves (pinned RAM)");
+        if (ptr && keep > 0) std::memcpy(np, ptr, (size_t) keep * row_bytes);
+        if (ptr) cudaFreeHost(ptr);
+        ptr = (T*) np;
+    };
+    realloc_pinned(S.kc, codes);
+    realloc_pinned(S.ksc, scales);
+    realloc_pinned(S.vc, codes);
+    realloc_pinned(S.vsc, scales);
+    S.zleaf_cap = cap;
+    S.zleaf_used = keep;
+}
+
+void Inkling2::zha_leaf_room(ZSlot& S, int64_t need) {
+    if (need <= S.zleaf_cap) return;
+    int64_t cap = std::max<int64_t>(S.zleaf_cap, zleaf_cap0_);
+    while (cap < need && cap < opt_.max_context) cap = std::min<int64_t>(opt_.max_context, cap * 2);
+    zha_leaf_recap(S, cap);
 }
 
 void Inkling2::zha_scratch() {
@@ -2503,6 +2538,17 @@ void Inkling2::zha_attention(int slot, int n, int64_t pos, const float* sink_p) 
     const Block& B = blocks_[(size_t) schedule_[(size_t) slot].phys];
     ZSlot& S = zs_[(size_t) slot];
     const int hk = n_kv_ * head_dim_, C = zha_.C;
+    if (pos != S.zpos && opt_.kv_grow && S.zleaf_cap > zleaf_cap0_) {
+        const int64_t want_rows = std::max<int64_t>(pos + n, read_end_);
+        if (4 * want_rows <= S.zleaf_cap) {
+            S.zleaf_used = std::min<int64_t>(S.zleaf_used, pos);
+            int64_t cap = zleaf_cap0_;
+            while (cap < want_rows && cap < opt_.max_context) cap = std::min<int64_t>(opt_.max_context, cap * 2);
+            zha_leaf_recap(S, cap);
+        }
+    }
+    zha_leaf_room(S, pos + n);
+    S.zleaf_used = std::max<int64_t>(S.zleaf_used, pos + n);
     ink::store_q4(k_, S.kc, S.ksc, hk, pos, n, 0, st_);
     ink::store_q4(v_, S.vc, S.vsc, hk, pos, n, 0, st_);
     {

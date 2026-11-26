@@ -223,6 +223,8 @@ private:
         float* zb = nullptr;
         int zbuilt = 0;                           ///< chunks summarized so far
         int zcap = 0;                             ///< summary capacity (chunks/KV-head)
+        int64_t zleaf_cap = 0;                    ///< host leaf capacity (rows)
+        int64_t zleaf_used = 0;                   ///< high-water valid leaf rows
         int64_t zpos = -1;                        ///< end position of last call (-1: rebuild)
         ink::ZhaCache zcache;                     ///< per-KV-head LRU chunk cache in VRAM
     };
@@ -244,9 +246,12 @@ private:
     }
     bool zgrow_ = false;
     int zcap0_ = 0;
+    int64_t zleaf_cap0_ = 0;
     bool zread_full_ = false;
     void zha_recap(ZSlot& S, int cap);
     void zha_room(ZSlot& S, int need);
+    void zha_leaf_recap(ZSlot& S, int64_t cap);
+    void zha_leaf_room(ZSlot& S, int64_t need);
     void zha_room_all(int64_t end);
     void zha_load();
     void zha_alloc(int slot, int il, int pass);
