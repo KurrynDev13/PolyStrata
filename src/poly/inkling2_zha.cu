@@ -574,6 +574,74 @@ __global__ void __launch_bounds__(128) zha_score_dec_kernel(const float* __restr
     (void) lane;
 }
 
+// Multi-row (rows <= 4, Q4 summaries, per <= 3) version of zha_score_dec_kernel: reads each chunk summary row once
+// and computes chunk scores + best reference for all `rows` tokens of a KV group in a single pass.
+__global__ void __launch_bounds__(128) zha_score_dec_few_kernel(
+    const float* __restrict__ q, const int8_t* __restrict__ codes, size_t q8n, const float* __restrict__ bhat, int nch,
+    int max_chunks, int rows, int n_head, int per, float* __restrict__ score, uint8_t* __restrict__ rstar, size_t hs) {
+    __shared__ float qs[4][3][kZhaDim];
+    const int g = blockIdx.y;
+    const float sc = rsqrtf((float) kZhaDim);
+    for (int i = threadIdx.x; i < rows * per * kZhaDim; i += blockDim.x) {
+        const int t = i / (per * kZhaDim), rem = i % (per * kZhaDim), p = rem / kZhaDim, d = rem % kZhaDim;
+        qs[t][p][d] = q[((size_t) t * n_head + g * per + p) * kZhaDim + d] * sc;
+    }
+    __syncthreads();
+    const int c = blockIdx.x * 32 + (threadIdx.x >> 2), r = threadIdx.x & 3;
+    const bool live = c < nch;
+    const size_t row = ((size_t) g * zq_cap(q8n, max_chunks) + (live ? c : 0)) * 4 + r;
+    const uint16_t* scales = zq_scales(codes, q8n);
+    const uint2 su = *reinterpret_cast<const uint2*>(scales + row * 4);
+    const uint16_t sv[4] = {(uint16_t) (su.x & 0xffff), (uint16_t) (su.x >> 16), (uint16_t) (su.y & 0xffff),
+                            (uint16_t) (su.y >> 16)};
+    float acc[4][3] = {};
+    const uint4* cr = reinterpret_cast<const uint4*>(codes + row * (kZhaDim / 2));
+    uint4 x[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) x[i] = cr[i];
+#pragma unroll
+    for (int b = 0; b < 4; ++b) {
+        const uint32_t w4[4] = {x[b].x, x[b].y, x[b].z, x[b].w};
+        float part[4][3] = {};
+#pragma unroll
+        for (int k = 0; k < 4; ++k)
+#pragma unroll
+            for (int n = 0; n < 8; ++n) {
+                const int d0 = 32 * b + 8 * k + n;
+                const float a0 = (float) ((int) ((w4[k] >> (4 * n)) & 15) - 8);
+                for (int t = 0; t < rows; ++t)
+#pragma unroll
+                    for (int p = 0; p < 3; ++p)
+                        if (p < per) part[t][p] += a0 * qs[t][p][d0];
+            }
+        const float d = __half2float(__ushort_as_half(sv[b]));
+        for (int t = 0; t < rows; ++t)
+#pragma unroll
+            for (int p = 0; p < 3; ++p) acc[t][p] += part[t][p] * d;
+    }
+    const float bb = bhat[row];
+    for (int t = 0; t < rows; ++t) {
+        const size_t row_off = (size_t) t * max_chunks;
+#pragma unroll
+        for (int p = 0; p < 3; ++p) {
+            if (p >= per) break;
+            float v = acc[t][p] + bb;
+            int arg = r;
+#pragma unroll
+            for (int o = 1; o < 4; o <<= 1) {
+                const float ov = __shfl_xor_sync(0xffffffffu, v, o);
+                const int oa = __shfl_xor_sync(0xffffffffu, arg, o);
+                if (ov > v || (ov == v && oa < arg)) v = ov, arg = oa;
+            }
+            if (live && r == 0) {
+                const size_t at = (size_t) (g * per + p) * hs + row_off + c;
+                score[at] = v;
+                rstar[at] = (uint8_t) arg;
+            }
+        }
+    }
+}
+
 // The block's max (every thread gets it); red: 32 floats of shared memory.
 __device__ __forceinline__ float zha_block_max(float v, float* red) {
     const int lane = threadIdx.x & 31, w = threadIdx.x >> 5, warps = blockDim.x >> 5;
@@ -929,13 +997,15 @@ __global__ void __launch_bounds__(128) zha_exact_dec_kernel(const float* __restr
                                                             const float* __restrict__ rr, const float* __restrict__ table,
                                                             int extent, int nrel, float* __restrict__ part, int seg_total) {
     __shared__ float qs[kZhaDim], rv[32], wm[4], wl[4], wo[4][kZhaDim];
-    const int head = blockIdx.x, seg = blockIdx.y, segs = gridDim.y, lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+    const int head = blockIdx.x, seg = blockIdx.y, segs = gridDim.y, t = blockIdx.z, lane = threadIdx.x & 31, w = threadIdx.x >> 5;
     const int g = head / (n_head / kv);
     const float sc = rsqrtf((float) kZhaDim);
+    q += (size_t) t * n_head * kZhaDim;
+    rr += (size_t) t * n_head * nrel;
     for (int i = threadIdx.x; i < kZhaDim; i += blockDim.x) qs[i] = q[(size_t) head * kZhaDim + i] * sc;
     if ((int) threadIdx.x < nrel) rv[threadIdx.x] = rr[(size_t) head * nrel + threadIdx.x];
     __syncthreads();
-    const long long own = pos;
+    const long long own = pos + t;
     long long fr;
     zha_far(own, C, recent, &fr);
     const int* gl = glist + (size_t) g * (max_chunks + 1);
@@ -1071,7 +1141,7 @@ __global__ void __launch_bounds__(128) zha_exact_dec_kernel(const float* __restr
 #pragma unroll
         for (int i = 0; i < 4; ++i) o[i] += wo[k][4 * lane + i] * f;
     }
-    float* pp = part + ((size_t) head * seg_total + seg) * (kZhaDim + 2);
+    float* pp = part + (((size_t) t * n_head + head) * seg_total + seg) * (kZhaDim + 2);
 #pragma unroll
     for (int i = 0; i < 4; ++i) pp[4 * lane + i] = o[i];
     if (lane == 0) pp[kZhaDim] = M, pp[kZhaDim + 1] = Z;
@@ -1145,14 +1215,16 @@ __global__ void __launch_bounds__(128) zha_exact_dec_group_kernel(const float* _
                                                                   float* __restrict__ part, int seg_total) {
     constexpr int PER = 3, KPS = 4;   // KPS: keys a step of the values (8 lanes a key, 16 values a lane)
     __shared__ float qs[PER][kZhaDim], rv[PER][16], wm[4][PER], wl[4][PER], wo[4][PER][kZhaDim];
-    const int g = blockIdx.x, seg = blockIdx.y, segs = gridDim.y, lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+    const int g = blockIdx.x, seg = blockIdx.y, segs = gridDim.y, t = blockIdx.z, lane = threadIdx.x & 31, w = threadIdx.x >> 5;
     const float sc = rsqrtf((float) kZhaDim);
+    q += (size_t) t * n_head * kZhaDim;
+    rr += (size_t) t * n_head * nrel;
     for (int i = threadIdx.x; i < PER * kZhaDim; i += blockDim.x)
         qs[i / kZhaDim][i % kZhaDim] = q[((size_t) g * PER + i / kZhaDim) * kZhaDim + i % kZhaDim] * sc;
     for (int i = threadIdx.x; i < PER * nrel; i += blockDim.x)
         rv[i / nrel][i % nrel] = rr[((size_t) g * PER + i / nrel) * nrel + i % nrel];
     __syncthreads();
-    const long long own = pos;
+    const long long own = pos + t;
     long long fr;
     zha_far(own, C, recent, &fr);
     const int* gl = glist + (size_t) g * (max_chunks + 1);
@@ -1304,7 +1376,7 @@ __global__ void __launch_bounds__(128) zha_exact_dec_group_kernel(const float* _
 #pragma unroll
         for (int i = 0; i < 4; ++i) o[i] += wo[k][p][4 * lane + i] * f;
     }
-    float* pp = part + ((size_t) (g * PER + p) * seg_total + seg) * (kZhaDim + 2);
+    float* pp = part + (((size_t) t * n_head + (g * PER + p)) * seg_total + seg) * (kZhaDim + 2);
 #pragma unroll
     for (int i = 0; i < 4; ++i) pp[4 * lane + i] = o[i];
     if (lane == 0) pp[kZhaDim] = M, pp[kZhaDim + 1] = Z;
@@ -1320,13 +1392,14 @@ __global__ void __launch_bounds__(128) zha_tail_dec_kernel(const float* __restri
                                                            int R, int C, int recent, size_t hs, int sel_heads,
                                                            float* __restrict__ part, int seg_base, int seg_total) {
     __shared__ float red[32], wl[4], wo[4][kZhaDim];
-    const int head = blockIdx.x, seg = blockIdx.y, segs = gridDim.y, lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+    const int head = blockIdx.x, seg = blockIdx.y, segs = gridDim.y, t = blockIdx.z, lane = threadIdx.x & 31, w = threadIdx.x >> 5;
     const int per = n_head / kv, g = head / per;
-    score += (size_t) head * hs;
-    rstar += (size_t) head * hs;
-    sel += (size_t) (sel_heads == 1 ? g : head) * hs;
+    const size_t row_off = (size_t) t * max_chunks;
+    score += (size_t) head * hs + row_off;
+    rstar += (size_t) head * hs + row_off;
+    sel += (size_t) (sel_heads == 1 ? g : head) * hs + row_off;
     long long fr;
-    const int nf = zha_far(pos, C, recent, &fr);
+    const int nf = zha_far(pos + t, C, recent, &fr);
     const int cps = (nf + segs - 1) / segs, c0 = 1 + seg * cps, c1 = min(nf + 1, c0 + cps);   // chunks [c0, c1)
     float mx = -INFINITY;
     for (int c = c0 + threadIdx.x; c < c1; c += blockDim.x)
@@ -1384,7 +1457,7 @@ __global__ void __launch_bounds__(128) zha_tail_dec_kernel(const float* __restri
 #pragma unroll
         for (int i = 0; i < 4; ++i) o[i] += wo[k][4 * lane + i];
     }
-    float* pp = part + ((size_t) head * seg_total + seg_base + seg) * (kZhaDim + 2);
+    float* pp = part + (((size_t) t * n_head + head) * seg_total + seg_base + seg) * (kZhaDim + 2);
 #pragma unroll
     for (int i = 0; i < 4; ++i) pp[4 * lane + i] = o[i];
     if (lane == 0) pp[kZhaDim] = Z > 0.f ? M : -INFINITY, pp[kZhaDim + 1] = Z;
@@ -2382,6 +2455,9 @@ void zha_attend(void* blas, const Zha& z, const float* q, const ZhaKv& leaves, c
     if (dec && built > 0) {
         zha_score_dec_kernel<<<dim3(grid(nch, 32), kv_heads), 128, 0, cs(stream)>>>(
             q, (const int8_t*) khat, q8n, bhat, nch, max_chunks, n_head, per, wk.score, wk.rstar, hs);
+    } else if (dec_few && per <= 3 && zq_4(q8n) && built > 0) {
+        zha_score_dec_few_kernel<<<dim3(grid(nch, 32), kv_heads), 128, 0, cs(stream)>>>(
+            q, (const int8_t*) khat, q8n, bhat, nch, max_chunks, rows, n_head, per, wk.score, wk.rstar, hs);
     } else if (few && built > 0) {   // a thread a chunk of a group, its heads' scores at once
         zha_score_few_kernel<4><<<dim3(grid(nch, 128), kv_heads, rows), 128, 0, cs(stream)>>>(
             q, (const __half*) khat, q8n, bhat, nch, max_chunks, n_head, per, wk.score, wk.rstar, hs);
@@ -2438,7 +2514,7 @@ void zha_attend(void* blas, const Zha& z, const float* q, const ZhaKv& leaves, c
             zha_fill_q4_kernel<<<dim3(kFillBlocks, kv_heads), 256, 0, s>>>(leaves, wk.cmap, cache->aux, cache->P,
                                                                            cache->pool, max_chunks);
         };
-        if (!dec) {
+        if (!dec && !dec_few) {
             fill(cs(stream));
             zha_attend_kernel<<<dim3(rows, n_head, segs), 128, 0, cs(stream)>>>(
                 q, cache->pool, wk.cmap, ring, n_ring, wk.score, wk.sel, wk.rstar, (const __half*) vhat, max_chunks,
@@ -2465,16 +2541,16 @@ void zha_attend(void* blas, const Zha& z, const float* q, const ZhaKv& leaves, c
         // the tail in segments, then (the fill done) the exact part: the selected chunks, chunk 0 and the recent keys,
         // all joined with the sinks
         constexpr int segs_all = kSegExact + kSegTail;
-        zha_tail_dec_kernel<<<dim3(n_head, kSegTail), 128, 0, cs(stream)>>>(
+        zha_tail_dec_kernel<<<dim3(n_head, kSegTail, rows), 128, 0, cs(stream)>>>(
             wk.score, wk.rstar, wk.sel, (const __half*) vhat, q8n, max_chunks, pos, n_head, kv_heads, z.R, z.C,
             z.recent, hs, sels, wk.S, kSegExact, segs_all);
         cudaStreamWaitEvent(cs(stream), filled, 0);
         if (per == 3 && nrel <= 16)   // a group's three heads in one launch
-            zha_exact_dec_group_kernel<<<dim3(kv_heads, kSegExact), 128, 0, cs(stream)>>>(
+            zha_exact_dec_group_kernel<<<dim3(kv_heads, kSegExact, rows), 128, 0, cs(stream)>>>(
                 q, cache->pool, wk.cmap, wk.glist, ring, n_ring, max_chunks, pos, n_head, z.C, z.recent, r, table,
                 extent, nrel, wk.S, segs_all);
         else
-            zha_exact_dec_kernel<<<dim3(n_head, kSegExact), 128, 0, cs(stream)>>>(
+            zha_exact_dec_kernel<<<dim3(n_head, kSegExact, rows), 128, 0, cs(stream)>>>(
                 q, cache->pool, wk.cmap, wk.glist, ring, n_ring, max_chunks, pos, n_head, kv_heads, z.C, z.recent, r,
                 table, extent, nrel, wk.S, segs_all);
         zha_join_kernel<<<dim3(rows, n_head), 32, 0, cs(stream)>>>(wk.S, segs_all, n_head, 0, sinks, out);
