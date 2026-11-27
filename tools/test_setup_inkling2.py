@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -21,6 +22,17 @@ SIZES = [
     ("UD-IQ3_XXS", 11663309504),
     ("UD-Q4_K_XL", 17629759456),
     ("UD-Q8_K_XL", 22867451616),
+]
+
+GSQ_FAM = setup.FAMILIES["inkling2-gsq"]
+GSQ_SIZES = [
+    ("IQ3_S", 11425259648, "ISTA-DASLab/Inkling-2-Mini-GSQ-RCO-GGUF"),
+    ("IQ3_XXS", 10608205952, "ISTA-DASLab/Inkling-2-Mini-GSQ-RCO-GGUF"),
+    ("Q2_K_XL", 9792516224, "ISTA-DASLab/Inkling-2-Mini-GSQ-RCO-GGUF"),
+    ("IQ2_S", 8975863424, "ISTA-DASLab/Inkling-2-Mini-GSQ-RCO-GGUF"),
+    ("IQ2_XS", 8476859744, "abenzerps/Inkling-2-Mini-GSQ-RCO-GGUF"),
+    ("IQ3_XS", 11644899392, "abenzerps/Inkling-2-Mini-GSQ-RCO-GGUF"),
+    ("IQ4_XS", 13577765280, "abenzerps/Inkling-2-Mini-GSQ-RCO-GGUF"),
 ]
 
 
@@ -41,9 +53,38 @@ class Pins(unittest.TestCase):
         self.assertEqual(setup.POLY_GGUF_ARCHS["inkling2"], ("inkling2_loop", "inkling2"))
         self.assertIn("KurrynDev13/PolyStrata-Inkling2", setup.POLY_PREBUILT_URL)
 
+    def test_gsq_rco_files(self):
+        self.assertEqual(list(setup.family_models("inkling2-gsq")), [m for m, _, _ in GSQ_SIZES])
+        self.assertRegex(GSQ_FAM["hf"], r"^https://huggingface.co/ISTA-DASLab/Inkling-2-Mini-GSQ-RCO-GGUF/resolve/[0-9a-f]{40}/$")
+        self.assertEqual(list(GSQ_FAM["sha256"]), [f"Inkling-2-Mini-GSQ-RCO-{m}.gguf" for m, _, _ in GSQ_SIZES])
+        for size, n, repo in GSQ_SIZES:
+            file = f"Inkling-2-Mini-GSQ-RCO-{size}.gguf"
+            d = GSQ_FAM["models"][size]
+            self.assertEqual((setup.model_file(GSQ_FAM, size, 1), setup.model_shards(GSQ_FAM, size)), (file, 1))
+            self.assertIn(repo, d.get("hf", GSQ_FAM["hf"]))
+            self.assertEqual(GSQ_FAM["sha256"][file][0], n)
+            self.assertRegex(GSQ_FAM["sha256"][file][1], r"^[0-9a-f]{64}$")
+            self.assertAlmostEqual(n / 1e9, d["download_gb"], delta=0.05)
+            self.assertLess(d["arena_gb"], d["download_gb"])
+            self.assertEqual(d["ram_gb"], round(setup.poly_ram_need(d, 8.0)), size)
+        self.assertEqual(setup.POLY_GGUF_ARCHS["inkling2-gsq"], ("inkling2_loop", "inkling2"))
+
     def test_the_about_line_says_the_first_size(self):
         n = setup.poly_ram_need(FAM["models"]["UD-Q3_K_XL"], 8.0)
         self.assertIn(f"~{n:.0f} GB of RAM beside an 8 GB card", FAM["about"])
+        n_gsq = setup.poly_ram_need(GSQ_FAM["models"]["IQ3_S"], 8.0)
+        self.assertIn(f"~{n_gsq:.0f} GB of RAM beside an 8 GB card", GSQ_FAM["about"])
+
+    def test_choices_from_config_tells_ud_and_gsq_apart(self):
+        with tempfile.TemporaryDirectory() as d:
+            ud_cfg = Path(d) / "strata-inkling2-ud-q4_k_xl.json"
+            gsq_cfg = Path(d) / "strata-inkling2gsq-iq3_xs.json"
+            ud_cfg.write_text(json.dumps({"exe": "/x/strata-poly.exe", "args": ["--max-context", "32768"]}))
+            gsq_cfg.write_text(json.dumps({"exe": "/x/strata-poly.exe", "args": ["--max-context", "65536"]}))
+            self.assertEqual(setup.choices_from_config(ud_cfg)["family"], "inkling2")
+            self.assertEqual(setup.choices_from_config(ud_cfg)["model"], "UD-Q4_K_XL")
+            self.assertEqual(setup.choices_from_config(gsq_cfg)["family"], "inkling2-gsq")
+            self.assertEqual(setup.choices_from_config(gsq_cfg)["model"], "IQ3_XS")
 
 
 class Main(unittest.TestCase):
@@ -68,8 +109,36 @@ class Main(unittest.TestCase):
                 for flag in ("--draft-model", "--tail-skip"):
                     self.assertNotIn(flag, args)
                 self.assertEqual(cfg["model_name"], f"inkling-2-mini-{size.lower()}")
-                self.assertEqual(cfg["display_name"], f"Inkling-2-Mini {size}")
+                self.assertEqual(cfg["display_name"], f"Inkling-2-Mini (Unsloth UD) {size}")
                 self.assertNotIn("vision", cfg)
+
+    def test_install_gsq_rco_sizes(self):
+        for size, _n, repo in GSQ_SIZES:
+            with self.subTest(size):
+                self.tearDown()
+                self.setUp()
+                self.downloads, self.runs, self.verified = [], [], []
+                code, out, _ = self.main(family="inkling2-gsq", model=size, ram=64.0, vram=10.0)
+                self.assertEqual(code, 0, out)
+                cfg = json.loads((self.t / f"strata-inkling2gsq-{size.lower()}.json").read_text())
+                file = f"Inkling-2-Mini-GSQ-RCO-{size}.gguf"
+                expected_hf = GSQ_FAM["models"][size].get("hf", GSQ_FAM["hf"])
+                self.assertIn(repo, expected_hf)
+                self.assertEqual(self.downloads, [expected_hf + file])
+                self.assertEqual(self.verified, [(file, *GSQ_FAM["sha256"][file])])
+                self.assertEqual(cfg["model_name"], f"inkling-2-mini-gsq-{size.lower()}")
+                self.assertEqual(cfg["display_name"], f"Inkling-2-Mini (GSQ-RCO) {size}")
+
+    def test_gsq_kv_formats_go_into_config_and_persist(self):
+        for kv in ("k8v4", "q8_0", "q4_0"):
+            with self.subTest(kv):
+                self.tearDown()
+                self.setUp()
+                code, out, cfg = self.main(["--kv", kv], family="inkling2-gsq", model="IQ3_S", ram=64.0, vram=10.0)
+                self.assertEqual(code, 0, out)
+                self.assertEqual(cfg["args"][cfg["args"].index("--kv") + 1], kv)
+                code, out, cfg = self.main(family="inkling2-gsq", model="IQ3_S", ram=64.0, vram=10.0)
+                self.assertEqual(cfg["args"][cfg["args"].index("--kv") + 1], kv)
 
     def test_kv_formats_go_into_config_and_persist(self):
         for kv in ("k8v4", "q8_0", "q4_0"):

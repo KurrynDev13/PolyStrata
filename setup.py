@@ -96,6 +96,8 @@ HF_REVISIONS = {
     "unsloth/Ornith-1.5-122B-GGUF": "3842d003341507c216295c6f28dfcd30349925c6",                          # 2026-10-20
     "ornith-ai/Ornith-1.5-122B": "dfa07bab90e90746ffbfc0b0cba3126eb9265de2",                              # 2026-10-20
     "unsloth/Inkling-2-Mini-GGUF": "45fd08764f2b0bf16b03a5483a80e5c7aaec8772",                            # 2026-11-22
+    "ISTA-DASLab/Inkling-2-Mini-GSQ-RCO-GGUF": "f0da1097633dd7c2f5733e4077cff861be122245",                # 2026-11-26
+    "abenzerps/Inkling-2-Mini-GSQ-RCO-GGUF": "78c95a16e097cb30ff975a0374293188aae0c339",                  # 2026-11-26
 }
 
 
@@ -870,7 +872,7 @@ FAMILIES = {
     # layers x 8 KV heads x 128 x 2 (K, V) x 2 B (fp16) = 32,768 B/token (--kv k8v4 uses 13,312 B/token).
     # Note: Unsloth's dspark-Inkling-2-Mini-*.gguf uses the "dflash" GGUF layout; strata-poly's optional DSpark MTP
     # drafter currently loads inkling2_dspark GGUFs converted via tools/convert_inkling2_dspark.py.
-    "inkling2": {"title": "Inkling-2-Mini", "by": "Thinking Machines Lab; quantized by Unsloth",
+    "inkling2": {"title": "Inkling-2-Mini (Unsloth UD)", "by": "Thinking Machines Lab; quantized by Unsloth",
                  "about": "on the strata-poly engine: one NVIDIA card, Linux or Windows; a 14 GB file, ~18 GB of RAM "
                           "beside an 8 GB card; three other sizes too, no images",
                  "hf": hf("unsloth/Inkling-2-Mini-GGUF"), "file": "Inkling-2-Mini-{q}.gguf", "shards": 1,
@@ -892,6 +894,44 @@ FAMILIES = {
                             (17629759456, "e62d463c135ffe283df8d94b279a96ca145ac128b52ce854478613045bf4de15"),
                             "Inkling-2-Mini-UD-Q8_K_XL.gguf":
                             (22867451616, "dfb04bf37bee457f98800989dedf93ec442ede8636dbea9433992f1e527e9a41")}},
+    "inkling2-gsq": {"title": "Inkling-2-Mini (GSQ-RCO)",
+                     "by": "Thinking Machines Lab; GSQ-RCO quants by ISTA-DASLab and abenzerps",
+                     "about": "on the strata-poly engine: one NVIDIA card, Linux or Windows; an 11 GB file, ~15 GB of RAM "
+                              "beside an 8 GB card; six other GSQ-RCO sizes too, no images",
+                     "hf": hf("ISTA-DASLab/Inkling-2-Mini-GSQ-RCO-GGUF"), "file": "Inkling-2-Mini-GSQ-RCO-{q}.gguf",
+                     "shards": 1, "tag": "inkling2gsq-", "name": "inkling-2-mini-gsq", "engine": "poly",
+                     "vision": False, "experimental": True, "windows": True, "ran_on_gb": 12, "row_bytes": 32768,
+                     "models": {"IQ3_S": {"about": "3-bit GSQ-RCO (ISTA-DASLab): best quality/size balance for 8-12 GB cards",
+                                          "download_gb": 11.4, "ram_gb": 15, "arena_gb": 10.2, "vram_beside_gb": 3.5},
+                                "IQ3_XXS": {"about": "3-bit GSQ-RCO (ISTA-DASLab): smaller 3-bit footprint",
+                                            "download_gb": 10.6, "ram_gb": 15, "arena_gb": 9.4, "vram_beside_gb": 3.5},
+                                "Q2_K_XL": {"about": "2-bit K-quant GSQ-RCO (ISTA-DASLab): compact and fast",
+                                            "download_gb": 9.8, "ram_gb": 14, "arena_gb": 8.6, "vram_beside_gb": 3.5},
+                                "IQ2_S": {"about": "2-bit GSQ-RCO (ISTA-DASLab): fits more experts on 8 GB cards",
+                                          "download_gb": 9.0, "ram_gb": 13, "arena_gb": 7.8, "vram_beside_gb": 3.5},
+                                "IQ2_XS": {"about": "2-bit GSQ-RCO (abenzerps): the least RAM",
+                                           "download_gb": 8.5, "ram_gb": 12, "arena_gb": 7.3, "vram_beside_gb": 3.5,
+                                           "hf": hf("abenzerps/Inkling-2-Mini-GSQ-RCO-GGUF")},
+                                "IQ3_XS": {"about": "3-bit GSQ-RCO (abenzerps): community 3-bit option",
+                                           "download_gb": 11.6, "ram_gb": 16, "arena_gb": 10.4, "vram_beside_gb": 3.5,
+                                           "hf": hf("abenzerps/Inkling-2-Mini-GSQ-RCO-GGUF")},
+                                "IQ4_XS": {"about": "4-bit GSQ-RCO (abenzerps): higher quality 4-bit",
+                                           "download_gb": 13.6, "ram_gb": 18, "arena_gb": 12.4, "vram_beside_gb": 3.5,
+                                           "hf": hf("abenzerps/Inkling-2-Mini-GSQ-RCO-GGUF")}},
+                     "sha256": {"Inkling-2-Mini-GSQ-RCO-IQ3_S.gguf":
+                                (11425259648, "8a3515374c3cd9b65a1677b17e805bb1e32df8e98756e5f0d2fe1837d62aa4cb"),
+                                "Inkling-2-Mini-GSQ-RCO-IQ3_XXS.gguf":
+                                (10608205952, "f6533d05a0f01d6187160a51dc43e136b39dcc69485c2b819fda7ade0f4611ea"),
+                                "Inkling-2-Mini-GSQ-RCO-Q2_K_XL.gguf":
+                                (9792516224, "df264db473adf61660f1968726646a73599e295e882d6a120f675363bd8179e0"),
+                                "Inkling-2-Mini-GSQ-RCO-IQ2_S.gguf":
+                                (8975863424, "3a94bfe6e8f2741a438c0356fdc6a96ced55d453c3215e7b10a7bedcc470bd26"),
+                                "Inkling-2-Mini-GSQ-RCO-IQ2_XS.gguf":
+                                (8476859744, "c3cde616af54825246ba858a1f5b8ba8e62d201ce48cfd59a016e1460c5e8ff3"),
+                                "Inkling-2-Mini-GSQ-RCO-IQ3_XS.gguf":
+                                (11644899392, "009d1173f575b06d6d30d73c25c2021cc1388fef9500fb3f0bc690b1e2902986"),
+                                "Inkling-2-Mini-GSQ-RCO-IQ4_XS.gguf":
+                                (13577765280, "b20b4e29e8fd55c19c731998bb260c21b470d74991b36f9d6e36b5380440df1f")}},
 }
 MMPROJ = "mmproj-Qwen3.8-Flash-Next-BF16.gguf"
 # Qwen3.6-35B-A3B (GGUF architecture qwen35moe), Unsloth's GGUFs with the MTP block: a family with an engine path of its
@@ -2420,7 +2460,7 @@ def verify_sha256(s: Path, size: int, sha: str, own: bool = False) -> None:
 # code by; the families not listed are qwen35moe
 POLY_GGUF_ARCHS = {"glm": ("glm5-next", "glm5next"), "deepseek": ("deepseek4",), "lfm25": ("lfm2moe",),
                    "gemma4": ("gemma4",), "flint": ("flint",), "kolibri": ("kolibri1",), "clover": ("clover_moe",),
-                   "inkling2": ("inkling2_loop", "inkling2")}
+                   "inkling2": ("inkling2_loop", "inkling2"), "inkling2-gsq": ("inkling2_loop", "inkling2")}
 
 
 def gguf_arch(s: Path) -> str:
@@ -6556,8 +6596,9 @@ def poly_verdict(d, ram, vram_gb, hip, windows=False) -> str:
 
 # --kv for a model of strata-poly (docs/Q8_KV.md): the formats its architecture's attention caches have beside
 # fp16, the default.  The other engine's own are STRATA_KV.
-POLY_KV = {"q8_0": ("qwen36", "ornith", "ornith122", "tiel", "minicpmv", "kolibri", "flint", "lfm25", "inkling2"),
-           "q4_0": ("inkling2",), "k8v4": ("inkling2",),
+POLY_KV = {"q8_0": ("qwen36", "ornith", "ornith122", "tiel", "minicpmv", "kolibri", "flint", "lfm25", "inkling2",
+                    "inkling2-gsq"),
+           "q4_0": ("inkling2", "inkling2-gsq"), "k8v4": ("inkling2", "inkling2-gsq"),
            "int8": ("gemma4",), "int8k": ("gemma4",)}
 STRATA_KV = ("int8", "q4_0", "k8v4")
 
@@ -6938,7 +6979,7 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
         warn(f"{title} on AMD cards on Windows: EXPERIMENTAL.  Setup compiles the HIP engine here (AMD's ROCm "
              "wheels), which has run Tiel Coder on an RX 9070 XT and Qwen3.6, Ornith, Tiel Coder and Gemma 4 on an "
              "RX 5700 XT, and nothing else yet; the log says where it stops if it does")
-    elif hip and family in ("glm", "deepseek", "flint", "kolibri", "clover", "inkling2"):   # the engine runs on AMD, these not yet
+    elif hip and family in ("glm", "deepseek", "flint", "kolibri", "clover", "inkling2", "inkling2-gsq"):   # the engine runs on AMD, these not yet
         warn(f"{title} on the AMD card has not been tried: the engine runs there, this model was not")
     if cuda_tk == 12:
         warn(f"{title}'s engine with CUDA 12 is compiled here (the ready-made one is CUDA 13)" +
@@ -7881,7 +7922,8 @@ def main() -> int:
                          "DeepSeek V4 Flash, lfm25 = LFM2.5-24B-A2B, flint = Flint 40B-A2.5B, qwen36 = "
                          "Qwen3.6-35B-A3B on strata-poly, clover = Clover-35B-A3B-Preview, ornith = "
                          "Ornith 1.5, gemma4 = Gemma 4 26B-A4B, tiel = Tiel Coder 35B-A3B, minicpmv = MiniCPM-V 4.7 "
-                         "35B-A3B, ornith122 = Ornith 1.5 122B, inkling2 = Inkling-2-Mini (docs/BACKENDS.md), qwen36-strata = Qwen3.6-35B-A3B on the Strata project's "
+                         "35B-A3B, ornith122 = Ornith 1.5 122B, inkling2 = Inkling-2-Mini (Unsloth UD), "
+                         "inkling2-gsq = Inkling-2-Mini (GSQ-RCO) (docs/BACKENDS.md), qwen36-strata = Qwen3.6-35B-A3B on the Strata project's "
                          "own engine (UD-Q4_K_XL and up, 32 GB of RAM or more; pictures with --vision, several "
                          "requests at once with --parallel; docs/QWEN36.md)")
     ap.add_argument("--model", choices=list(dict.fromkeys(
